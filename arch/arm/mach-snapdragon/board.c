@@ -32,6 +32,8 @@
 #include <usb.h>
 #include <sort.h>
 #include <time.h>
+#include <fastboot.h>
+#include <g_dnl.h>
 
 #include "qcom-priv.h"
 
@@ -311,8 +313,44 @@ void __weak qcom_board_init(void)
 {
 }
 
+/*
+ * TEMPORARY BRING-UP DIAGNOSTIC (sheng): the board never reaches bootcmd's
+ * `run fastboot`, with no display and no confirmed physical UART to say
+ * why. board_init() runs immediately after initr_dm (DM binding) -- much
+ * earlier than console_init_r/board_late_init/bootcmd -- so forcing the
+ * fastboot USB gadget up right here, bypassing env/console entirely,
+ * turns "did we get this far" into a plain yes/no `fastboot devices`
+ * check on the host: if it shows up now, the hang is somewhere between
+ * here and bootcmd; if it still doesn't, the hang is at or before this
+ * point (initr_dm, initr_caches, initr_malloc, or board_init_f). Revert
+ * once we have a real signal.
+ */
+static void __noreturn qcom_debug_early_fastboot_trap(void)
+{
+	struct udevice *udc;
+	int ret;
+
+	fastboot_init((void *)CONFIG_FASTBOOT_BUF_ADDR, CONFIG_FASTBOOT_BUF_SIZE);
+
+	ret = udc_device_get_by_index(0, &udc);
+	if (ret)
+		hang();
+
+	g_dnl_clear_detach();
+	ret = g_dnl_register("usb_dnl_fastboot");
+	if (ret)
+		hang();
+
+	while (1) {
+		schedule();
+		dm_usb_gadget_handle_interrupts(udc);
+	}
+}
+
 int board_init(void)
 {
+	qcom_debug_early_fastboot_trap();
+
 	show_psci_version();
 	qcom_board_init();
 	return 0;
