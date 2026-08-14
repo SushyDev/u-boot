@@ -56,7 +56,13 @@ CONFIG_OF_UPSTREAM_BUILD_VENDOR=y
 # phones/tablets lack a physical keyboard or accessible serial console, so
 # this pulls in the bootmenu-driven UX, panic-on-hang so errors stay on
 # screen, and CDC-ACM USB gadget serial for `tio`/fastboot-oem-log access.
-CONFIG_ENV_DEFAULT_ENV_TEXT_FILE="board/qualcomm/qcom-phone.env"
+#
+# We use our own env (board/qualcomm/sheng.env, a copy of qcom-phone.env)
+# instead of the stock one: during bring-up bootcmd must never attempt
+# `bootefi bootmgr` unattended, and the USB serial gadget needs to be live
+# from power-on rather than opt-in from a bootmenu we may not be able to see
+# yet (the on-screen framebuffer address/resolution is still unverified).
+CONFIG_ENV_DEFAULT_ENV_TEXT_FILE="board/qualcomm/sheng.env"
 CONFIG_PANIC_HANG=y
 CONFIG_CMD_PAUSE=y
 CONFIG_BOOT_RETRY=y
