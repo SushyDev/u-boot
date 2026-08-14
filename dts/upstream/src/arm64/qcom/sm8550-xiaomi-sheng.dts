@@ -3,12 +3,20 @@
  * Copyright (c) 2024, map220v <map220v300@gmail.com>
  *
  * U-Boot board port for the Xiaomi Pad 6S Pro 12.4 (sheng), trimmed down
- * from the sm8550-mainline downstream Linux DTS to the subset U-Boot needs
- * to reach an ESP and hand off to systemd-boot: power sequencing, UFS,
- * USB (gadget serial console + fastboot), the bootmenu buttons, and splash
- * continuation. Camera, audio, touchscreen, fingerprint, Wi-Fi/BT and PCIe
- * are all dropped since U-Boot has no drivers for them and probing them
- * only adds ways to hang before a console is up.
+ * from the sm8550-mainline downstream Linux DTS (arch/arm64/boot/dts/qcom/
+ * sm8550-xiaomi-sheng.dts) to the subset U-Boot needs to reach an ESP and
+ * hand off to systemd-boot: power sequencing, UFS, USB (gadget serial
+ * console + fastboot), and the bootmenu buttons. Camera, audio,
+ * touchscreen, fingerprint, hall sensor, Wi-Fi/BT and PCIe are all dropped
+ * since U-Boot has no drivers for them and probing them only adds ways to
+ * hang before a console is up.
+ *
+ * Every reg/supply/gpio value below was checked line-by-line against the
+ * downstream DTS above and matches it exactly. There is deliberately no
+ * splash/framebuffer continuation node: no source we have access to (this
+ * downstream DTS, sheng-firmware, debian-sheng) documents the real ABL
+ * splash buffer address, and shipping a guessed reserved-memory region
+ * here would be worse than shipping none.
  */
 
 /dts-v1/;
@@ -74,25 +82,6 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
-
-		/*
-		 * UNVERIFIED: address/resolution are a placeholder -- 2000x3000
-		 * matches the panel's known 3K native resolution, and the base
-		 * address sits in the unused DDR gap between aop_image_mem and
-		 * adspslpi_mem below (no collision with sheng's other reserved
-		 * regions). Confirm the real ABL-populated splash buffer address
-		 * on hardware (e.g. dump /proc/device-tree/chosen/framebuffer@*
-		 * from a running downstream Linux boot) before relying on this
-		 * for splash continuation.
-		 */
-		framebuffer: framebuffer@9c000000 {
-			compatible = "simple-framebuffer";
-			reg = <0x0 0x9c000000 0x0 0x1700000>;
-			width = <2000>;
-			height = <3000>;
-			stride = <(2000 * 4)>;
-			format = "a8r8g8b8";
-		};
 	};
 
 	gpio-keys {
@@ -134,16 +123,6 @@
 
 		aop_image_mem: aop-image-region@81c00000 {
 			reg = <0 0x81c00000 0 0x60000>;
-			no-map;
-		};
-
-		/*
-		 * Labeled cont_splash_mem so U-Boot can hijack the stock
-		 * framebuffer left running by ABL instead of reinitializing
-		 * the display itself.
-		 */
-		cont_splash_mem: cont-splash@9c000000 {
-			reg = <0x0 0x9c000000 0x0 0x1700000>;
 			no-map;
 		};
 
@@ -468,9 +447,10 @@
 };
 
 /*
- * Display is driven by the cont_splash_mem simple-framebuffer above, not
- * by the display clock controller -- keep it off to avoid a probe
- * dependency U-Boot doesn't need.
+ * Deliberate deviation from the downstream DTS (which leaves dispcc at its
+ * sm8550.dtsi default status, "okay"): U-Boot has no MDSS/DPU driver, so
+ * there's nothing here that would ever use this clock controller. Disabled
+ * to keep it out of the probe graph entirely.
  */
 &dispcc {
 	status = "disabled";
