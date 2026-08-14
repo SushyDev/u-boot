@@ -70,7 +70,8 @@ in
         cat u-boot-nodtb.bin.gz dts/upstream/src/arm64/qcom/sm8550-xiaomi-sheng.dtb \
           > u-boot-nodtb.bin.gz-dtb
         mkbootimg --kernel u-boot-nodtb.bin.gz-dtb \
-          --output boot.img --pagesize 4096 --base 0x80000000 \
+          --output boot.img --pagesize 4096 \
+          --base 0x0 --kernel_offset 0x00008000 --tags_offset 0x01e00000 \
           || echo "mkbootimg not on PATH -- get it from debian-sheng/ or AOSP mkbootimg."
         echo "✓ boot.img ready in $BUILD_DIR/"
       '';
