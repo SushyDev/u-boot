@@ -1,4 +1,19 @@
 CONFIG_ARM=y
+# Buffer any printf()/panic()/log_err() output to a fixed physical RAM
+# address before a real console exists (gd->precon_buf_idx defaults to 0,
+# not negative, so this is live as soon as gd itself is set up, early in
+# board_init_f). Address 0x82000000 verified against the live device's
+# real reserved-memory list (captured earlier this session) as an unused
+# gap between adsp-mhi-region (ends ~0x81f20000) and global-sync-region
+# (starts 0x82600000) -- not inside our own u-boot load range either
+# (0x80008000, within the much smaller 0x80000000-0x80e00000 bank).
+# Point of this: if U-Boot still hangs/panics somewhere on real hardware,
+# and DRAM survives a targeted warm reset (hold power+voldown back to
+# fastboot, not a full power cycle), this buffer might be readable via
+# /dev/mem from a subsequent `fastboot boot` into the working Linux image.
+CONFIG_PRE_CONSOLE_BUFFER=y
+CONFIG_PRE_CON_BUF_SZ=16384
+CONFIG_PRE_CON_BUF_ADDR=0x82000000
 CONFIG_SKIP_LOWLEVEL_INIT=y
 CONFIG_POSITION_INDEPENDENT=y
 CONFIG_SYS_INIT_SP_BSS_OFFSET=0x180000
