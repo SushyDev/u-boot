@@ -79,18 +79,24 @@
 	};
 
 	/*
-	 * sm8550.dtsi's memory@a0000000 is a zero-sized placeholder every
-	 * board is expected to override with its real size -- ours never
-	 * did, so qcom_parse_memory() always failed on the internal DTB and
-	 * every boot depended entirely on board_fdt_blob_setup()'s external
-	 * (ABL-handoff, x0-register) fallback succeeding. 8GiB is the safe
-	 * minimum across this device's known 8/12/16GB RAM SKUs -- safe to
-	 * underclaim (unused tail RAM, harmless) but never to overclaim.
+	 * REVERTED: sm8550.dtsi's memory@a0000000 is a zero-sized placeholder;
+	 * an earlier commit here overrode it with a single fake contiguous
+	 * 8GiB bank at 0xa0000000. Real /proc/device-tree/memory@a0000000/reg
+	 * pulled from a live, booted Debian system on this exact unit shows
+	 * the true layout is 8 fragmented banks starting at 0x80000000, with
+	 * a second cluster jumping to ~0x880000000 -- nothing like a single
+	 * contiguous region, and mostly NOT covering the fabricated range.
+	 * qcom_parse_memory() prefers the internal DTB once it looks "valid"
+	 * (non-zero size), so that fake single bank may have caused U-Boot to
+	 * relocate itself or build page tables against addresses that aren't
+	 * real backed DRAM at all -- plausibly the actual crash cause this
+	 * whole session. Reverted to the zero-sized placeholder so
+	 * qcom_parse_memory() correctly fails on the internal DTB again and
+	 * falls back to board_fdt_blob_setup()'s external (ABL-handoff) FDT,
+	 * which the live system proves carries the real, correct layout.
+	 * Matches Samsung's and Sony's real, working sm8550 phone ports,
+	 * neither of which override /memory either.
 	 */
-	memory@a0000000 {
-		device_type = "memory";
-		reg = <0x0 0xa0000000 0x2 0x00000000>;
-	};
 
 	chosen {
 		#address-cells = <2>;
