@@ -753,7 +753,21 @@ static int fdt_cmp_res(const void *v1, const void *v2)
 	return res1->start - res2->start;
 }
 
-#define N_RESERVED_REGIONS 32
+/*
+ * BOARD FIX (sheng): the compiled sm8550-xiaomi-sheng.dtb has 34 no-map
+ * subnodes under /reserved-memory (inherited from sm8550.dtsi's base set --
+ * this board only ever /delete-node/'s some, never adds its own), 2 over
+ * the original 32. carve_out_reserved_memory() below silently drops
+ * anything past N_RESERVED_REGIONS via `if (i == N_RESERVED_REGIONS) break`
+ * -- meaning the last 2 regions never got PTE_TYPE_FAULT-mapped at all,
+ * left as ordinary cacheable RAM instead. Per this same function's own
+ * comment, that's "enough to trigger a security violation and trap to EL3"
+ * if the cache-prefetcher speculatively touches one of them -- a silent,
+ * extremely early crash matching everything observed on real hardware.
+ * Bumped with headroom rather than the exact minimum (34) in case future
+ * DT edits add more.
+ */
+#define N_RESERVED_REGIONS 48
 
 /* Mark all no-map regions as PTE_TYPE_FAULT to prevent speculative access.
  * On some platforms this is enough to trigger a security violation and trap
