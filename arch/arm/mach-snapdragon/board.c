@@ -208,15 +208,43 @@ static void qcom_psci_fixup(void *fdt)
  * or for supporting quirky devices where it's easier to leave the downstream DT in place
  * to improve ABL compatibility. Otherwise, we use the DT provided by ABL.
  */
+/*
+ * TEMPORARY BRING-UP DEFENSIVE CHECK (sheng): get_prev_bl_fdt_addr() just
+ * returns raw x0 as saved at boot entry (arch/arm/lib/save_prev_bl_data.c),
+ * with zero validation -- board_fdt_blob_setup() below then unconditionally
+ * calls fdt_check_header() on it, before ever checking whether the internal
+ * DTB is even usable. If ABL doesn't hand off a DTB pointer in x0 the way
+ * this generic mach-snapdragon code assumes, that's an unguarded dereference
+ * of a potentially garbage/unmapped address, this early in boot with no
+ * exception vectors installed yet -- an unhandled crash, not a graceful
+ * failure, and indistinguishable from a hang with no console. Since we no
+ * longer depend on this path at all now that our own /memory node is valid
+ * (see the board .dts), gate the dereference behind a coarse sanity check
+ * instead of trusting x0 blindly. Revert (or tighten) once we have a real
+ * signal on whether this was ever the issue.
+ */
+static bool qcom_debug_addr_plausible(phys_addr_t addr)
+{
+	/* Non-null, 8-byte aligned (FDT convention), and within a broad
+	 * DRAM range for this SoC -- our own /memory node covers
+	 * 0xa0000000..0x2a0000000, so allow some margin either side.
+	 */
+	return addr && !(addr & 0x7) &&
+	       addr >= 0x80000000ULL && addr < 0x400000000ULL;
+}
+
 int board_fdt_blob_setup(void **fdtp)
 {
 	struct fdt_header *external_fdt, *internal_fdt;
 	bool internal_valid, external_valid;
+	phys_addr_t prev_bl_fdt;
 	int ret = -ENODATA;
 
 	internal_fdt = (struct fdt_header *)*fdtp;
-	external_fdt = (struct fdt_header *)get_prev_bl_fdt_addr();
-	external_valid = external_fdt && !fdt_check_header(external_fdt);
+	prev_bl_fdt = get_prev_bl_fdt_addr();
+	external_fdt = (struct fdt_header *)prev_bl_fdt;
+	external_valid = qcom_debug_addr_plausible(prev_bl_fdt) &&
+			  !fdt_check_header(external_fdt);
 	internal_valid = !fdt_check_header(internal_fdt);
 
 	/*

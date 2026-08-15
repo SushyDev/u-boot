@@ -78,6 +78,20 @@
 		serial0 = &uart7;
 	};
 
+	/*
+	 * sm8550.dtsi's memory@a0000000 is a zero-sized placeholder every
+	 * board is expected to override with its real size -- ours never
+	 * did, so qcom_parse_memory() always failed on the internal DTB and
+	 * every boot depended entirely on board_fdt_blob_setup()'s external
+	 * (ABL-handoff, x0-register) fallback succeeding. 8GiB is the safe
+	 * minimum across this device's known 8/12/16GB RAM SKUs -- safe to
+	 * underclaim (unused tail RAM, harmless) but never to overclaim.
+	 */
+	memory@a0000000 {
+		device_type = "memory";
+		reg = <0x0 0xa0000000 0x2 0x00000000>;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
