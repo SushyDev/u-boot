@@ -24,6 +24,16 @@ config SYS_MALLOC_LEN
 	default 0x800000
 
 config LNX_KRNL_IMG_TEXT_OFFSET_BASE
+	# TEXT_OFFSET (arch/arm/cpu/armv8/linux-kernel-image-header-vars.h) is
+	# computed as CONFIG_TEXT_BASE - this value, which only makes sense if
+	# CONFIG_TEXT_BASE holds a real absolute link address. Position-
+	# independent builds link at CONFIG_TEXT_BASE=0x0, so the unconditional
+	# 0x80000000 default below produces a bogus TEXT_OFFSET
+	# (0x0 - 0x80000000 = 0xffffffff80000000) in the emitted Linux Image
+	# header -- harmless to loaders that ignore this field, but rejected by
+	# spec-compliant ones (confirmed via `kexec_file_load` on real
+	# hardware: "Cannot assign requested address").
+	default 0x0 if POSITION_INDEPENDENT
 	default 0x80000000
 
 config SYS_BOARD
