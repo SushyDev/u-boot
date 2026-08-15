@@ -2,18 +2,28 @@ CONFIG_ARM=y
 # Buffer any printf()/panic()/log_err() output to a fixed physical RAM
 # address before a real console exists (gd->precon_buf_idx defaults to 0,
 # not negative, so this is live as soon as gd itself is set up, early in
-# board_init_f). Address 0x82000000 verified against the live device's
-# real reserved-memory list (captured earlier this session) as an unused
-# gap between adsp-mhi-region (ends ~0x81f20000) and global-sync-region
-# (starts 0x82600000) -- not inside our own u-boot load range either
-# (0x80008000, within the much smaller 0x80000000-0x80e00000 bank).
+# board_init_f).
+#
+# Address is xbl_ramdump_mem's base (0x81200000, size 0x280000) -- a
+# real, verified no-map reserved-memory region from the live device's own
+# memory map (captured earlier this session), not just "an unused gap".
+# This matters specifically because of how Linux's generic
+# devmem_is_allowed() (lib/devmem_is_allowed.c, no arm64-specific
+# override, and critically no cmdline override either -- iomem=relaxed is
+# x86-only) works: it unconditionally blocks /dev/mem reads of anything
+# page_is_ram() considers ordinary System RAM. A no-map reserved region is
+# excluded from Linux's own memory management, so page_is_ram() is false
+# there and the read is actually allowed -- an "unused but otherwise
+# ordinary RAM" address (this config's first attempt) is *not* readable
+# this way on this kernel, confirmed the hard way (EPERM).
+#
 # Point of this: if U-Boot still hangs/panics somewhere on real hardware,
 # and DRAM survives a targeted warm reset (hold power+voldown back to
-# fastboot, not a full power cycle), this buffer might be readable via
+# fastboot, not a full power cycle), this buffer should be readable via
 # /dev/mem from a subsequent `fastboot boot` into the working Linux image.
 CONFIG_PRE_CONSOLE_BUFFER=y
 CONFIG_PRE_CON_BUF_SZ=16384
-CONFIG_PRE_CON_BUF_ADDR=0x82000000
+CONFIG_PRE_CON_BUF_ADDR=0x81200000
 CONFIG_SKIP_LOWLEVEL_INIT=y
 CONFIG_POSITION_INDEPENDENT=y
 CONFIG_SYS_INIT_SP_BSS_OFFSET=0x180000
