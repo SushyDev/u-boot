@@ -79,24 +79,42 @@
 	};
 
 	/*
-	 * REVERTED: sm8550.dtsi's memory@a0000000 is a zero-sized placeholder;
-	 * an earlier commit here overrode it with a single fake contiguous
-	 * 8GiB bank at 0xa0000000. Real /proc/device-tree/memory@a0000000/reg
-	 * pulled from a live, booted Debian system on this exact unit shows
-	 * the true layout is 8 fragmented banks starting at 0x80000000, with
-	 * a second cluster jumping to ~0x880000000 -- nothing like a single
-	 * contiguous region, and mostly NOT covering the fabricated range.
-	 * qcom_parse_memory() prefers the internal DTB once it looks "valid"
-	 * (non-zero size), so that fake single bank may have caused U-Boot to
-	 * relocate itself or build page tables against addresses that aren't
-	 * real backed DRAM at all -- plausibly the actual crash cause this
-	 * whole session. Reverted to the zero-sized placeholder so
-	 * qcom_parse_memory() correctly fails on the internal DTB again and
-	 * falls back to board_fdt_blob_setup()'s external (ABL-handoff) FDT,
-	 * which the live system proves carries the real, correct layout.
-	 * Matches Samsung's and Sony's real, working sm8550 phone ports,
-	 * neither of which override /memory either.
+	 * Real, verified DRAM layout for this exact physical unit, pulled
+	 * directly from /proc/device-tree/memory@a0000000/reg on a live,
+	 * booted Debian system (xxd dump, parsed byte-for-byte -- not a
+	 * guess). 7 fragmented banks (an 8th, 0xd8800000 size 0, is a
+	 * degenerate zero-size artifact and is dropped here).
+	 *
+	 * Superseding board_fdt_blob_setup()'s external-FDT fallback
+	 * entirely: that path depends on both (a) ABL handing off a valid
+	 * FDT pointer in x0, which we've never been able to confirm, and
+	 * (b) our own qcom_debug_addr_plausible() guessed-range filter
+	 * (0x80000000..0x400000000) accepting whatever address ABL actually
+	 * uses -- confirmed via QEMU that this filter's range assumption is
+	 * real DRAM-base guesswork, not verified fact. Giving qcom_parse_
+	 * memory() a real, valid internal DTB removes the dependency on
+	 * either of those unknowns.
 	 */
+	/*
+	 * Must be named exactly memory@a0000000 (matching sm8550.dtsi's
+	 * placeholder, which has no label to /delete-node/ by reference) --
+	 * a different unit-address here creates a *second*, separate
+	 * memory@ node instead of overriding the placeholder, and
+	 * fdt_path_offset(fdt, "/memory") matches whichever one is first in
+	 * the tree (the empty placeholder), silently ignoring this one.
+	 * Confirmed via fdtdump on the compiled output: this was exactly
+	 * what broke the first attempt at this fix.
+	 */
+	memory@a0000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x00e00000>,
+		      <0x0 0x811d0000 0x0 0x56e30000>,
+		      <0x0 0xd8140000 0x0 0x00020000>,
+		      <0x0 0xe7cb0000 0x0 0x18350000>,
+		      <0x8 0x80000000 0x0 0x3b300000>,
+		      <0x8 0xbb500000 0x0 0x01e00000>,
+		      <0x8 0xc0000000 0x1 0x40000000>;
+	};
 
 	chosen {
 		#address-cells = <2>;
