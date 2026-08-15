@@ -16,8 +16,10 @@
 #include <asm/system.h>
 #include <dm/device.h>
 #include <dm/pinctrl.h>
+#include <dm/uclass.h>
 #include <dm/uclass-internal.h>
 #include <dm/read.h>
+#include <spmi/spmi.h>
 #include <power/regulator.h>
 #include <env.h>
 #include <fdt_support.h>
@@ -314,6 +316,60 @@ void __weak qcom_board_init(void)
 }
 
 /*
+ * TEMPORARY BRING-UP DIAGNOSTIC (sheng): light the green status LED
+ * (pm8550_pwm channel 2 / green_led in the board DTS) via raw SPMI writes,
+ * bypassing every driver -- U-Boot has no driver for this LPG/PWM
+ * peripheral at all, so this hand-rolls the exact register sequence
+ * drivers/leds/rgb/leds-qcom-lpg.c uses in the real Linux kernel
+ * (sm8550-mainline), against pm8350c_pwm_data's real, verified addresses
+ * (pm8550-pwm falls back to "qcom,pm8350c-pwm" -- pm8550 itself has no
+ * dedicated entry in that driver's match table):
+ *   - USID 1 or the PMIC (pm8550.dtsi: `pmic@1 { reg = <0x1 SPMI_USID>; }`)
+ *   - channel 2 (green_led, DTS `reg = <2>`) base 0xe900
+ *   - triled_base 0xef00, this channel's triled_mask BIT(6)
+ *
+ * Called right before the USB trap below, specifically to disambiguate
+ * two cases that trap alone can't tell apart: if DM binding (initr_dm)
+ * merely failed/hung, we'd never even get this far, so the LED stays
+ * off either way -- but if DM binding *succeeded* and something later
+ * hung specifically inside USB/UDC probing, the LED would still light
+ * (a completely different, much simpler peripheral, same PMIC we
+ * already talk to successfully for pon_pwrkey/pon_resin/pm8550_gpios)
+ * even though fastboot never shows up. Revert once we have a real signal.
+ */
+static void qcom_debug_led_trap(void)
+{
+	struct udevice *spmi;
+	int ret, val;
+
+	ret = uclass_get_device(UCLASS_SPMI, 0, &spmi);
+	if (ret)
+		return;
+
+#define GREEN_LED_PID   0xe9
+#define TRILED_PID      0xef
+#define TRILED_EN_CTL   0x46
+#define GREEN_TRILED_BIT BIT(6)
+
+	spmi_reg_write(spmi, 1, GREEN_LED_PID, 0x41, 0x01); /* LPG_SIZE_CLK_REG: clk_sel=1, 9-bit */
+	spmi_reg_write(spmi, 1, GREEN_LED_PID, 0x42, 0x00); /* LPG_PREDIV_CLK_REG */
+	spmi_reg_write(spmi, 1, GREEN_LED_PID, 0x43, 0x00); /* PWM_TYPE_CONFIG_REG */
+	spmi_reg_write(spmi, 1, GREEN_LED_PID, 0x44, 0xff); /* PWM_VALUE_REG lo: 0x1ff (~max, 9-bit) */
+	spmi_reg_write(spmi, 1, GREEN_LED_PID, 0x45, 0x01); /* PWM_VALUE_REG hi */
+	/* PWM_ENABLE_CONTROL_REG: BUFFER_TRISTATE|OUTPUT|SRC_PWM */
+	spmi_reg_write(spmi, 1, GREEN_LED_PID, 0x46, 0x20 | 0x80 | 0x04);
+	/* HW erratum workaround (matches lpg_apply_control): rewrite value once enabled */
+	spmi_reg_write(spmi, 1, GREEN_LED_PID, 0x44, 0xff);
+	spmi_reg_write(spmi, 1, GREEN_LED_PID, 0x45, 0x01);
+	spmi_reg_write(spmi, 1, GREEN_LED_PID, 0x47, 0x01); /* PWM_SYNC_REG: LPG_SYNC_PWM */
+
+	val = spmi_reg_read(spmi, 1, TRILED_PID, TRILED_EN_CTL);
+	if (val < 0)
+		return;
+	spmi_reg_write(spmi, 1, TRILED_PID, TRILED_EN_CTL, val | GREEN_TRILED_BIT);
+}
+
+/*
  * TEMPORARY BRING-UP DIAGNOSTIC (sheng): the board never reaches bootcmd's
  * `run fastboot`, with no display and no confirmed physical UART to say
  * why. board_init() runs immediately after initr_dm (DM binding) -- much
@@ -349,6 +405,7 @@ static void __noreturn qcom_debug_early_fastboot_trap(void)
 
 int board_init(void)
 {
+	qcom_debug_led_trap();
 	qcom_debug_early_fastboot_trap();
 
 	show_psci_version();
