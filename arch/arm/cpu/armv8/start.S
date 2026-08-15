@@ -53,6 +53,30 @@ _bss_end_ofs:
 	.quad	__bss_end - _start
 
 reset:
+	/*
+	 * TEMPORARY BRING-UP FIX (sheng): save_boot_params() below is a C
+	 * function, called here as the very first thing after entry -- but
+	 * nothing has set up a stack pointer yet. crt0's own SP setup
+	 * doesn't happen until much later (after PIE relocation, EL
+	 * switching, cache/MMU setup), and this call has to stay this early
+	 * specifically to capture x0 before the PIE fixup code that
+	 * immediately follows clobbers x0-x4/x9. Confirmed via QEMU (both
+	 * the -kernel boot-stub path and a direct -device loader entry,
+	 * same result both ways): with SP left at whatever reset/previous-
+	 * stage value it had (0 in QEMU's case), execution crashes
+	 * immediately inside save_boot_params and spins forever on
+	 * unmapped/zeroed exception-vector memory (PC stuck at a fixed
+	 * address, SP=0, LR=0) -- silent, no console, indistinguishable
+	 * from a hang. Give it a minimal, safe stack first: just past our
+	 * own loaded image (using _end_ofs, already computed relative to
+	 * _start below) with generous margin, computed with only PC-
+	 * relative literal loads (adr/ldr, not adrp) since alignment isn't
+	 * verified yet at this point either. x0 is left untouched.
+	 */
+	adr	x1, _start
+	ldr	x2, _end_ofs
+	add	sp, x1, x2
+	add	sp, sp, #0x10000
 	/* Allow the board to save important registers */
 	b	save_boot_params
 .globl	save_boot_params_ret
