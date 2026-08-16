@@ -238,9 +238,6 @@ int board_fdt_blob_setup(void **fdtp)
 	phys_addr_t prev_bl_fdt;
 	int ret = -ENODATA;
 
-	/* DEBUG: Proof that U-Boot code execution reached C-land */
-	hang();
-
 	internal_fdt = (struct fdt_header *)*fdtp;
 	prev_bl_fdt = get_prev_bl_fdt_addr();
 	external_fdt = (struct fdt_header *)prev_bl_fdt;
