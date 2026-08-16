@@ -138,6 +138,12 @@
 		};
 	};
 
+	backlight-gpio {
+		compatible = "gpio-backlight";
+		enable-gpios = <&tlmm 128 GPIO_ACTIVE_HIGH>;
+		default-on;
+	};
+
 	vph_pwr: vph-pwr-regulator {
 		compatible = "regulator-fixed";
 		regulator-name = "vph_pwr";
