@@ -148,7 +148,22 @@
 		regulator-boot-on;
 	};
 
+	framebuffer {
+		compatible = "simple-framebuffer";
+		reg = <0x0 0xfb800000 0x0 0x18000000>;
+		width = <3048>;
+		height = <2032>;
+		stride = <12288>;
+		format = "a8r8g8b8";
+		status = "okay";
+	};
+
 	reserved-memory {
+		framebuffer_mem: framebuffer-region@fb800000 {
+			reg = <0x0 0xfb800000 0x0 0x18000000>;
+			no-map;
+		};
+
 		xbl_ramdump_mem: xbl-ramdump-region@81200000 {
 			reg = <0 0x81200000 0 0x280000>;
 			no-map;
