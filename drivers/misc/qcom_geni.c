@@ -560,6 +560,26 @@ static int qcom_geni_fw_initialise(void)
 		}
 	}
 
+	/* Also load firmware for I2C master-hub wrappers (e.g., i2c_master_hub_0).
+	 * These use a different compatible string ("qcom,geni-se-i2c-master-hub")
+	 * and driver name but still need the same protocol firmware in their
+	 * sequencers. Scan all devices and set fw_buf on master-hub wrappers too.
+	 */
+	struct udevice *hub_wrapper;
+	for (uclass_first_device(UCLASS_NOP, &hub_wrapper);
+	     hub_wrapper;
+	     uclass_next_device(&hub_wrapper)) {
+		if (ofnode_device_is_compatible(dev_ofnode(hub_wrapper),
+						"qcom,geni-se-i2c-master-hub")) {
+			dev_set_priv(hub_wrapper, fw_buf);
+			/* Probe children of this master-hub wrapper so they load firmware */
+			struct udevice *child;
+			device_foreach_child(child, hub_wrapper) {
+				device_probe(child);
+			}
+		}
+	}
+
 	return 0;
 }
 

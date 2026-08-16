@@ -76,6 +76,7 @@
 
 	aliases {
 		serial0 = &uart7;
+		i2c1 = &i2c1;
 	};
 
 	/*
@@ -554,6 +555,18 @@
 	linux,code = <KEY_VOLUMEDOWN>;
 	status = "okay";
 };
+
+&i2c1 {
+	status = "okay";
+};
+
+/* i2c_master_hub_0 / i2c_hub_2 (ktz8866b, chip B) intentionally left
+ * disabled -- U-Boot's geni_i2c_master_hub driver never loads QUP protocol
+ * firmware for this wrapper (qcom_geni_fw_initialise() only handles
+ * driver->name == "geni-se-qup"), so probing this bus NULL-derefs inside
+ * qcom_geni_load_firmware()/read_elf() and hangs. See board_late_init()
+ * comment in mach-snapdragon/board.c. Only chip A (i2c1) is initialized.
+ */
 
 &qupv3_id_0 {
 	status = "okay";
