@@ -586,6 +586,12 @@ int board_late_init(void)
 
 		mdelay(20);
 
+		/* Trap: after GPIO and regulator, before I2C */
+		{
+			struct arm_smccc_res res;
+			arm_smccc_smc(ARM_PSCI_0_2_FN_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, 0, &res);
+		}
+
 		/* KTZ8866A backlight IC initialization
 		 * Scan I2C1 for any responding devices to find actual address
 		 */
@@ -596,6 +602,12 @@ int board_late_init(void)
 				ret = uclass_get_device_by_ofnode(UCLASS_I2C, i2c_node, &i2c_bus);
 
 				if (ret == 0 && i2c_bus) {
+					/* Trap: about to scan I2C addresses */
+					{
+						struct arm_smccc_res res;
+						arm_smccc_smc(ARM_PSCI_0_2_FN_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, 0, &res);
+					}
+
 					/* Scan addresses 0x10-0x20 for any responding chip */
 					u8 probe_addrs[] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
 						0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20};
@@ -611,8 +623,6 @@ int board_late_init(void)
 							break;
 						}
 					}
-
-					if (ret == 0 && chip) {
 
 					if (ret == 0 && chip) {
 						u8 buf;
@@ -750,7 +760,7 @@ static void build_mem_map(void)
 #endif
 }
 
-u64 get_page_table_size(void)
+u64 __maybe_unused get_page_table_size(void)
 {
 	return SZ_1M;
 }
@@ -863,7 +873,7 @@ static void carve_out_reserved_memory(void)
 /* This function open-codes setup_all_pgtables() so that we can
  * insert additional mappings *before* turning on the MMU.
  */
-void enable_caches(void)
+void __maybe_unused enable_caches(void)
 {
 	u64 tlb_addr = gd->arch.tlb_addr;
 	u64 tlb_size = gd->arch.tlb_size;
