@@ -1,15 +1,7 @@
 CONFIG_ARM=y
-# Buffer any printf()/panic()/log_err() output to a fixed physical RAM
-# address before a real console exists (gd->precon_buf_idx defaults to 0,
-# not negative, so this is live as soon as gd itself is set up, early in
-# board_init_f).
-#
-# Address is xbl_ramdump_mem's base (0x81200000, size 0x280000) -- a
-# real, verified no-map reserved-memory region from the live device's own
-# memory map, readable via /dev/mem from a subsequent `fastboot boot`
-# into a known-working Linux image after a warm reset. Kept in this
-# stripped-down "shell" build because it's the only postmortem channel
-# left once the USB/display bring-up code is gone.
+# Buffers early printf()/panic() output to xbl_ramdump_mem (a verified
+# no-map reserved-memory region), readable via /dev/mem after a warm
+# reset -- the only postmortem channel on this display/USB-less build.
 CONFIG_PRE_CONSOLE_BUFFER=y
 CONFIG_PRE_CON_BUF_SZ=16384
 CONFIG_PRE_CON_BUF_ADDR=0x81200000
@@ -36,16 +28,8 @@ CONFIG_CMD_CAT=y
 # CONFIG_OF_LIVE is not set
 CONFIG_OF_UPSTREAM_BUILD_VENDOR=y
 
-# Shell handoff build: ABL -> U-Boot -> straight to the extlinux.conf
-# kernel on UFS, no interactive UX at all. See board/qualcomm/sheng.env --
-# bootcmd does `scsi scan; bootflow scan -lb` unconditionally, nothing
-# more. All of the previous bring-up code (framebuffer/panel/backlight,
-# USB gadget/fastboot, button-kbd/bootmenu, EFI bootmgr+NVRAM for
-# systemd-boot) is intentionally gone; it's preserved on the
-# xiaomi-sheng branch (git stash + prior commits) if it's needed again.
-# This build exists purely to answer one question: does execution reach
-# the final kernel-jump handoff in arch/arm/lib/bootm.c at all. See the
-# psci_system_reset() trap there.
+# Shell handoff: ABL -> U-Boot -> extlinux kernel on UFS, no interactive
+# UX. See board/qualcomm/sheng.env for the boot sequence.
 CONFIG_ENV_DEFAULT_ENV_TEXT_FILE="board/qualcomm/sheng.env"
 CONFIG_PANIC_HANG=y
 # CONFIG_SILENT_CONSOLE is not set
@@ -100,10 +84,8 @@ CONFIG_PMIC_QCOM=y
 CONFIG_DM_REGULATOR=y
 CONFIG_DM_REGULATOR_FIXED=y
 CONFIG_DM_REGULATOR_QCOM_RPMH=y
-# UFS is the only persistent storage path on SM8550 (no eMMC) and is the
-# route to /boot/extlinux/extlinux.conf on the flashed rootfs partition,
-# so it stays enabled even though upstream SM8550 UFS support is still
-# young -- debug any instability directly rather than disabling it.
+# UFS is the only persistent storage path on SM8550 (no eMMC) and the
+# route to /boot/extlinux/extlinux.conf on the flashed rootfs partition.
 CONFIG_SCSI=y
 CONFIG_MSM_SERIAL=y
 CONFIG_MSM_GENI_SERIAL=y
@@ -114,7 +96,6 @@ CONFIG_SPMI_MSM=y
 CONFIG_SYSRESET_QCOM_PSHOLD=y
 CONFIG_UFS=y
 CONFIG_UFS_QCOM=y
-# Distro-boot arm64 "Image" header parsing (magic/text_offset/image_size)
-# -- unrelated to display despite living near CONFIG_VIDEO upstream,
-# needed for booti/extlinux to size and relocate the kernel correctly.
+# arm64 "Image" header parsing, needed for booti to size/relocate the
+# kernel correctly.
 CONFIG_LINUX_KERNEL_IMAGE_HEADER=y

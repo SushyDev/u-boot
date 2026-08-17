@@ -32,17 +32,12 @@
 #include <usb.h>
 #include <sort.h>
 #include <time.h>
-#include <fastboot.h>
-#include <g_dnl.h>
-#include <i2c.h>
-#include <linux/delay.h>
 
 #include "qcom-priv.h"
 
 DECLARE_GLOBAL_DATA_PTR;
 
 enum qcom_boot_source qcom_boot_source __section(".data") = 0;
-
 
 static struct mm_region rbx_mem_map[CONFIG_NR_DRAM_BANKS + 2] = { { 0 } };
 
@@ -210,26 +205,13 @@ static void qcom_psci_fixup(void *fdt)
  * to improve ABL compatibility. Otherwise, we use the DT provided by ABL.
  */
 /*
- * TEMPORARY BRING-UP DEFENSIVE CHECK (sheng): get_prev_bl_fdt_addr() just
- * returns raw x0 as saved at boot entry (arch/arm/lib/save_prev_bl_data.c),
- * with zero validation -- board_fdt_blob_setup() below then unconditionally
- * calls fdt_check_header() on it, before ever checking whether the internal
- * DTB is even usable. If ABL doesn't hand off a DTB pointer in x0 the way
- * this generic mach-snapdragon code assumes, that's an unguarded dereference
- * of a potentially garbage/unmapped address, this early in boot with no
- * exception vectors installed yet -- an unhandled crash, not a graceful
- * failure, and indistinguishable from a hang with no console. Since we no
- * longer depend on this path at all now that our own /memory node is valid
- * (see the board .dts), gate the dereference behind a coarse sanity check
- * instead of trusting x0 blindly. Revert (or tighten) once we have a real
- * signal on whether this was ever the issue.
+ * get_prev_bl_fdt_addr() returns raw x0 as saved at boot entry with no
+ * validation. sheng's internal DT is always valid, so gate the external
+ * pointer behind a sanity check instead of dereferencing it unconditionally
+ * this early in boot (no exception vectors installed yet).
  */
 static bool qcom_debug_addr_plausible(phys_addr_t addr)
 {
-	/* Non-null, 8-byte aligned (FDT convention), and within a broad
-	 * DRAM range for this SoC -- our own /memory node covers
-	 * 0xa0000000..0x2a0000000, so allow some margin either side.
-	 */
 	return addr && !(addr & 0x7) &&
 	       addr >= 0x80000000ULL && addr < 0x400000000ULL;
 }
@@ -564,15 +546,6 @@ int board_late_init(void)
 	phys_addr_t addr;
 	struct fdt_header *fdt_blob = (struct fdt_header *)gd->fdt_blob;
 
-	/* Shell handoff build: the GPIO 128 + KTZ8866A backlight/I2C bring-up
-	 * that used to live here is gone (it's driver-specific work, and
-	 * with CONFIG_DM_I2C stripped from this defconfig it wouldn't link
-	 * anyway) -- preserved on the xiaomi-sheng branch (git stash + prior
-	 * commits) if it's needed again. This build only needs the generic
-	 * runtime-address setup below, which extlinux/bootflow boot depends
-	 * on (kernel_addr_r, pxefile_addr_r, etc).
-	 */
-
 	/* We need to be fairly conservative here as we support boards with just 1G of TOTAL RAM */
 	status |= !lmb_alloc(SZ_128M, &addr) ?
 		env_set_hex("loadaddr", addr) : 1;
@@ -678,18 +651,10 @@ static int fdt_cmp_res(const void *v1, const void *v2)
 }
 
 /*
- * BOARD FIX (sheng): the compiled sm8550-xiaomi-sheng.dtb has 34 no-map
- * subnodes under /reserved-memory (inherited from sm8550.dtsi's base set --
- * this board only ever /delete-node/'s some, never adds its own), 2 over
- * the original 32. carve_out_reserved_memory() below silently drops
- * anything past N_RESERVED_REGIONS via `if (i == N_RESERVED_REGIONS) break`
- * -- meaning the last 2 regions never got PTE_TYPE_FAULT-mapped at all,
- * left as ordinary cacheable RAM instead. Per this same function's own
- * comment, that's "enough to trigger a security violation and trap to EL3"
- * if the cache-prefetcher speculatively touches one of them -- a silent,
- * extremely early crash matching everything observed on real hardware.
- * Bumped with headroom rather than the exact minimum (34) in case future
- * DT edits add more.
+ * sm8550-xiaomi-sheng.dtb has 34 no-map subnodes under /reserved-memory,
+ * over the original 32 -- carve_out_reserved_memory() silently drops
+ * anything past this count, leaving unmapped regions as ordinary
+ * cacheable RAM instead of PTE_TYPE_FAULT. Bumped with headroom.
  */
 #define N_RESERVED_REGIONS 48
 

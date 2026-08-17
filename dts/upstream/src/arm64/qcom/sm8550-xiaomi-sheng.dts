@@ -4,19 +4,11 @@
  *
  * U-Boot board port for the Xiaomi Pad 6S Pro 12.4 (sheng), trimmed down
  * from the sm8550-mainline downstream Linux DTS (arch/arm64/boot/dts/qcom/
- * sm8550-xiaomi-sheng.dts) to the subset U-Boot needs to reach an ESP and
- * hand off to systemd-boot: power sequencing, UFS, USB (gadget serial
- * console + fastboot), and the bootmenu buttons. Camera, audio,
- * touchscreen, fingerprint, hall sensor, Wi-Fi/BT and PCIe are all dropped
- * since U-Boot has no drivers for them and probing them only adds ways to
- * hang before a console is up.
- *
- * Every reg/supply/gpio value below was checked line-by-line against the
- * downstream DTS above and matches it exactly. There is deliberately no
- * splash/framebuffer continuation node: no source we have access to (this
- * downstream DTS, sheng-firmware, debian-sheng) documents the real ABL
- * splash buffer address, and shipping a guessed reserved-memory region
- * here would be worse than shipping none.
+ * sm8550-xiaomi-sheng.dts) to the subset U-Boot needs: power sequencing and
+ * UFS to reach /boot/extlinux/extlinux.conf. Camera, audio, touchscreen,
+ * fingerprint, hall sensor, Wi-Fi/BT, PCIe, and display are all dropped --
+ * U-Boot has no drivers for them, and probing them only adds ways to hang
+ * before a console is up.
  */
 
 /dts-v1/;
@@ -80,31 +72,14 @@
 	};
 
 	/*
-	 * Real, verified DRAM layout for this exact physical unit, pulled
-	 * directly from /proc/device-tree/memory@a0000000/reg on a live,
-	 * booted Debian system (xxd dump, parsed byte-for-byte -- not a
-	 * guess). 7 fragmented banks (an 8th, 0xd8800000 size 0, is a
-	 * degenerate zero-size artifact and is dropped here).
-	 *
-	 * Superseding board_fdt_blob_setup()'s external-FDT fallback
-	 * entirely: that path depends on both (a) ABL handing off a valid
-	 * FDT pointer in x0, which we've never been able to confirm, and
-	 * (b) our own qcom_debug_addr_plausible() guessed-range filter
-	 * (0x80000000..0x400000000) accepting whatever address ABL actually
-	 * uses -- confirmed via QEMU that this filter's range assumption is
-	 * real DRAM-base guesswork, not verified fact. Giving qcom_parse_
-	 * memory() a real, valid internal DTB removes the dependency on
-	 * either of those unknowns.
-	 */
-	/*
-	 * Must be named exactly memory@a0000000 (matching sm8550.dtsi's
-	 * placeholder, which has no label to /delete-node/ by reference) --
-	 * a different unit-address here creates a *second*, separate
-	 * memory@ node instead of overriding the placeholder, and
-	 * fdt_path_offset(fdt, "/memory") matches whichever one is first in
-	 * the tree (the empty placeholder), silently ignoring this one.
-	 * Confirmed via fdtdump on the compiled output: this was exactly
-	 * what broke the first attempt at this fix.
+	 * Real DRAM layout for this device, pulled from
+	 * /proc/device-tree/memory@a0000000/reg on a live, booted system:
+	 * 7 fragmented banks (an 8th, 0xd8800000 size 0, is a degenerate
+	 * zero-size artifact and is dropped). Gives qcom_parse_memory() a
+	 * valid internal DTB instead of depending on ABL handing off a
+	 * usable FDT pointer in x0. Must be named exactly memory@a0000000
+	 * to override sm8550.dtsi's placeholder rather than create a second,
+	 * separate node.
 	 */
 	memory@a0000000 {
 		device_type = "memory";
@@ -506,12 +481,7 @@
 	};
 };
 
-/*
- * Deliberate deviation from the downstream DTS (which leaves dispcc at its
- * sm8550.dtsi default status, "okay"): U-Boot has no MDSS/DPU driver, so
- * there's nothing here that would ever use this clock controller. Disabled
- * to keep it out of the probe graph entirely.
- */
+/* U-Boot has no MDSS/DPU driver; keep dispcc out of the probe graph. */
 &dispcc {
 	status = "disabled";
 };
@@ -559,14 +529,6 @@
 &i2c1 {
 	status = "okay";
 };
-
-/* i2c_master_hub_0 / i2c_hub_2 (ktz8866b, chip B) intentionally left
- * disabled -- U-Boot's geni_i2c_master_hub driver never loads QUP protocol
- * firmware for this wrapper (qcom_geni_fw_initialise() only handles
- * driver->name == "geni-se-qup"), so probing this bus NULL-derefs inside
- * qcom_geni_load_firmware()/read_elf() and hangs. See board_late_init()
- * comment in mach-snapdragon/board.c. Only chip A (i2c1) is initialized.
- */
 
 &qupv3_id_0 {
 	status = "okay";

@@ -7,6 +7,8 @@
 #
 .*
 !.checkpatch.conf
+devenv.nix
+devenv.lock
 *.a
 *.asn1.[ch]
 *.bin
