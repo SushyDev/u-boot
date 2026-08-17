@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * sheng shell-handoff bring-up checkpoint (PSCI reset as a reachability
- * signal for bisecting hangs with no display/USB/UART available).
- *
- * `trap` is not called anywhere in bootcmd on this board and looks like
- * dead code -- it isn't. Removing this file (and its cmd/Makefile hook)
- * has been confirmed on real hardware to reintroduce a boot hang, even
- * though nothing else changes and bootcmd never references it. Cause
- * not fully understood (suspected link-layout/size sensitivity on this
- * particular bring-up), but empirically: do not remove without a full
- * reboot test on real hardware first.
+ * sheng shell-handoff bring-up: a bootcmd-callable checkpoint. Reaching
+ * this command and issuing the PSCI reset is the only observable signal
+ * available on this build (no display, no USB, no confirmed UART) -- if
+ * the device reboots, everything in bootcmd before this point completed;
+ * if it just hangs instead, the failure is upstream of wherever `trap`
+ * was placed in bootcmd. Move it forward once the current position is
+ * confirmed reached, same as the earlier LED/fastboot traps on this
+ * board. Remove once the real hang site is found.
  */
 
 #include <command.h>
