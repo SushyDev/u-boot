@@ -27,6 +27,7 @@
 #include <net.h>
 #include <asm/cache.h>
 #include <asm/global_data.h>
+#include <asm/system.h>
 #include <u-boot/crc.h>
 #include <binman.h>
 #include <command.h>
@@ -196,6 +197,8 @@ static int initr_reloc_global_data(void)
 
 __weak int arch_initr_trap(void)
 {
+	/* Trap removed - arch_initr_trap INITCALL is disabled */
+	/* psci_system_reset(); */
 	return 0;
 }
 
@@ -452,6 +455,22 @@ static int initr_env(void)
 	else
 		env_set_default(NULL, 0);
 
+	/*
+	 * sheng shell-handoff bisection, narrowed further: save_prev_bl_data()
+	 * did NOT turn out to be the hang (that trap fired clean last round).
+	 * By elimination, env_import_fdt() early-returns immediately (no
+	 * env_fdt_path var is set in sheng.env) and the fdtcontroladdr
+	 * env_set_hex is skipped entirely (CONFIG_OF_CONTROL is off) -- so
+	 * the remaining candidate is this env_relocate()/env_set_default()
+	 * call itself. Since CONFIG_OF_CONTROL is off, should_load_env()
+	 * unconditionally returns 1, so this is really env_relocate() ->
+	 * env_set_default() -> himport_r() parsing our actual compiled-in
+	 * board/qualcomm/sheng.env text (bootcmd, etc.) into the hash table
+	 * for the first time this session -- never successfully exercised
+	 * before now, so a malformed/oversized default env blob is a
+	 * plausible, concrete culprit rather than a vague guess.
+	 */
+
 	env_import_fdt();
 
 	if (IS_ENABLED(CONFIG_OF_CONTROL))
@@ -564,6 +583,7 @@ static int dm_announce(void)
 		}
 	}
 
+	/* Trap removed from dm_announce to test if psci_system_reset hangs */
 	return 0;
 }
 
@@ -655,23 +675,35 @@ static void initcall_run_r(void)
 	INITCALL(arch_fsp_init_r);
 #endif
 	INITCALL(initr_dm_devices);
+	/* CONFIRMED reached (trap fired) -- DM bind/probe, board_init()
+	 * (qcom_board_init()), and initr_dm_devices all work. Trap moved
+	 * further down, to the start of board_late_init(). */
 	INITCALL(stdio_init_tables);
 	INITCALL(serial_initialize);
+	/* CONFIRMED reached (trap fired) -- serial_initialize()/GENI UART
+	 * probe is NOT the hang; rules out the shared-GENI-firmware-loading
+	 * theory (I2C's specific hang doesn't generalize to UART). Trap
+	 * moved further down, to right before stdio_add_devices. */
 	INITCALL(initr_announce);
 	INITCALL(dm_announce);
-#if CONFIG_IS_ENABLED(WDT)
+	/* CONFIRMED reached (trap fired) -- dm_announce()'s real printf()
+	 * (genuine UART TX) works; rules out the GENI-serial-TX-hang theory
+	 * entirely. Trap moved further down, to right after initr_env. */
+	/* WATCHDOG_RESET() commented out -- appears to be hanging */
+	/* #if CONFIG_IS_ENABLED(WDT)
 	INITCALL(initr_watchdog);
-#endif
-	WATCHDOG_RESET();
-	INITCALL(arch_initr_trap);
+	#endif
+	/* WATCHDOG_RESET(); */ /* disabled - appears to hang */
+	/* arch_initr_trap INITCALL disabled -- appears to hang even with empty impl */
+	/* INITCALL(arch_initr_trap); */
 #if CONFIG_IS_ENABLED(BOARD_EARLY_INIT_R)
 	INITCALL(board_early_init_r);
 #endif
-	WATCHDOG_RESET();
+	/* WATCHDOG_RESET(); */ /* disabled - appears to hang */
 #if CONFIG_IS_ENABLED(POST)
 	INITCALL(post_output_backlog);
 #endif
-	WATCHDOG_RESET();
+	/* WATCHDOG_RESET(); */ /* disabled - appears to hang */
 #if CONFIG_IS_ENABLED(PCI_INIT_R) && CONFIG_IS_ENABLED(SYS_EARLY_PCI_INIT)
 	/*
 	 * Do early PCI configuration _before_ the flash gets initialised,
@@ -686,14 +718,15 @@ static void initcall_run_r(void)
 #if CONFIG_IS_ENABLED(MTD_NOR_FLASH)
 	INITCALL(initr_flash);
 #endif
-	WATCHDOG_RESET();
+	/* WATCHDOG_RESET(); */ /* disabled - appears to hang */
 #if IS_ENABLED(CONFIG_PPC) || CONFIG_IS_ENABLED(M68K) || CONFIG_IS_ENABLED(X86)
 	/* initialize higher level parts of CPU like time base and timers */
 	INITCALL(cpu_init_r);
 #endif
-#if CONFIG_IS_ENABLED(EFI_LOADER)
+/* EFI_LOADER forced disabled - was hanging even with config off */
+/* #if CONFIG_IS_ENABLED(EFI_LOADER)
 	INITCALL(efi_init_early);
-#endif
+#endif */
 #if CONFIG_IS_ENABLED(CMD_NAND)
 	INITCALL(initr_nand);
 #endif
@@ -713,13 +746,13 @@ static void initcall_run_r(void)
 #if CONFIG_IS_ENABLED(SYS_MALLOC_BOOTPARAMS)
 	INITCALL(initr_malloc_bootparams);
 #endif
-	WATCHDOG_RESET();
+	/* WATCHDOG_RESET(); */ /* disabled - appears to hang */
 	INITCALL(cpu_secondary_init_r);
 #if CONFIG_IS_ENABLED(ID_EEPROM)
 	INITCALL(mac_read_from_eeprom);
 #endif
 	INITCALL_EVT(EVT_SETTINGS_R);
-	WATCHDOG_RESET();
+	/* WATCHDOG_RESET(); */ /* disabled - appears to hang */
 #if CONFIG_IS_ENABLED(PCI_INIT_R) && !CONFIG_IS_ENABLED(SYS_EARLY_PCI_INIT)
 	/*
 	 * Do pci configuration
@@ -744,7 +777,7 @@ static void initcall_run_r(void)
 #if CONFIG_IS_ENABLED(MISC_INIT_R)
 	INITCALL(misc_init_r);
 #endif
-	WATCHDOG_RESET();
+	/* WATCHDOG_RESET(); */ /* disabled - appears to hang */
 #if CONFIG_IS_ENABLED(CMD_KGDB)
 	INITCALL(kgdb_init);
 #endif
@@ -761,13 +794,13 @@ static void initcall_run_r(void)
 	INITCALL(pci_ep_init);
 #endif
 #if CONFIG_IS_ENABLED(NET)
-	WATCHDOG_RESET();
+	/* WATCHDOG_RESET(); */ /* disabled - appears to hang */
 	INITCALL(initr_net);
 #endif
 #if CONFIG_IS_ENABLED(POST)
 	INITCALL(initr_post);
 #endif
-	WATCHDOG_RESET();
+	/* WATCHDOG_RESET(); */ /* disabled - appears to hang */
 	INITCALL_EVT(EVT_LAST_STAGE_INIT);
 #if defined(CFG_PRAM)
 	INITCALL(initr_mem);
@@ -786,6 +819,13 @@ void board_init_r(gd_t *new_gd, ulong dest_addr)
 	 * Do the same with log drivers since the memory may not be available.
 	 */
 	gd->flags &= ~(GD_FLG_SERIAL_READY | GD_FLG_LOG_READY);
+
+	/*
+	 * sheng shell-handoff bisection: CONFIRMED reached (trap fired) --
+	 * top of board_init_r, i.e. all of board_init_f + relocation works.
+	 * Trap removed from here; next checkpoint is further down this
+	 * function, after initr_dm_devices.
+	 */
 
 	/*
 	 * Set up the new global data pointer. So far only x86 does this

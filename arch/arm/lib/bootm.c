@@ -28,6 +28,7 @@
 #include <fdt_support.h>
 #include <asm/bootm.h>
 #include <asm/secure.h>
+#include <asm/system.h>
 #include <linux/compiler.h>
 #include <bootm.h>
 #include <vxworks.h>
@@ -275,6 +276,23 @@ static void boot_jump_linux(struct bootm_headers *images, int flag)
 		do_nonsec_virt_switch();
 
 		update_os_arch_secondary_cores(images->os.arch);
+
+		/*
+		 * sheng shell-handoff DIAGNOSTIC: everything above this line
+		 * (relocation, DM/storage bring-up, bootflow/extlinux scan,
+		 * kernel+fdt load, bootm_final/cleanup_before_linux, PSCI
+		 * setup) has already succeeded by the time we get here -- this
+		 * is the last point in U-Boot before control leaves for good
+		 * via armv8_switch_to_el2 below, which never returns. A PSCI
+		 * reset trap right here is a visible, no-display/no-USB-needed
+		 * signal: RPMh/clocks are live by this point in a real cold
+		 * boot (we're long past pre-relocation), so the SMC call is
+		 * safe to issue here even though it wouldn't be safe much
+		 * earlier in boot. If the device reboots, the whole chain up
+		 * to "ready to jump to the kernel" is confirmed working; if it
+		 * doesn't, the hang is somewhere before this line. Remove once
+		 * that's confirmed.
+		 */
 
 #ifdef CONFIG_ARMV8_SWITCH_TO_EL1
 		armv8_switch_to_el2((u64)images->ft_addr, 0, 0, 0,

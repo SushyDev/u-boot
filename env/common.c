@@ -14,6 +14,7 @@
 #include <log.h>
 #include <sort.h>
 #include <asm/global_data.h>
+#include <asm/system.h>
 #include <linux/printk.h>
 #include <linux/stddef.h>
 #include <mapmem.h>

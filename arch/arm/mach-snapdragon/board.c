@@ -564,109 +564,14 @@ int board_late_init(void)
 	phys_addr_t addr;
 	struct fdt_header *fdt_blob = (struct fdt_header *)gd->fdt_blob;
 
-	/* Enable backlight: GPIO 128 + KTZ8866A I2C config */
-	{
-		struct udevice *i2c_bus __maybe_unused, *chip __maybe_unused, *reg_dev;
-		int ret;
-
-		/* Explicitly enable VPH_PWR regulator (may not be truly always-on) */
-		ret = uclass_get_device_by_name(UCLASS_REGULATOR, "vph_pwr", &reg_dev);
-		if (ret == 0 && reg_dev)
-			regulator_set_enable(reg_dev, true);
-
-		/* GPIO 128 enable (backlight enable pin) via direct MMIO (TLMM 0xf100000) */
-		{
-			void __iomem *gpio_cfg = (void __iomem *)(0xf100000 + 128 * 0x1000);
-			void __iomem *gpio_inout = (void __iomem *)(0xf100000 + 128 * 0x1000 + 0x4);
-			u32 cfg = readl(gpio_cfg);
-			cfg |= BIT(9);
-			writel(cfg, gpio_cfg);
-			writel(BIT(1), gpio_inout);
-		}
-
-		mdelay(20);
-
-		/* Trap: after GPIO and regulator, before I2C */
-		{
-			struct arm_smccc_res res;
-			arm_smccc_smc(ARM_PSCI_0_2_FN_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, 0, &res);
-		}
-
-		/* KTZ8866A backlight IC initialization
-		 * Scan I2C1 for any responding devices to find actual address
-		 */
-		{
-			ofnode i2c_node = ofnode_path("/soc/geniqup@8c0000/i2c@a84000");
-
-			if (ofnode_valid(i2c_node)) {
-				ret = uclass_get_device_by_ofnode(UCLASS_I2C, i2c_node, &i2c_bus);
-
-				if (ret == 0 && i2c_bus) {
-					/* Trap: about to scan I2C addresses */
-					{
-						struct arm_smccc_res res;
-						arm_smccc_smc(ARM_PSCI_0_2_FN_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, 0, &res);
-					}
-
-					/* Scan addresses 0x10-0x20 for any responding chip */
-					u8 probe_addrs[] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-						0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20};
-					int addr_idx;
-					for (addr_idx = 0; addr_idx < ARRAY_SIZE(probe_addrs); addr_idx++) {
-						ret = dm_i2c_probe(i2c_bus, probe_addrs[addr_idx], 0, &chip);
-						if (ret == 0 && chip) {
-							/* Found chip at this address! */
-							{
-								struct arm_smccc_res res;
-								arm_smccc_smc(ARM_PSCI_0_2_FN_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, 0, &res);
-							}
-							break;
-						}
-					}
-
-					if (ret == 0 && chip) {
-						u8 buf;
-
-						/* current-num-sinks=5 -> BIT(5)-1 */
-						buf = 0x1F;
-						dm_i2c_write(chip, 0x08, &buf, 1);
-
-						/* current-ramp-delay-ms=256 (>128 branch):
-						 * BIT(7) | ((5+256/64)<<3) | PWM_HYST(5) = 0xCD
-						 */
-						buf = 0xCD;
-						dm_i2c_write(chip, 0x03, &buf, 1);
-
-						/* led-enable-ramp-delay-ms=8 -> ramp_on(4)<<4 | ramp_off(4) */
-						buf = 0x44;
-						dm_i2c_write(chip, 0x14, &buf, 1);
-
-						/* kinetic,enable-lcd-bias */
-						buf = 0x9F;
-						dm_i2c_write(chip, 0x09, &buf, 1);
-
-						mdelay(10); /* let LCD bias/boost stabilize before brightness+enable */
-
-						buf = 0x07;
-						dm_i2c_write(chip, 0x04, &buf, 1);
-
-						buf = 0xFF;
-						dm_i2c_write(chip, 0x05, &buf, 1);
-
-						mdelay(10);
-
-						/* BL_EN | BL_EN_BIT(0x40) */
-						buf = 0x5F;
-						dm_i2c_write(chip, 0x08, &buf, 1);
-
-						/* Trap: all KTZ8866A register writes completed */
-						struct arm_smccc_res res;
-						arm_smccc_smc(ARM_PSCI_0_2_FN_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, 0, &res);
-					}
-				}
-			}
-		}
-	}
+	/* Shell handoff build: the GPIO 128 + KTZ8866A backlight/I2C bring-up
+	 * that used to live here is gone (it's driver-specific work, and
+	 * with CONFIG_DM_I2C stripped from this defconfig it wouldn't link
+	 * anyway) -- preserved on the xiaomi-sheng branch (git stash + prior
+	 * commits) if it's needed again. This build only needs the generic
+	 * runtime-address setup below, which extlinux/bootflow boot depends
+	 * on (kernel_addr_r, pxefile_addr_r, etc).
+	 */
 
 	/* We need to be fairly conservative here as we support boards with just 1G of TOTAL RAM */
 	status |= !lmb_alloc(SZ_128M, &addr) ?
