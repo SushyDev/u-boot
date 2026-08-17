@@ -659,24 +659,19 @@ static void initcall_run_r(void)
 	INITCALL(serial_initialize);
 	INITCALL(initr_announce);
 	INITCALL(dm_announce);
-	/*
-	 * WDT/watchdog INITCALLs and arch_initr_trap hang on this board even
-	 * with CONFIG_WATCHDOG/HW_WATCHDOG unset and an empty arch_initr_trap
-	 * impl -- disabled throughout this function rather than only here.
-	 */
-	/* #if CONFIG_IS_ENABLED(WDT)
+#if CONFIG_IS_ENABLED(WDT)
 	INITCALL(initr_watchdog);
-	#endif
-	/* WATCHDOG_RESET(); */
-	/* INITCALL(arch_initr_trap); */
+#endif
+	WATCHDOG_RESET();
+	INITCALL(arch_initr_trap);
 #if CONFIG_IS_ENABLED(BOARD_EARLY_INIT_R)
 	INITCALL(board_early_init_r);
 #endif
-	/* WATCHDOG_RESET(); */
+	WATCHDOG_RESET();
 #if CONFIG_IS_ENABLED(POST)
 	INITCALL(post_output_backlog);
 #endif
-	/* WATCHDOG_RESET(); */
+	WATCHDOG_RESET();
 #if CONFIG_IS_ENABLED(PCI_INIT_R) && CONFIG_IS_ENABLED(SYS_EARLY_PCI_INIT)
 	/*
 	 * Do early PCI configuration _before_ the flash gets initialised,
@@ -691,15 +686,14 @@ static void initcall_run_r(void)
 #if CONFIG_IS_ENABLED(MTD_NOR_FLASH)
 	INITCALL(initr_flash);
 #endif
-	/* WATCHDOG_RESET(); */
+	WATCHDOG_RESET();
 #if IS_ENABLED(CONFIG_PPC) || CONFIG_IS_ENABLED(M68K) || CONFIG_IS_ENABLED(X86)
 	/* initialize higher level parts of CPU like time base and timers */
 	INITCALL(cpu_init_r);
 #endif
-/* efi_init_early hangs on this board even with CONFIG_EFI_LOADER unset */
-/* #if CONFIG_IS_ENABLED(EFI_LOADER)
+#if CONFIG_IS_ENABLED(EFI_LOADER)
 	INITCALL(efi_init_early);
-#endif */
+#endif
 #if CONFIG_IS_ENABLED(CMD_NAND)
 	INITCALL(initr_nand);
 #endif
@@ -719,13 +713,13 @@ static void initcall_run_r(void)
 #if CONFIG_IS_ENABLED(SYS_MALLOC_BOOTPARAMS)
 	INITCALL(initr_malloc_bootparams);
 #endif
-	/* WATCHDOG_RESET(); */
+	WATCHDOG_RESET();
 	INITCALL(cpu_secondary_init_r);
 #if CONFIG_IS_ENABLED(ID_EEPROM)
 	INITCALL(mac_read_from_eeprom);
 #endif
 	INITCALL_EVT(EVT_SETTINGS_R);
-	/* WATCHDOG_RESET(); */
+	WATCHDOG_RESET();
 #if CONFIG_IS_ENABLED(PCI_INIT_R) && !CONFIG_IS_ENABLED(SYS_EARLY_PCI_INIT)
 	/*
 	 * Do pci configuration
@@ -750,7 +744,7 @@ static void initcall_run_r(void)
 #if CONFIG_IS_ENABLED(MISC_INIT_R)
 	INITCALL(misc_init_r);
 #endif
-	/* WATCHDOG_RESET(); */
+	WATCHDOG_RESET();
 #if CONFIG_IS_ENABLED(CMD_KGDB)
 	INITCALL(kgdb_init);
 #endif
@@ -767,13 +761,13 @@ static void initcall_run_r(void)
 	INITCALL(pci_ep_init);
 #endif
 #if CONFIG_IS_ENABLED(NET)
-	/* WATCHDOG_RESET(); */
+	WATCHDOG_RESET();
 	INITCALL(initr_net);
 #endif
 #if CONFIG_IS_ENABLED(POST)
 	INITCALL(initr_post);
 #endif
-	/* WATCHDOG_RESET(); */
+	WATCHDOG_RESET();
 	INITCALL_EVT(EVT_LAST_STAGE_INIT);
 #if defined(CFG_PRAM)
 	INITCALL(initr_mem);
