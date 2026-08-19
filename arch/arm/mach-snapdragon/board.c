@@ -17,7 +17,9 @@
 #include <dm/device.h>
 #include <dm/pinctrl.h>
 #include <dm/uclass-internal.h>
+#include <dm/uclass.h>
 #include <dm/read.h>
+#include <video.h>
 #include <power/regulator.h>
 #include <env.h>
 #include <fdt_support.h>
@@ -335,6 +337,28 @@ int board_init(void)
 
 int ft_board_setup(void *blob, struct bd_info *bd)
 {
+	/* Relay sheng_mdss's per-stage status codes (see
+	 * drivers/video/qualcomm/sheng_mdss.c) into /chosen so they're
+	 * readable from Linux at /proc/device-tree/chosen/sheng,mdss-status
+	 * -- this board has no working UART/console during U-Boot's own
+	 * boot stage to see log_debug() output directly. 5 stages x 4
+	 * bytes = 20 bytes (gdsc, dispcc, dsi_phy, dsi_panel, dpu, in that
+	 * order); each is 0x7fffffff if that stage was never reached, 0 on
+	 * success, or a negative errno.
+	 */
+	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS) && IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
+		int nodeoff = fdt_path_offset(blob, "/chosen");
+
+		if (nodeoff >= 0) {
+			fdt_setprop(blob, nodeoff, "sheng,mdss-status",
+				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3000),
+				    24);
+			fdt_setprop(blob, nodeoff, "sheng,uclass-get-device-ret",
+				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3020),
+				    4);
+		}
+	}
+
 	return 0;
 }
 
@@ -597,6 +621,34 @@ int board_late_init(void)
 	qcom_show_boot_source();
 	/* Configure the dfu_string for capsule updates */
 	qcom_configure_capsule_updates();
+
+	/*
+	 * CONFIG_VIDEO=y only *binds* video devices during early boot
+	 * (video_reserve()'s uclass walk); nothing in this board's flow
+	 * otherwise *probes* one (no splash screen, no CONSOLE_MUX/
+	 * SYS_CONSOLE_IS_IN_ENV console selection -- both explicitly
+	 * disabled elsewhere, see configs/sm8550_defconfig, to work
+	 * around an unrelated early-boot hang). Force a probe attempt
+	 * here so sheng_mdss's probe() actually runs.
+	 */
+	if (IS_ENABLED(CONFIG_VIDEO)) {
+		struct udevice *vdev = NULL;
+		int vret;
+
+		vret = uclass_get_device(UCLASS_VIDEO, 0, &vdev);
+		if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
+			/* Diagnostic: raw uclass_get_device() return code,
+			 * to tell "no video device bound at all" (-ENODEV)
+			 * apart from "bound but probe() itself failed"
+			 * (whatever sheng_mdss_probe() returned) apart from
+			 * "found and probed fine" (0). Separate slot from
+			 * sheng_mdss's own 5-stage status array so it's
+			 * populated even if probe() is never entered at all.
+			 * Relayed via ft_board_setup below.
+			 */
+			*(volatile int *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3020) = vret;
+		}
+	}
 
 	return 0;
 }

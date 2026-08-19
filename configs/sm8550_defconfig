@@ -28,8 +28,8 @@ CONFIG_CMD_CAT=y
 # CONFIG_OF_LIVE is not set
 CONFIG_OF_UPSTREAM_BUILD_VENDOR=y
 
-# Shell handoff: ABL -> U-Boot -> extlinux kernel on UFS, no interactive
-# UX. See board/qualcomm/sheng.env for the boot sequence.
+# Shell handoff: ABL -> U-Boot -> kernel on UFS, no interactive UX. See
+# board/qualcomm/sheng.env for the boot sequence.
 CONFIG_ENV_DEFAULT_ENV_TEXT_FILE="board/qualcomm/sheng.env"
 CONFIG_PANIC_HANG=y
 # CONFIG_SILENT_CONSOLE is not set
@@ -41,6 +41,37 @@ CONFIG_ENV_USE_DEFAULT_ENV_TEXT_FILE=y
 # CONFIG_WDT is not set
 # CONFIG_EFI_LOADER is not set
 # CONFIG_MMC is not set
+CONFIG_VIDEO=y
+CONFIG_VIDEO_SHENG_MDSS=y
+# Root cause of the CONFIG_VIDEO hang (see git history / SPEC.md):
+# growing the u-boot binary enough to cross ~1MB loaded size (physical
+# kernel_offset 0x8000 + kernel_size) apparently collides with
+# something ABL still has resident there while jumping into "the
+# kernel" (actually u-boot.bin) -- confirmed via breadcrumb
+# instrumentation that _main's first instruction never even executes
+# once that boundary is crossed. Not a bug in any of our code; a size
+# budget. Trim what we don't need: the embedded splash logo and its
+# BMP decode support save real space for zero functional loss (we
+# don't use splash screens).
+# CONFIG_VIDEO_LOGO is not set
+# CONFIG_VIDEO_BMP_RLE8 is not set
+# CONFIG_BMP is not set
+# CONFIG_CMD_BMP is not set
+# CONFIG_VIDEO pulls these in via `imply`, and CONSOLE_MUX +
+# SYS_CONSOLE_IS_IN_ENV means console_init_r() looks up stdin/stdout/
+# stderr device names from the saved environment -- this board's env
+# was never set up with those and hung silently before any console
+# output at all when this was left on (confirmed on hardware). Force
+# both off; a single fixed serial console is all that's needed here.
+# CONFIG_CONSOLE_MUX is not set
+# CONFIG_SYS_CONSOLE_IS_IN_ENV is not set
+# Still hung with just those two off -- force off the rest of what
+# CONFIG_VIDEO implies too, to isolate whether it's one of these or
+# something in the core video uclass itself.
+# CONFIG_PANEL is not set
+# CONFIG_SIMPLE_PANEL is not set
+# CONFIG_CYCLIC is not set
+# CONFIG_BACKLIGHT is not set
 CONFIG_CLK=y
 CONFIG_CLK_STUB=y
 CONFIG_CLK_QCOM_SM8550=y

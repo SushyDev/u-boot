@@ -70,6 +70,25 @@ static const struct rpmhpd_desc sa8775p_desc = {
 	.num_pds = ARRAY_SIZE(sa8775p_rpmhpds),
 };
 
+/*
+ * SM8550 RPMH power domains -- only MMCX is wired up here, since that's
+ * the one the sheng_mdss DPU driver needs (mdss_mdp@ae01000's
+ * power-domains = <&rpmhpd RPMHPD_MMCX> in sm8550.dtsi -- the DPU core
+ * sits on a separate RPMh-voted rail from the MDSS_GDSC-gated wrapper/
+ * DISPCC/DSI, and without this vote any register access to the DPU
+ * block hangs the AHB bus indefinitely since the slave never acks).
+ * RPMHPD_MMCX/_AO = 6/7 from dt-bindings/power/qcom,rpmhpd.h.
+ */
+static struct rpmhpd *sm8550_rpmhpds[] = {
+	[RPMHPD_MMCX] = &mmcx,
+	[RPMHPD_MMCX_AO] = &mmcx_ao,
+};
+
+static const struct rpmhpd_desc sm8550_desc = {
+	.rpmhpds = sm8550_rpmhpds,
+	.num_pds = ARRAY_SIZE(sm8550_rpmhpds),
+};
+
 /* stub RPMH power domains mapped for unsupported platforms */
 static struct rpmhpd *stub_rpmhpds[] = {};
 
@@ -102,7 +121,7 @@ static const struct udevice_id rpmhpd_match_table[] = {
 	{ .compatible = "qcom,sm8250-rpmhpd", .data = (ulong)&stub_desc },
 	{ .compatible = "qcom,sm8350-rpmhpd", .data = (ulong)&stub_desc },
 	{ .compatible = "qcom,sm8450-rpmhpd", .data = (ulong)&stub_desc },
-	{ .compatible = "qcom,sm8550-rpmhpd", .data = (ulong)&stub_desc },
+	{ .compatible = "qcom,sm8550-rpmhpd", .data = (ulong)&sm8550_desc },
 	{ .compatible = "qcom,sm8650-rpmhpd", .data = (ulong)&stub_desc },
 	{ .compatible = "qcom,sm8750-rpmhpd", .data = (ulong)&stub_desc },
 	{ .compatible = "qcom,x1e80100-rpmhpd", .data = (ulong)&stub_desc },

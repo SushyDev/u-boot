@@ -481,9 +481,22 @@
 	};
 };
 
-/* U-Boot has no MDSS/DPU driver; keep dispcc out of the probe graph. */
+/*
+ * sheng_mdss (drivers/video/qualcomm/) is a native U-Boot MDSS/DPU
+ * driver -- enable both nodes upstream leaves disabled by default
+ * (sm8550.dtsi has no U-Boot driver in mind, so neither is on unless
+ * a board explicitly needs it). sheng_mdss does raw MMIO throughout
+ * (GDSC/DISPCC/DSI-PHY/DPU registers) rather than going through
+ * U-Boot's clock framework, so dispcc doesn't strictly need to probe
+ * successfully for mdss's own probe to run -- enabled anyway since
+ * mdss's `clocks` property phandle-references it.
+ */
 &dispcc {
-	status = "disabled";
+	status = "okay";
+};
+
+&mdss {
+	status = "okay";
 };
 
 &pm8550_gpios {

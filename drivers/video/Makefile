@@ -94,3 +94,4 @@ obj-$(CONFIG_VIDEO_ZYNQMP_DPSUB) += zynqmp/
 obj-y += bridge/
 obj-y += sunxi/
 obj-y += tegra/
+obj-y += qualcomm/

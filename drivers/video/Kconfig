@@ -1022,6 +1022,21 @@ config VIDEO_MCDE_SIMPLE
 	  before u-boot starts, and u-boot will simply render to the pre-
 	  allocated frame buffer surface.
 
+config VIDEO_SHENG_MDSS
+	bool "Native MDSS/DSI driver for SM8550 (Xiaomi Pad 6S Pro)"
+	depends on VIDEO
+	help
+	  Bare-metal Qualcomm MDSS display driver for the SM8550
+	  Snapdragon 8 Gen 2, targeting the Xiaomi Pad 6S Pro ("sheng").
+	  Unlike downstream ABL, this brings up GDSC/DISPCC clocks, the
+	  DSI PHY/host, and the DPU pixel pipeline directly from cold
+	  boot, since ABL does not leave a usable continuous splash
+	  framebuffer behind for simple-framebuffer to reuse.
+
+	  Register sequencing is implemented in Zig
+	  (drivers/video/qualcomm/sheng_mdss_hw.zig) and requires the
+	  `zig` compiler on PATH to build.
+
 config OSD
 	bool "Enable OSD support"
 	depends on DM
