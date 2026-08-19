@@ -214,6 +214,35 @@ const GDSC_RETAIN_FF_ENABLE: u32 = 1 << 11;
 const GDSC_POWER_UP_COMPLETE: u32 = 1 << 16;
 const GDSC_POLL_TIMEOUT_US: u32 = 2000;
 
+// DISP_CC_MDSS_CORE_BCR, from disp_cc_sm8550_resets[DISP_CC_MDSS_CORE_BCR]
+// = { 0x8000 } in dispcc-sm8550.c (qcom_reset_map: only .reg set, so
+// .bit defaults to 0 -> mask = BIT(0)). Confirmed present and
+// read/write-accessible in the live device's own regmap at
+// af00000.clock-controller's offset 08000 before ever writing to it.
+//
+// msm_mdss_reset() in msm_mdss.c calls this via the generic
+// reset-controller framework (reset_control_assert() / msleep(20) /
+// reset_control_deassert()) as the FIRST thing msm_mdss_init() does --
+// before GDSC, before any clock is parsed or enabled. It's a plain
+// regmap write into DISPCC, which is already reachable pre-GDSC (the
+// AHB config path to DISPCC is on the always-on GCC_DISP_AHB_CLK), so
+// nothing about clock/power sequencing blocks doing this first. Never
+// attempted before -- see SPEC.md's "Next leads, not yet tried".
+const MDSS_CORE_BCR_OFFSET: usize = 0x8000;
+const MDSS_CORE_BCR_MASK: u32 = 1 << 0;
+
+/// Assert then deassert DISP_CC_MDSS_CORE_BCR, mirroring msm_mdss_reset().
+/// Source holds the reset for msleep(20) ("tests indicate reset has to
+/// be held for some period of time... one frame in a typical system");
+/// U-Boot's udelay() is the closest equivalent to that busy-ish wait.
+export fn sheng_mdss_core_reset(dispcc_base: usize) callconv(.c) void {
+    mmioSetBits32(dispcc_base, MDSS_CORE_BCR_OFFSET, MDSS_CORE_BCR_MASK);
+    _ = mmioRead32(dispcc_base, MDSS_CORE_BCR_OFFSET); // ensure write completion, like regmap_read() does
+    udelay(20000);
+    mmioClearBits32(dispcc_base, MDSS_CORE_BCR_OFFSET, MDSS_CORE_BCR_MASK);
+    _ = mmioRead32(dispcc_base, MDSS_CORE_BCR_OFFSET);
+}
+
 /// Enable the MDSS GDSC power domain, mirroring gdsc_enable() in
 /// gdsc.c for the mdss_gdsc case (no SW_RESET/CLAMP_IO/VOTABLE
 /// branches apply to it, so this only implements what mdss_gdsc's own
@@ -396,8 +425,39 @@ const MDP_CLK_CBCR: usize = 0x800c;
 const MDP_CLK_SRC_SEL_PLL0: u32 = 1;
 const MDP_CLK_DIV_REG_VAL: u32 = 5; // F(514000000, P_DISP_CC_PLL0_OUT_MAIN, 3, 0, 0) -> 2*3-1
 
+// disp_cc_mdss_mdp_lut_clk (halt_reg=enable_reg=0x8018, bit0,
+// BRANCH_HALT_VOTED): a plain branch off disp_cc_mdss_mdp_clk_src, the
+// SAME RCG we already configure for MDP_CLK above -- no separate RCG
+// programming needed, just another CBCR enable.
+//
+// disp_cc_mdss_vsync_clk (halt_reg=enable_reg=0x8024, bit0,
+// BRANCH_HALT): sourced from its own disp_cc_mdss_vsync_clk_src RCG
+// (cmd_rcgr=0x80f0, parent_map_0: P_BI_TCXO=0, mnd_width=0 i.e.
+// HID-only like AHB), needs its own rcg2ConfigureHidOnly() call. Target
+// 19.2MHz (XO passthrough, div=1) confirmed against the live device's
+// own clk_summary -- see SPEC.md.
+//
+// mdss_mdp@ae01000's OWN devicetree node (distinct from the mdss
+// wrapper's) lists clock-names = "bus","nrt_bus","iface","lut","core",
+// "vsync" -- six clocks. dpu_runtime_resume() in dpu_kms.c does
+// clk_bulk_prepare_enable() over ALL of them before dpu_kms_hw_init()
+// ever reads the DPU HW_VERSION register. We had only ever enabled
+// "iface" (AHB) and "core" (MDP) -- "lut" and "vsync" were never
+// touched at all. The wrapper device doesn't need these (which is why
+// DISPCC/DSI worked fine without them), but the DPU sub-block, a
+// separate platform device with its own additional clock requirements,
+// might. Never attempted before this pass.
+const MDP_LUT_CLK_CBCR: usize = 0x8018;
+
+const VSYNC_CLK_SRC_CMD_RCGR: usize = 0x80f0;
+const VSYNC_CLK_CBCR: usize = 0x8024;
+const VSYNC_CLK_SRC_SEL_XO: u32 = 0;
+const VSYNC_CLK_DIV_REG_VAL: u32 = 1; // F(19200000, P_BI_TCXO, 1, 0, 0) -> 2*1-1
+
 /// Bring up disp_cc_pll0, then the AHB (bus, 19.2MHz off XO) and MDP
-/// (DPU core, 514MHz off PLL0) clocks. pclk0/byte0/esc0 are NOT done
+/// (DPU core, 514MHz off PLL0) clocks, plus the MDP LUT and VSYNC
+/// clocks the DPU sub-block's own devicetree node additionally
+/// requires (see the comment above). pclk0/byte0/esc0 are NOT done
 /// here -- they mux from the DSI PHY's own PLL output rather than
 /// DISPCC's internal PLL0, so they belong with DSI PHY bring-up
 /// (sheng_mdss_dsi_phy_init) instead.
@@ -413,6 +473,14 @@ export fn sheng_mdss_dispcc_init(dispcc_base: usize) callconv(.c) c_int {
     ret = rcg2ConfigureHidOnly(dispcc_base, MDP_CLK_SRC_CMD_RCGR, MDP_CLK_SRC_SEL_PLL0, MDP_CLK_DIV_REG_VAL);
     if (ret != 0) return ret;
     ret = clkBranchEnable(dispcc_base, MDP_CLK_CBCR);
+    if (ret != 0) return ret;
+
+    ret = clkBranchEnable(dispcc_base, MDP_LUT_CLK_CBCR);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, VSYNC_CLK_SRC_CMD_RCGR, VSYNC_CLK_SRC_SEL_XO, VSYNC_CLK_DIV_REG_VAL);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, VSYNC_CLK_CBCR);
     if (ret != 0) return ret;
 
     return 0;
@@ -958,7 +1026,17 @@ fn dsiSendRawLong(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, data_i
 /// knowledge rather than read from DT. Without them the panel may
 /// simply not be in a receptive state, independent of whether this
 /// DSI command engine itself works correctly.
-export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) c_int {
+/// `enable_dsc`: the real panel bring-up needs DSC (video-mode pixel
+/// rate requires it -- see this file's own topology comment below), but
+/// the DPU write hang (SPEC.md task #5) meant the DSC-enabled panel was
+/// never actually fed compressed frames. sheng_mdss_dsi_test_patch()
+/// (below) is a DPU-bypass proof-of-concept that pushes a small
+/// *uncompressed* RGB888 patch directly over the command-mode DSI DMA
+/// engine -- if DSC were left enabled, the panel would try to DSC-decode
+/// that raw data as compressed and very likely show garbage or nothing.
+/// Pass false to leave DSC off (skips the 0x90/PPS/0x9d/framerate-branch
+/// block entirely) for that test; real use should pass true.
+export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, enable_dsc: bool) callconv(.c) c_int {
     dsiHostBringUp(dsi0_base);
     dsiHostBringUp(dsi1_base);
 
@@ -967,26 +1045,28 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
         if (ret != 0) return ret;
     }
 
-    // Enable DSC.
-    var ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x90, &[_]u8{0x03});
-    if (ret != 0) return ret;
+    if (enable_dsc) {
+        // Enable DSC.
+        var ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x90, &[_]u8{0x03});
+        if (ret != 0) return ret;
 
-    // DSC Picture Parameter Set.
-    ret = dsiSendRawLong(dsi0_base, dsi1_base, dma_scratch, 0x0a, &nt36532e_pps_144hz);
-    if (ret != 0) return ret;
+        // DSC Picture Parameter Set.
+        ret = dsiSendRawLong(dsi0_base, dsi1_base, dma_scratch, 0x0a, &nt36532e_pps_144hz);
+        if (ret != 0) return ret;
 
-    ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x9d, &[_]u8{0x01});
-    if (ret != 0) return ret;
+        ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x9d, &[_]u8{0x01});
+        if (ret != 0) return ret;
 
-    // 144Hz framerate control branch.
-    ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb2, &[_]u8{0x91});
-    if (ret != 0) return ret;
-    ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb3, &[_]u8{0x40});
-    if (ret != 0) return ret;
+        // 144Hz framerate control branch.
+        ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb2, &[_]u8{0x91});
+        if (ret != 0) return ret;
+        ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb3, &[_]u8{0x40});
+        if (ret != 0) return ret;
+    }
 
     // Exit sleep mode (MIPI DCS 0x11, no args), then the panel needs
     // 120ms before it'll accept display-on.
-    ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x11, &[_]u8{});
+    var ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x11, &[_]u8{});
     if (ret != 0) return ret;
     // mdelay() is a U-Boot macro (udelay(n*1000)), not a linkable
     // symbol -- call udelay directly instead.
@@ -997,6 +1077,58 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
     if (ret != 0) return ret;
 
     return 0;
+}
+
+/// DPU-bypass proof-of-concept (SPEC.md task #5): pushes a small solid-
+/// color RGB888 patch directly to the panel over the already-proven
+/// command-mode DSI DMA engine, entirely without touching the DPU
+/// (0xae01000+, where every write has hung this session). Caller must
+/// have called sheng_mdss_dsi_panel_init(..., enable_dsc=false) first --
+/// DSC must stay off, or the panel will try to DSC-decode this raw data.
+/// Sets a 16x16 pixel column/page address window (MIPI DCS 0x2A/0x2B),
+/// then a write_memory_start (0x2C) DCS long write with 16*16=256 solid
+/// red RGB888 pixels (768 bytes) as its payload. The write_memory_start
+/// packet is built directly in the DMA scratch buffer rather than going
+/// through dsiSendDcs() (whose internal buffer is only 16 bytes, far
+/// too small here) -- same MSM command-packet framing
+/// buildMsmCmdPacket() uses for its own long-write path:
+/// [len_lo,len_hi,0x39,0x80|0x40][cmd byte][payload...], padded to a
+/// 4-byte boundary with 0xff.
+const TEST_PATCH_W: usize = 16;
+const TEST_PATCH_H: usize = 16;
+
+export fn sheng_mdss_dsi_test_patch(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) c_int {
+    var ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x2a, &[_]u8{ 0x00, 0x00, 0x00, @as(u8, TEST_PATCH_W - 1) });
+    if (ret != 0) return ret;
+
+    ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x2b, &[_]u8{ 0x00, 0x00, 0x00, @as(u8, TEST_PATCH_H - 1) });
+    if (ret != 0) return ret;
+
+    const npix: usize = TEST_PATCH_W * TEST_PATCH_H;
+    const total_len: usize = 1 + npix * 3; // DCS cmd byte + RGB888 pixel data
+    const size: usize = 4 + total_len;
+    const padded: usize = (size + 3) & ~@as(usize, 0x3);
+
+    const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
+    dst[0] = @truncate(total_len & 0xff);
+    dst[1] = @truncate((total_len >> 8) & 0xff);
+    dst[2] = 0x39; // DCS long write
+    dst[3] = 0x80 | 0x40; // last packet, long
+    dst[4] = 0x2c; // write_memory_start
+
+    var i: usize = 0;
+    while (i < npix) : (i += 1) {
+        dst[5 + i * 3 + 0] = 0xff; // R
+        dst[5 + i * 3 + 1] = 0x00; // G
+        dst[5 + i * 3 + 2] = 0x00; // B
+    }
+    var j: usize = size;
+    while (j < padded) : (j += 1) dst[j] = 0xff;
+
+    ret = dsiCmdDmaTxOne(dsi1_base, dma_scratch, padded);
+    if (ret != 0) return ret;
+    ret = dsiCmdDmaTxOne(dsi0_base, dma_scratch, padded);
+    return ret;
 }
 
 // ---------------------------------------------------------------------

@@ -16,11 +16,16 @@
 #include <log.h>
 #include <video.h>
 #include <asm/io.h>
+#include <asm/barriers.h>
+#include <asm/global_data.h>
+#include <cpu_func.h>
 #include <soc/qcom/cmd-db.h>
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+
+DECLARE_GLOBAL_DATA_PTR;
 
 /*
  * The DPU core (unlike the MDSS wrapper/DISPCC/DSI, which live on the
@@ -91,14 +96,48 @@ enum {
 	SHENG_LOG_GCC_HF_AXI_READBACK,
 	SHENG_LOG_DPU_PRE_WRITE_READ,
 	SHENG_LOG_DPU_PRE_WRITE_READ_RET,
+	SHENG_LOG_MDP_RCG_CFG_READBACK,
+	SHENG_LOG_MMCX_LEVEL_PICKED,
+	SHENG_LOG_WRAPPER_READ,
+	SHENG_LOG_WRAPPER_READ_RET,
+	SHENG_LOG_DPU_SINGLE_WRITE_RET,
+	SHENG_LOG_DPU_SINGLE_WRITE_READBACK,
+	SHENG_LOG_PLAT_BASE,
+	SHENG_LOG_GD_VIDEO_TOP,
+	SHENG_LOG_GD_VIDEO_BOTTOM,
+	SHENG_LOG_WRAPPER_WRITE_RET,
+	SHENG_LOG_WRAPPER_WRITE_READBACK,
 };
+
+/*
+ * D-cache is on for this board (CONFIG_SYS_DCACHE_OFF is not set), so a
+ * plain `volatile u32 *` store into this DRAM-backed breadcrumb region
+ * is just a normal cacheable write -- it can sit dirty in a cache line
+ * indefinitely. If the CPU hard-hangs on the very next instruction (the
+ * DPU AHB bus lockup this whole log/status mechanism exists to survive),
+ * that dirty line never reaches physical DRAM and a subsequent warm-
+ * reboot memory scrape reads back zeros/stale data instead of whatever
+ * was actually written -- confirmed empirically: a scrape after exactly
+ * this scenario read back all zeros. Every breadcrumb write must be
+ * immediately pushed to the point of coherency (flush_dcache_range(),
+ * arch/arm/lib/cache-pl310.c's DSB-backed implementation) and followed
+ * by an explicit `dsb sy` so the write is guaranteed physically complete
+ * in DRAM before control ever returns to code that might touch the DPU.
+ */
+static void sheng_mdss_breadcrumb_flush(uintptr_t addr, size_t len)
+{
+	flush_dcache_range(addr, addr + len);
+	dsb();
+}
 
 static void sheng_mdss_log_reset(void)
 {
 	volatile u32 *count = (volatile u32 *)(uintptr_t)SHENG_MDSS_LOG_ADDR;
 
-	if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
+	if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
 		*count = 0;
+		sheng_mdss_breadcrumb_flush(SHENG_MDSS_LOG_ADDR, sizeof(*count));
+	}
 }
 
 static void sheng_mdss_log(u32 tag, u32 value)
@@ -114,6 +153,8 @@ static void sheng_mdss_log(u32 tag, u32 value)
 	entries[*count * 2] = tag;
 	entries[*count * 2 + 1] = value;
 	(*count)++;
+	sheng_mdss_breadcrumb_flush(SHENG_MDSS_LOG_ADDR,
+				     4 + (*count) * 8);
 }
 
 #define APPS_RSC_DRV2_BASE	0x17a20000
@@ -268,12 +309,25 @@ static int rsc_send_active_write(u32 resource_addr, u32 data)
 	return -ETIMEDOUT;
 }
 
+/* mdss_mdp@ae01000's own OPP table (mdp_opp_table in sm8550.dtsi) ties
+ * its 514MHz entry (the exact DISP_CC_MDSS_MDP_CLK rate
+ * sheng_mdss_dispcc_init() programs, confirmed correct via readback --
+ * see the MDP_RCG_CFG_READBACK log entry) to `required-opps =
+ * <&rpmhpd_opp_nom>`. rpmhpd_opp_nom is labelled `opp-256` in the
+ * rpmhpd OPP table (sm8550.dtsi), i.e. RPMH_REGULATOR_LEVEL_NOM = 256
+ * (dt-bindings/regulator/qcom,rpmh-regulator.h). We were previously
+ * picking the *lowest* nonzero corner unconditionally -- an MMCX
+ * under-vote for the clock rate actually requested, which is a
+ * plausible root cause for a bus that clocks correctly (confirmed) but
+ * still hangs on first register access. */
+#define RPMH_REGULATOR_LEVEL_NOM 256
+
 static int sheng_mdss_mmcx_power_on(void)
 {
 	u32 addr;
 	const u16 *levels;
 	size_t len, count, i;
-	u32 corner = 0;
+	u32 corner;
 
 	addr = cmd_db_read_addr("mmcx.lvl");
 	sheng_mdss_log(SHENG_LOG_CMDDB_MMCX_ADDR, addr);
@@ -285,13 +339,21 @@ static int sheng_mdss_mmcx_power_on(void)
 		return PTR_ERR(levels);
 
 	count = len >> 1;
+
+	/* Mirror rpmhpd_set_performance_state() (drivers/pmdomain/qcom/
+	 * rpmhpd.c): pick the smallest corner whose level is >= the
+	 * required performance level, clamping to the max corner if none
+	 * qualifies (its own "if the level requested is more than that
+	 * supported by the max corner, just set it to max anyway"). */
+	corner = count ? (u32)(count - 1) : 0;
 	for (i = 0; i < count; i++) {
-		if (levels[i]) {
+		if (levels[i] >= RPMH_REGULATOR_LEVEL_NOM) {
 			corner = i;
 			break;
 		}
 	}
 	sheng_mdss_log(SHENG_LOG_MMCX_CORNER, corner);
+	sheng_mdss_log(SHENG_LOG_MMCX_LEVEL_PICKED, corner < count ? levels[corner] : 0);
 
 	return rsc_send_active_write(addr, corner);
 }
@@ -391,6 +453,7 @@ static int sheng_mdss_bcm_vote(const char *bcm_name)
 #define SHENG_MDSS_STATUS_NOT_REACHED	0x7fffffff
 
 enum {
+	SHENG_MDSS_STATUS_MDSS_RESET,
 	SHENG_MDSS_STATUS_BCM_MM0,
 	SHENG_MDSS_STATUS_MMCX,
 	SHENG_MDSS_STATUS_GDSC,
@@ -406,10 +469,14 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
 {
 	volatile int *slots = (volatile int *)(uintptr_t)SHENG_MDSS_STATUS_ADDR;
 
-	if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
+	if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
 		slots[stage] = ret;
+		sheng_mdss_breadcrumb_flush(SHENG_MDSS_STATUS_ADDR + stage * sizeof(*slots),
+					     sizeof(*slots));
+	}
 }
 
+#define SM8550_MDSS_WRAPPER_BASE	0x0ae00000
 #define SM8550_MDSS_DPU_BASE		0x0ae01000
 #define SM8550_MDSS_DSI0_BASE		0x0ae94000
 #define SM8550_MDSS_DSI0_PHY_BASE	0x0ae95000
@@ -425,6 +492,15 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
  * largest single DCS command we send (well under 4KB). */
 #define SHENG_MDSS_DSI_DMA_SCRATCH	0xa0100000
 
+/* Fixed physical DRAM framebuffer address, self-allocated by
+ * sheng_mdss_probe() (see its comment for why: alloc_fb()'s bind-time
+ * automatic reservation path is unusable on this board). 2MB in, clear
+ * of SHENG_MDSS_DSI_DMA_SCRATCH above (1MB in, well under 4KB used) and
+ * everything else touched this early in boot; needs ~24.8MB
+ * (3048*2032*4 XRGB8888), ending well below 0xd8100000 (xbl-sc-region,
+ * the nearest higher reserved region per SPEC.md's memory map). */
+#define SHENG_MDSS_FB_ADDR		0xa0200000
+
 /* 144Hz mode, xiaomi,sheng-nt36532e panel. Confirmed against the live
  * DPU crtc-0 modeline AND panel-novatek-nt36532e.c's sheng_tianma_modes[]
  * -- see SPEC.md. */
@@ -436,10 +512,13 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
 #define SHENG_PANEL_VBACK_PORCH		138
 
 /* sheng_mdss_hw.zig */
+extern void sheng_mdss_core_reset(unsigned long dispcc_base);
 extern int sheng_mdss_gdsc_enable(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init(unsigned long dispcc_base);
 extern int sheng_mdss_dsi_phy_init(unsigned long dsi_phy_base, bool is_master);
 extern int sheng_mdss_dsi_panel_init(unsigned long dsi0_base, unsigned long dsi1_base,
+				      unsigned long dma_scratch, bool enable_dsc);
+extern int sheng_mdss_dsi_test_patch(unsigned long dsi0_base, unsigned long dsi1_base,
 				      unsigned long dma_scratch);
 extern int sheng_mdss_dpu_start(unsigned long dpu_base,
 				 unsigned long dsi0_base, unsigned long dsi1_base,
@@ -466,6 +545,23 @@ static int sheng_mdss_probe(struct udevice *dev)
 	for (unsigned int i = 0; i < SHENG_MDSS_STATUS_COUNT; i++)
 		sheng_mdss_status_set(i, SHENG_MDSS_STATUS_NOT_REACHED);
 
+	/* msm_mdss_reset() in the real driver toggles DISP_CC_MDSS_CORE_BCR
+	 * as the very first thing msm_mdss_init() does, before GDSC or any
+	 * clock is even parsed -- see sheng_mdss_core_reset()'s comment in
+	 * sheng_mdss_hw.zig. Never attempted before this pass; matching
+	 * that exact ordering here since the DPU register bus has stayed
+	 * unreachable through every power/clock/interconnect step tried
+	 * so far. This is a void C ABI call (msm_mdss_reset() itself
+	 * always returns 0 for a present reset line), so we still track it
+	 * via the status relay to confirm it actually ran.
+	 */
+	sheng_mdss_core_reset(SM8550_DISPCC_BASE);
+	sheng_mdss_status_set(SHENG_MDSS_STATUS_MDSS_RESET, 0);
+
+	/* BISECTION: reset-toggle + GDSC confirmed reaching Linux. Next:
+	 * add DISPCC (PLL0 + AHB/MDP clocks) back and stop right after it,
+	 * before DSI PHY.
+	 */
 	ret = sheng_mdss_gdsc_enable(SM8550_DISPCC_BASE);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_GDSC, ret);
 	if (ret) {
@@ -477,6 +573,25 @@ static int sheng_mdss_probe(struct udevice *dev)
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DISPCC, ret);
 	if (ret)
 		return ret;
+
+	/* Lead #2 (SPEC.md task #5 log): sheng_mdss_dispcc_init() only
+	 * confirms clkBranchEnable()'s CBCR halt-poll succeeded, never
+	 * that the RCG's CFG register (src_sel/div) actually landed as
+	 * rcg2ConfigureHidOnly() intended. Read it back: MDP_CLK_SRC_CMD_RCGR
+	 * = 0x80d8 (dispcc_base-relative), CFG at +0x4. Expect src_sel=1
+	 * (P_DISP_CC_PLL0_OUT_MAIN, bits [10:8]) and src_div=5 (2*3-1 for
+	 * /3, bits [4:0]) if our 514MHz MDP-clock programming actually took.
+	 */
+	sheng_mdss_log_reset();
+	{
+		volatile u32 *mdp_rcg_cfg =
+			(volatile u32 *)(uintptr_t)(SM8550_DISPCC_BASE + 0x80d8 + 0x4);
+		sheng_mdss_log(SHENG_LOG_MDP_RCG_CFG_READBACK, *mdp_rcg_cfg);
+	}
+
+	/* BISECTION: reset-toggle + GDSC + DISPCC confirmed reaching Linux.
+	 * Next: add both DSI PHYs back and stop before DSI panel init.
+	 */
 
 	/* Dual-DSI split-link panel: DSI0 is master (drives its own PLL),
 	 * DSI1 is slave (sources its bit clock from DSI0 over
@@ -492,15 +607,108 @@ static int sheng_mdss_probe(struct udevice *dev)
 	if (ret)
 		return ret;
 
+	/* BISECTION: reset-toggle + GDSC + DISPCC + both DSI PHYs confirmed
+	 * reaching Linux. Next: add DSI panel init back and stop right
+	 * after it -- this re-creates the last known-good stopping point
+	 * from before this session's reset-toggle work, just with the new
+	 * reset call now running first.
+	 */
+	/* DPU-bypass proof-of-concept (SPEC.md task #5): enable_dsc=false
+	 * here -- the real pipeline needs DSC, but this experiment pushes
+	 * raw uncompressed pixels directly over DSI command mode and must
+	 * NOT have DSC enabled on the panel side, or it'll try to decode
+	 * garbage. Revert to true before ever resuming real dpu_start()
+	 * work (which is unreachable below regardless, for now). */
 	ret = sheng_mdss_dsi_panel_init(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
-					 SHENG_MDSS_DSI_DMA_SCRATCH);
+					 SHENG_MDSS_DSI_DMA_SCRATCH, false);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI_PANEL, ret);
 	if (ret)
 		return ret;
 
-	/* Xiaomi Pad 6S Pro panel (xiaomi,sheng-nt36532e), 144Hz mode.
-	 * Confirmed both from the live DPU crtc-0 state and from
-	 * sheng_tianma_modes[] in panel-novatek-nt36532e.c -- see SPEC.md. */
+	/* Push a small solid-red 16x16 RGB888 patch directly to the panel
+	 * over the DSI command-mode DMA engine, entirely bypassing the DPU
+	 * (0xae01000+) -- see sheng_mdss_dsi_test_patch()'s comment in
+	 * sheng_mdss_hw.zig. If this survives and a red square appears
+	 * (backlight permitting -- see SPEC.md's known gap), we have a
+	 * pixel-output path independent of the still-unsolved DPU write
+	 * hang.
+	 */
+	ret = sheng_mdss_dsi_test_patch(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
+					 SHENG_MDSS_DSI_DMA_SCRATCH);
+	sheng_mdss_status_set(SHENG_MDSS_STATUS_DPU, ret); /* reusing the DPU slot for this experiment */
+	if (ret)
+		return ret;
+
+	return 0;
+
+	/* BREAKTHROUGH (see SPEC.md task #5 log): every hang all session was
+	 * caused by rsc_send_active_write() (the hand-rolled RSC/TCS
+	 * transaction backing sheng_mdss_mmcx_power_on()/sheng_mdss_bcm_vote())
+	 * breaking subsequent AHB access to the whole mdss/DPU address
+	 * range -- not power/clock/VBIF gating. Proven via bisection:
+	 * boot-wrapper-read-no-rsc.img and boot-dpu-read-no-rsc.img both
+	 * reached Linux, reading real register values from the wrapper
+	 * (0x90000001, a structured HW_VERSION) and the DPU
+	 * (SSPP_SRC_SIZE = 0, a plausible unconfigured default) with RSC
+	 * never touched at all. MMCX and BCM MM0 were never actually
+	 * required -- ABL/firmware already leaves whatever's necessary
+	 * active. sheng_mdss_mmcx_power_on()/sheng_mdss_bcm_vote() are
+	 * intentionally NOT called below.
+	 *
+	 * ISOLATION TEST: boot-safe-post-rsc.img (this exact path, stopping
+	 * right after DSI panel init with GCC_DISP_HF_AXI_CLK enabled) HUNG
+	 * even after a genuine full power cycle -- ruling out accumulated
+	 * hardware state from prior hangs. Tracing back: sheng_mdss_gcc_
+	 * disp_hf_axi_clk_enable() (`*cbcr |= 1u`, a WRITE) was never
+	 * actually called in either of the two builds that DID boot
+	 * successfully this session (boot-wrapper-read-no-rsc.img,
+	 * boot-dpu-read-no-rsc.img both stopped before reaching it, at the
+	 * time dead code). Given this session's core finding -- DPU writes
+	 * hang, DPU reads don't -- it's plausible the same asymmetry
+	 * applies to this GCC clock-controller write too. RESULT: booted
+	 * fine -- this write is NOT the issue. Ruled out.
+	 */
+	sheng_mdss_gcc_disp_hf_axi_clk_enable();
+
+	/* CONFIRMED (see SPEC.md task #5 log): sheng_mdss_bind() itself was
+	 * the cause of every "post-RSC" hang, not the DPU/GCC/RSC/framebuffer
+	 * math investigated above -- it runs during a pre-relocation DM
+	 * bind pass that's independently fragile on this board (see the
+	 * "RESOLVED: CONFIG_VIDEO early-boot hang" entry further down this
+	 * file for the earlier, related pre-relocation fragility). Removed
+	 * .bind entirely. Instead, self-allocate the framebuffer here in
+	 * probe() (stable, post-relocation context) by setting plat->base
+	 * directly -- alloc_fb() in video-uclass.c explicitly supports this
+	 * ("Allow drivers to allocate the frame buffer themselves": if
+	 * (plat->base) return 0;), completely bypassing the fragile
+	 * bind-time reservation path. SHENG_MDSS_FB_ADDR is manually chosen
+	 * DRAM, clear of SHENG_MDSS_DSI_DMA_SCRATCH (0xa0100000) and well
+	 * below where kernel/dtb get lmb_alloc'd later in boot -- see
+	 * SPEC.md's memory-map notes.
+	 */
+	/* NEW TEST: never tried a WRITE to the MDSS wrapper (0xae00000)
+	 * before -- only reads (proven safe, real HW_VERSION value) and
+	 * DPU writes (proven to hang unconditionally). This is a genuinely
+	 * untested boundary: does the firewall/gate sit exactly at
+	 * 0xae01000 (DPU core), or does it already cover part of the
+	 * wrapper's own register window? Target offset 0x0 (HW_VERSION,
+	 * nominally read-only) specifically so even if the write has no
+	 * software effect, the bus still has to ack the transaction --
+	 * that's the actual thing being tested, not the register's value.
+	 * See SPEC.md's task #5 log.
+	 */
+	sheng_mdss_log_reset();
+	{
+		volatile u32 *wrapper_hwver = (volatile u32 *)(uintptr_t)(SM8550_MDSS_WRAPPER_BASE + 0x0);
+		u32 val = *wrapper_hwver;
+
+		*wrapper_hwver = val;
+		sheng_mdss_log(SHENG_LOG_WRAPPER_WRITE_RET, 1); /* survived the write */
+		sheng_mdss_log(SHENG_LOG_WRAPPER_WRITE_READBACK, *wrapper_hwver);
+	}
+
+	plat->base = SHENG_MDSS_FB_ADDR;
+
 	uc_priv->xsize = 3048;
 	uc_priv->ysize = 2032;
 	uc_priv->bpix = VIDEO_BPP32;
@@ -508,81 +716,14 @@ static int sheng_mdss_probe(struct udevice *dev)
 
 	plat->size = (u32)uc_priv->xsize * uc_priv->ysize * VNBYTES(uc_priv->bpix);
 
-	sheng_mdss_log_reset();
+	sheng_mdss_log(SHENG_LOG_PLAT_BASE, (u32)plat->base);
 
-	/*
-	 * STOPPING POINT for this session: GDSC + DISPCC + both DSI PHYs +
-	 * full DSI panel DCS init are all confirmed solid on real hardware
-	 * (many repeated successful boots). Everything past this point --
-	 * ANY DPU register access, reads included -- reliably hangs the
-	 * CPU. Confirmed via extensive bisection and driver-source tracing
-	 * that this survives: an MMCX RPMh power-domain vote, a BCM "MM0"
-	 * interconnect bandwidth vote, the GCC_DISP_HF_AXI_CLK clock
-	 * enable (all three traced from the real kernel driver), and even
-	 * a plain READ instead of a write (rules out write-protection/XPU
-	 * as the mechanism -- this is a genuine bus/power-gating block that
-	 * hits reads and writes alike). See SPEC.md's "Task #5 status"
-	 * section for the full trace and remaining leads (msm_mdss_reset()'s
-	 * reset-control step, dpu_kms.c's own pm_runtime/GDSC sequencing,
-	 * VBIF). Returning here keeps the device booting reliably instead
-	 * of hanging on every attempt -- do not remove this early return
-	 * until the DPU register bus is confirmed reachable by some other
-	 * means first.
+	/* Let video_post_probe() run this time -- that's the actual test:
+	 * does video_clear() survive with a manually-chosen, definitely-
+	 * real DRAM plat->base instead of relying on the fragile bind-time
+	 * mechanism? sheng_mdss_dpu_start() stays unreachable regardless
+	 * (separate, already-confirmed problem: DPU writes hang).
 	 */
-	return 0;
-
-	/* DPU core sits on its own RPMh-voted MMCX rail -- must be voted
-	 * active before any DPU (SSPP/LM/DSC/CTL/INTF) register access,
-	 * or the AHB write hangs the CPU indefinitely. See the comment on
-	 * sheng_mdss_mmcx_power_on() above. Moved to right before the
-	 * first DPU touch (was originally first thing in probe) --
-	 * bisection showed DSI panel init reliably hangs when it runs
-	 * *after* this vote, even though DSI0/1 aren't on the MMCX rail
-	 * at all; reordering so DSI panel init (which is proven solid)
-	 * completes untouched before RSC is ever touched. */
-	ret = sheng_mdss_mmcx_power_on();
-	sheng_mdss_status_set(SHENG_MDSS_STATUS_MMCX, ret);
-	if (ret) {
-		log_debug("sheng_mdss: MMCX power-domain vote failed (%d)\n", ret);
-		return ret;
-	}
-
-	/* BCM "MM0" gates mmss_noc's internal AXI clock enable for
-	 * MASTER_MDP (our SSPP block) -- see sheng_mdss_bcm_vote()'s
-	 * comment above for the full trace through the real kernel
-	 * driver/interconnect topology that identified this. */
-	ret = sheng_mdss_bcm_vote("MM0");
-	sheng_mdss_status_set(SHENG_MDSS_STATUS_BCM_MM0, ret);
-	if (ret) {
-		log_debug("sheng_mdss: BCM MM0 vote failed (%d)\n", ret);
-		return ret;
-	}
-
-	sheng_mdss_gcc_disp_hf_axi_clk_enable();
-
-	/*
-	 * STOPPING POINT for this session: everything above is either
-	 * proven solid (GDSC/DISPCC/DSI/panel-init) or believed correct
-	 * per the real driver trace (MMCX/BCM/GCC clock), but every DPU
-	 * *write* attempted so far has hung the CPU regardless. Before
-	 * ever writing again, do a single plain READ from the DPU block
-	 * (never tried before) and log the result -- if this also hangs,
-	 * it confirms a genuine bus/power-gating issue reads and writes
-	 * both hit; if it returns, that's new information (reads work,
-	 * only writes don't -- a very different class of problem, e.g.
-	 * write-protection/XPU rather than clock/power gating). Whatever
-	 * happens, do NOT proceed to sheng_mdss_dpu_start() below yet --
-	 * that's still known to hang. See SPEC.md's DPU power-sequencing
-	 * section for the full trace and remaining leads.
-	 */
-	{
-		volatile u32 *dpu_probe = (volatile u32 *)(uintptr_t)(SM8550_MDSS_DPU_BASE + 0x24000);
-		u32 val = *dpu_probe;
-
-		sheng_mdss_log(SHENG_LOG_DPU_PRE_WRITE_READ, val);
-		sheng_mdss_log(SHENG_LOG_DPU_PRE_WRITE_READ_RET, 1); /* survived the read */
-	}
-
 	return 0;
 
 	ret = sheng_mdss_dpu_start(SM8550_MDSS_DPU_BASE,
@@ -606,6 +747,10 @@ static const struct udevice_id sheng_mdss_ids[] = {
 	{ }
 };
 
+/* No .bind -- see sheng_mdss_probe()'s comment on SHENG_MDSS_FB_ADDR for
+ * why: a .bind hook (even one doing nothing but a single struct write)
+ * reliably hung the board, confirmed via bisection this session. The
+ * framebuffer is self-allocated directly in .probe instead. */
 U_BOOT_DRIVER(sheng_mdss) = {
 	.name		= "sheng_mdss",
 	.id		= UCLASS_VIDEO,

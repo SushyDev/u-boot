@@ -341,10 +341,11 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	 * drivers/video/qualcomm/sheng_mdss.c) into /chosen so they're
 	 * readable from Linux at /proc/device-tree/chosen/sheng,mdss-status
 	 * -- this board has no working UART/console during U-Boot's own
-	 * boot stage to see log_debug() output directly. 5 stages x 4
-	 * bytes = 20 bytes (gdsc, dispcc, dsi_phy, dsi_panel, dpu, in that
-	 * order); each is 0x7fffffff if that stage was never reached, 0 on
-	 * success, or a negative errno.
+	 * boot stage to see log_debug() output directly. 9 stages x 4
+	 * bytes = 36 bytes (mdss_reset, bcm_mm0, mmcx, gdsc, dispcc,
+	 * dsi0_phy, dsi1_phy, dsi_panel, dpu, in that order -- must track
+	 * SHENG_MDSS_STATUS_COUNT in sheng_mdss.c); each is 0x7fffffff if
+	 * that stage was never reached, 0 on success, or a negative errno.
 	 */
 	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS) && IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
 		int nodeoff = fdt_path_offset(blob, "/chosen");
@@ -352,7 +353,7 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 		if (nodeoff >= 0) {
 			fdt_setprop(blob, nodeoff, "sheng,mdss-status",
 				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3000),
-				    24);
+				    36);
 			fdt_setprop(blob, nodeoff, "sheng,uclass-get-device-ret",
 				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3020),
 				    4);
