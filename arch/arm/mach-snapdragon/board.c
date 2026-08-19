@@ -356,6 +356,14 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 			fdt_setprop(blob, nodeoff, "sheng,uclass-get-device-ret",
 				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3020),
 				    4);
+			/* Log buffer (see sheng_mdss_log() in sheng_mdss.c):
+			 * 4-byte entry count followed by up to 64 (tag,
+			 * value) u32 pairs = 4 + 64*8 = 516 bytes. Always
+			 * relay the full fixed-size region; the leading
+			 * count says how many entries are actually valid. */
+			fdt_setprop(blob, nodeoff, "sheng,mdss-log",
+				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3100),
+				    4 + 64 * 8);
 		}
 	}
 

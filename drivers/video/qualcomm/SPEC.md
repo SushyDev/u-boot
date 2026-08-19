@@ -87,6 +87,26 @@ of what follows.)
    unconditionally at `gcc-sm8550.c`'s own probe as a no-API always-on
    clock, so it needs no action from us. Still hangs, even with all
    three of the above stacked together.
+4. **Read-vs-write test**: with all three of the above in place, tried
+   a single plain *read* (not write) of `SSPP_SRC_SIZE`
+   (`dpu_base+0x24000`) instead of ever writing -- also hung. This
+   rules out write-protection/XPU access control as the mechanism;
+   whatever's gating the DPU register block blocks reads and writes
+   identically, consistent with a genuine unclocked/unpowered AHB
+   slave rather than a permissions issue.
+
+Also added a general-purpose log buffer (`sheng_mdss_log()` in
+`sheng_mdss.c`, relayed via `/proc/device-tree/chosen/sheng,mdss-log`,
+same mechanism as the status relay) that records actual values --
+`RSC_DRV_ID`, cmd-db lookup addresses for `mmcx.lvl`/`MM0`, the chosen
+TCS slot, the GCC_DISP_HF_AXI_CLK CBCR readback, etc. -- not just
+pass/fail codes, for whenever a future attempt gets far enough to boot
+and its log can be read back. It was NOT read back this session because
+every build that reached the DPU read/write step hung before reaching
+Linux (the log is only readable from a successful boot, so it's only
+useful for narrowing which of several new steps in a single attempt
+got furthest -- not for anything that hangs on the very first new step,
+which is what's happened every time DPU is touched at all so far).
 
 ### Next leads, not yet tried
 - `msm_mdss_reset()` in `msm_mdss.c`: grabs an optional
