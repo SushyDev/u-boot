@@ -675,7 +675,20 @@ static int sheng_ktz8866_write_chip(const char *path)
 		return ret;
 	}
 
-	val = 0x7f; /* BL_EN: all 6 current sinks + master enable bit */
+	/* BL_EN: this board's real devicetree (sm8550-mainline checkout,
+	 * arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dts) declares
+	 * `current-num-sinks = <5>` on BOTH chips -- only 5 of 6 current
+	 * sinks are physically wired. Our first pass wrote 0x7f (all 6
+	 * sinks + master enable), which the real driver's own
+	 * ktz8866_init() would never do: `ktz8866_write(ktz, BL_EN,
+	 * BIT(val) - 1)` with val=5 gives 0x1f, later OR'd with
+	 * BL_EN_BIT (0x40) once brightness > 0 -> 0x5f. Enabling a sink
+	 * channel that isn't physically connected is a real bug, not
+	 * just a harmless extra bit -- many LED driver ICs fault-protect
+	 * (and can disable output entirely) on an open/disconnected sink
+	 * channel. Confirmed live: Linux's own driver's register 0x08
+	 * reads 0x5f, never 0x7f, on this hardware. */
+	val = 0x5f; /* BL_EN: 5 current sinks (matches current-num-sinks=5) + master enable bit */
 	dm_i2c_write(chip, 0x08, &val, 1);
 	val = 0x07; /* BL_BRT_LSB: brightness 2047 (max), low 3 bits */
 	dm_i2c_write(chip, 0x04, &val, 1);
@@ -683,6 +696,18 @@ static int sheng_ktz8866_write_chip(const char *path)
 	dm_i2c_write(chip, 0x05, &val, 1);
 	val = 0x9f; /* LCD_BIAS_CFG1: LCD_BIAS_EN, matches real driver's ktz8866_init() */
 	dm_i2c_write(chip, 0x09, &val, 1);
+	/* BL_CFG2: kinetic,current-ramp-delay-ms=256 in the real DT ->
+	 * BIT(7) | ((5 + 256/64) << 3) | PWM_HYST(0x5) = 0xcd, per
+	 * ktz8866_init()'s >128ms branch. Confirmed against live register
+	 * dump (0x03 already reads 0xcd from Linux's own driver). */
+	val = 0xcd;
+	dm_i2c_write(chip, 0x03, &val, 1);
+	/* BL_DIMMING: kinetic,led-enable-ramp-delay-ms=8 in the real DT ->
+	 * ramp_off_time=ilog2(8)+1=4, ramp_on_time=4<<4=0x40, OR'd =
+	 * 0x44. Confirmed against live register dump (0x14 already reads
+	 * 0x44 from Linux's own driver). */
+	val = 0x44;
+	dm_i2c_write(chip, 0x14, &val, 1);
 
 	return 0;
 }

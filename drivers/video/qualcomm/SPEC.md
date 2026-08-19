@@ -842,6 +842,109 @@ values). Left unresolved -- if the DRM_MSM path doesn't pan out, this
 is the next concrete thing to chase, but needs a real devicetree source
 we don't have yet, not more guessing.
 
+### Cross-checked against a known-working debian-sheng+KDE reference boot, found the actual board dts, and traced the real remaining gap to sheng_mdss.c itself
+
+Got direct SSH access to a booted debian-sheng+KDE image on this exact
+unit (backlight and display both confirmed visually working). Compared
+everything findable:
+
+- `ktz8866.c` driver: byte-identical to our pinned kernel commit.
+- `backlight@11` devicetree node (found via the actual board DTS,
+  `sm8550-mainline`'s `arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dts`
+  -- the real Linux-side devicetree, previously undiscovered):
+  byte-identical property values to what we'd already independently
+  reverse-engineered, **except one real bug this surfaced**:
+  `current-num-sinks = <5>`, not 6. We had written `BL_EN = 0x7f` (all
+  6 sinks); the real driver computes `0x5f` (5 sinks + master enable).
+  Fixed in `board.c`, along with two other registers the real driver
+  writes that we'd missed entirely (`BL_CFG2`/`BL_DIMMING`, both
+  DT-property-driven, both confirmed matching the real driver's
+  computed values against our own earlier live register dump).
+- Base kernel `.config`: effectively identical (one unrelated
+  `CONFIG_STRICT_DEVMEM` diff).
+- GPIO 30/31/128 (avdd/avee/backlight-enable) end-state: identical
+  between both systems.
+- Boot method (`fastboot boot` vs genuine flash + full power cycle):
+  ruled out by direct test -- doesn't change anything.
+- `PWM2DIG_LSBs`/`MSBs` (registers `0x12`/`0x13`): the one register
+  that actually differs (`0xff,0x07` on the working system, `0x00,0x00`
+  on ours) -- confirmed via a raw I2C write (bypassing the kernel
+  driver via `/dev/i2c-*` + `I2C_SLAVE_FORCE`, since the driver never
+  writes these itself) that this is a genuine hardware-read-only status
+  register; our write ACK'd but didn't stick. Whatever sets this comes
+  from outside I2C entirely -- most likely a PMIC LPG channel, but nothing
+  in Linux's own PWM subsystem references it (`pwmchip0` exists,
+  `npwm=4`, but zero channels are exported and no devicetree node
+  anywhere has a `pwms = <...>` property on either system) -- so if
+  real, it's set below the OS entirely.
+
+**The actual lead:** a previously-working commit,
+`2d6803ccfa39ea5bb02c97f413449fe0dc8ff457` (2026-08-15, "sheng: use
+real, verified multi-bank /memory node"), confirmed via `git cat-file`
+to predate `sheng_mdss.c`'s existence entirely -- at that point U-Boot
+was a pure bootloader (load kernel, jump), touching zero display
+hardware, and debian-sheng's own drm/msm handled 100% of the hardware
+bring-up from a pristine, ABL-left state. Every boot since
+`sheng_mdss.c` was added runs a real hardware-poking sequence (GDSC
+enable, DISPCC PLL0 programming, DSI PHY bring-up, full DSI panel DCS
+blast, GCC clock enable, MDSS core reset toggle) *before* Linux ever
+starts. Plausible that this leaves something (plausibly PMIC/LPG-
+adjacent, matching the PWM2DIG finding above) in a state Linux's own
+driver init doesn't fully recover from, even though DPU/DSI itself is
+tolerant enough to still bind and render regardless.
+
+**Test built:** `CONFIG_VIDEO`/`CONFIG_VIDEO_SHENG_MDSS` disabled
+entirely in `sm8550_defconfig` -- U-Boot reverted to a pure bootloader,
+matching the known-working commit's hardware conditions exactly, with
+the NixOS kernel (DRM_MSM enabled) otherwise unchanged. Built as
+`boot-no-mdss-driver.img`. **Result: pending.**
+
+If this confirms the theory, the real fix is making `sheng_mdss_probe()`
+properly quiesce/restore the hardware it touches before handing off to
+Linux (or simply not touch it when the goal is Linux driving the
+display, as opposed to our own DPU-bypass pixel work), not another
+register chase.
+
+**Result: CONFIRMED. Backlight works.** Flashed `boot-no-mdss-driver.img`
+-- visually confirmed working backlight on real hardware. Verified via
+`exec.sh`: `PWM2DIG_LSBs`/`MSBs` now read `0xff`/`0x07` on both chips,
+exactly matching the debian-sheng reference (was `0x00`/`0x00` on every
+build with `sheng_mdss.c` active, all session). `msm_dpu` still bound
+successfully (`ae94000.dsi`, `ae96000.dsi`, `fb0: msmdrmfb`) -- the
+display pipeline itself is unaffected either way.
+
+**This is the actual, complete answer to tonight's central mystery,**
+found the hard way through hours of register-level investigation that
+all turned out to be correct-but-insufficient: `sheng_mdss.c`'s hardware
+bring-up (GDSC/DISPCC/DSI-PHY/panel-init/RSC, all run unconditionally on
+every boot since it was added) leaves something -- almost certainly
+PMIC/LPG-adjacent, given the exact register that flips -- in a state
+Linux's own driver init can't recover from, even though DPU/DSI
+themselves are tolerant enough to still bind and render regardless.
+Every earlier finding in this file (RSC corruption, `.bind` hang, DPU
+write hang, MMCX corner, LUT/VSYNC clocks, dual-chip backlight I2C,
+`BL_EN` sink count) was real and worth keeping -- none of them were
+wrong, they just weren't sufficient on their own, because the actual
+blocker was one layer up: our own driver running at all, before Linux
+gets a chance to configure the same hardware from a clean state.
+
+### What this means going forward
+
+For a **working display with backlight**, the answer today is: don't
+run `sheng_mdss_probe()` at all -- let U-Boot be a pure bootloader
+(`CONFIG_VIDEO`/`CONFIG_VIDEO_SHENG_MDSS` off) and let Linux's own
+`drm/msm` + `ktz8866` drivers do 100% of the bring-up, exactly like
+debian-sheng and the pre-`sheng_mdss.c` commit history. This is a
+completely different use case from `sheng_mdss.c`'s original goal
+(U-Boot itself drawing pixels, e.g. for an early splash before Linux
+even starts) -- both are legitimate, they just can't currently coexist
+on one boot. If `sheng_mdss.c` is needed again later (for its own
+DSI-bypass pixel work, which independently works and is unaffected by
+any of this), it would need to properly quiesce/restore GDSC, DISPCC,
+DSI PHY, and the MDSS core reset line back to a state Linux's own probe
+expects before handing off -- not attempted here, real follow-up work
+if that combination is ever needed.
+
 ## Task #5 status: DPU register bus won't come up -- power/clock/interconnect sequencing incomplete
 
 GDSC, DISPCC, both DSI PHYs, and the full DSI panel DCS init are all

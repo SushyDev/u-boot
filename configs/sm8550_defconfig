@@ -41,8 +41,16 @@ CONFIG_ENV_USE_DEFAULT_ENV_TEXT_FILE=y
 # CONFIG_WDT is not set
 # CONFIG_EFI_LOADER is not set
 # CONFIG_MMC is not set
-CONFIG_VIDEO=y
-CONFIG_VIDEO_SHENG_MDSS=y
+# CONFIG_VIDEO / CONFIG_VIDEO_SHENG_MDSS: TEMPORARILY disabled (SPEC.md
+# task #5 log) -- testing the theory that our own driver's hardware
+# pokes (GDSC/DISPCC/DSI-PHY/DPU/RSC, all run before Linux boots) leave
+# something (likely PMIC/LPG-adjacent) in a state Linux's own drm/msm
+# can't fully recover from, even though DPU/DSI itself still binds and
+# renders. Matches the hardware state at commit 2d6803cc (before
+# sheng_mdss.c existed at all), which is confirmed to have worked with
+# debian-sheng + backlight. Re-enable once this is confirmed/ruled out.
+# CONFIG_VIDEO is not set
+# CONFIG_VIDEO_SHENG_MDSS is not set
 # Root cause of the CONFIG_VIDEO hang (see git history / SPEC.md):
 # growing the u-boot binary enough to cross ~1MB loaded size (physical
 # kernel_offset 0x8000 + kernel_size) apparently collides with
