@@ -623,19 +623,224 @@ completely bypassing the still-unsolved `0xae01000+` write hang.**
 Still can't visually confirm a red square appeared -- backlight is off
 (see below). That's the immediate next step to actually see this work.
 
-### Known separate gap, not today's blocker: no backlight yet
+### Backlight: reviving earlier GPIO 128 work
 
-Panel currently has no backlight (`nt36532e_prepare()`'s regulator/DCS
-sequencing for `avdd`/`avee`/backlight enable, likely DCS `0x51`/`0x53`
-brightness+on commands per the panel driver, not yet implemented in
-`sheng_mdss_hw.zig`/`sheng_mdss.c`). Backlight is orthogonal to the
-register/memory hang being debugged here -- it only affects whether
-light emits from the panel once the DPU pipeline is otherwise working,
-not whether the pipeline itself functions. Tracked here so it isn't
-forgotten once the current hang is resolved and pixels are expected to
-be visible.
+A prior session (commits `d17e2634`/`bfdf514f`/`5d83f5ed`) already
+identified the backlight chain for this panel: **GPIO 128** (TLMM,
+active-high) is the backlight IC's enable line, independently verified
+working via a raw trap-based test at the time. The actual brightness/PWM
+control chip is a **KTZ8866A on I2C1**, which needs I2C to configure --
+still broken (QUP GENI firmware loader timing issue, `dm_i2c_probe()`
+hangs waiting for an ACK that never comes since the protocol firmware
+isn't loaded into the sequencer in time). That I2C problem is untouched
+this session; only the GPIO enable line is being revisited here, on the
+chance the IC has a sane default brightness without I2C configuration.
 
-Built as `.output/boot-mdp-lut-vsync-clk.img` -- **result pending**.
+The devicetree already has a `backlight-gpio` node (`enable-gpios =
+<&tlmm 128 GPIO_ACTIVE_HIGH>`, `default-on`) from that earlier session,
+but `CONFIG_BACKLIGHT` is currently disabled in `sm8550_defconfig`, so
+nothing acts on it. Deliberately did NOT re-enable `CONFIG_BACKLIGHT`/
+`CONFIG_BACKLIGHT_GPIO` (the standard U-Boot gpio-backlight uclass
+driver) -- this session found that even a trivial `.bind` hook hangs
+this board via pre-relocation DM fragility (see above), and
+gpio-backlight would be a completely new, untested driver-model
+interaction. Went raw MMIO instead, matching everything else this
+session: `sheng_mdss_backlight_gpio_enable()` in `sheng_mdss.c`, TLMM
+register layout confirmed from `pinctrl-sm8550.c`'s `PINGROUP` macro
+(mainline kernel checkout) -- per-pin `0x1000` stride from `tlmm@f100000`,
+`ctl_reg` at `+0` (mux_bit=2 selects native GPIO function, oe_bit=9 for
+output-enable), `io_reg` at `+0x4` (out_bit=1 to drive high). `vph_pwr`
+(the panel's power rail) needs no action -- it's `regulator-always-on`/
+`regulator-boot-on` with no GPIO control at all, a pure board-level
+always-on supply.
+
+Wired to run right before the DSI test patch, so backlight is on by the
+time pixels land. Built as `boot-backlight-test.img`.
+
+**Result: booted cleanly, no visible backlight.** Confirmed via a live
+Linux session on the same real boot: `backlight:ktz8866-backlight` is a
+real, working kernel backlight class device (`geniqup@ac0000/a84000.i2c/
+i2c-4/4-0011`) -- the chip and I2C wiring are fine in hardware, driven
+over I2C under Linux without issue. This confirms the GPIO-alone theory:
+GPIO 128 brings the KTZ8866 out of shutdown but doesn't drive LED
+current -- the KTZ886x family needs I2C register writes (current-sink
+enables + brightness) to actually turn on backlight output. Pulled the
+exact register map from the real kernel driver (`drivers/video/backlight/
+ktz8866.c`, mainline checkout): `BL_EN` (`0x08`, bit 6 = master enable,
+bits 0-5 = per-channel current sinks) and `BL_BRT_LSB`/`BL_BRT_MSB`
+(`0x04`/`0x05`, 11-bit brightness).
+
+### I2C: found `i2c1` was already enabled, wired up a real transaction
+
+Went looking for how to get these 3 register writes onto the bus.
+Checked U-Boot's GENI I2C firmware-loader (`drivers/misc/qcom_geni.c`):
+firmware loading and standard driver probing turned out to be
+inseparable in the existing code (`probe_children_load_firmware()`
+binds the child then calls `device_probe()` directly, and firmware
+loading happens *inside* that driver's own probe) -- so "hand-roll a
+raw I2C transaction with zero DM" would actually mean re-implementing
+*both* the ELF-firmware-partition loader (~90 lines, block/partition
+reads) *and* a full GENI FIFO-mode I2C protocol implementation from
+scratch, not just the transaction itself.
+
+Before committing to that scope, checked the board's own devicetree
+directly and found `&i2c1 { status = "okay"; };` **already present** --
+along with `&qupv3_id_0 { status = "okay"; }` (the QUP wrapper). Meaning
+U-Boot's automatic `EVT_LAST_STAGE_INIT` firmware-loader + standard
+`geni_i2c.c` driver bind/probe have likely been running successfully on
+*every single boot this entire session* already, just never exercised
+by an actual transaction (no child device previously attempted to talk
+to address `0x11`). This changes the risk calculus for going through DM
+here -- the scary part (SE firmware load + bus driver probe) may already
+be proven safe by every successful boot so far.
+
+Note on risk framing: earlier in this session it was suggested that
+DT-triggered (`status = "okay"`) binding is inherently safer than
+"manual" binding, distinct from the `.bind` hang found earlier. That
+distinction doesn't hold up -- `sheng_mdss`'s `.bind` hung via the exact
+same standard, declarative `U_BOOT_DRIVER(...).bind` + `.of_match`
+mechanism being described as safe here. What actually differs this time
+is that `i2c1`'s bind/probe path has already run to completion,
+successfully, on every prior boot -- that's real evidence of safety, not
+the DT-vs-manual distinction.
+
+**Implemented**: `sheng_ktz8866_backlight_init()` in `board.c`, called
+from `board_late_init()`. Gets the `i2c1` bus via `ofnode_path("/soc@0/
+geniqup@ac0000/i2c@a84000")` + `uclass_get_device_by_ofnode()`,
+`dm_i2c_probe()`s address `0x11` (dynamically, no static DT child node
+needed for a plain register write), then `dm_i2c_write()`s `0x08=0x7F`,
+`0x04=0x07`, `0x05=0xFF` (max brightness). Also had to add
+`CONFIG_DM_I2C`/`CONFIG_SYS_I2C_GENI` to `sm8550_defconfig` -- neither
+was actually enabled before (only `CONFIG_QCOM_GENI`, the firmware-
+loader/misc driver, was; the I2C uclass and GENI I2C bus driver itself
+were not compiled in at all). Built as `boot-ktz8866-i2c-test.img`.
+
+**Result: booted, no visible backlight.** Read back the ACTUAL live
+hardware registers via `/sys/kernel/debug/regmap/4-0011/registers`
+under the booted Linux kernel to check whether the write really landed
+(not just whether the API call returned success) -- and it had:
+`BL_EN=0x5F` (master enable + 5/6 sinks), brightness `0x07`/`0xFF`
+(max), exactly as intended. So the single-chip write was genuinely
+correct. Backlight still didn't appear -- even forcing max brightness
+live via `echo 2047 > .../brightness` under Linux's own complete,
+correct driver produced nothing. This ruled out our code being wrong
+and pointed at something more fundamental.
+
+### Found: KTZ8866 is a PAIRED pair of chips, and we only ever touched one
+
+`compatible = "kinetic,ktz8866a"` on the device we'd been testing
+(`4-0011`) -- not plain `ktz8866`. The real driver
+(`drivers/video/backlight/ktz8866.c`) has `ktz8866a`/`ktz8866b` id
+variants that mirror every write to each other
+(`ktz8866_write()`/`update_bits()` write to both `ktz->regmap` and a
+paired `ktz_b->regmap`). Found the actual paired "B" chip live:
+`kinetic,ktz8866b` at `0-0011`, on a **completely different physical
+I2C controller** (`9c0000.geniqup`/`988000.i2c`, an I2C
+*master-hub*-type wrapper -- distinct compatible
+`"qcom,geni-se-i2c-master-hub"` from `i2c1`'s plain
+`"qcom,geni-se-qup"`, with its own separate firmware-loading pass in
+`qcom_geni.c`). U-Boot's `sheng_ktz8866_backlight_init()` had only ever
+touched chip A. If the panel's two DSI halves are each driven by their
+own chip (plausible for a dual-DSI split-link panel, which this is),
+missing B entirely would explain total darkness despite A's registers
+being perfectly correct.
+
+Also found via the same live regmap dump: chip A's `LCD_BIAS_CFG1`
+(register `0x09`) reads `0x9F` (`LCD_BIAS_EN`, set by Linux's own
+`ktz8866_init()`, gated on the `kinetic,enable-lcd-bias` DT boolean
+property present on this board) while chip B's reads `0x98` -- the real
+driver's own `regmap_write()` for this register is **not** part of the
+mirrored-write path, so it only ever reaches whichever chip instance
+directly owns the `dev.of_node` with that property (chip A here). Our
+U-Boot code never wrote this register on either chip.
+
+**Fix applied:** `sheng_ktz8866_backlight_init()` now writes both
+chips (`sheng_ktz8866_write_chip()`, called for both the `i2c1`/`a84000`
+path and the new `geniqup@9c0000`/`988000` path), plus `LCD_BIAS_CFG1 =
+0x9F` on both (cheap, low-risk extra write; not certain the real
+driver's A-only behavior is intentional-by-hardware-design vs an
+oversight, so covering both is the safe choice). Enabled the second
+I2C path in the board dts: `&i2c_master_hub_0 { status = "okay"; }` +
+`&i2c_hub_2 { status = "okay"; }` (both `status = "disabled"` by
+default in the shared `sm8550.dtsi`; confirmed via `geni_i2c.c`'s own
+source that both the master-hub wrapper compatible and its child bus
+compatible already have real driver support in this U-Boot tree, no
+new driver code needed). Also added a 5-second `mdelay()` after both
+writes (requested explicitly, to rule out a timing race with whatever
+runs next) and a new status-relay region (`sheng,ktz8866-status`,
+`SHENG_KTZ8866_STATUS_ADDR`, same cache-flush-on-write pattern as
+`sheng_mdss.c`'s breadcrumbs) so the per-chip write result is readable
+after boot, since `board.c` had no visibility into whether these calls
+actually succeeded before now. Built as `boot-ktz8866-instrumented.img`.
+
+**Result: pending.**
+
+### Aside: NixOS/Linux-side backlight+display investigation (separate from U-Boot)
+
+While chasing this, discovered `nixos/kernel/default.nix` had
+`CONFIG_DRM_MSM` (the real, normally-working display driver for this
+exact panel) disabled -- a leftover from a completed "cont_splash
+investigation" that was never reverted, with a matching `getty@tty1`
+mask in `hardware.nix`. Reverted both. This is entirely independent of
+U-Boot's own driver work above -- Linux boots with its own, separately
+maintained devicetree (confirmed: `/sys/firmware/devicetree/base/
+framebuffer*` doesn't exist under the currently-running kernel even
+though a `framebuffer` node exists in U-Boot's own `dts/upstream/...`
+source -- they are different DTBs). Rebuilding the NixOS image to test
+this hit an unrelated infrastructure issue: the remote aarch64-linux
+builder's sandbox can't resolve DNS for several external patch-fetch
+URLs (`gitlab.postmarketos.org`, `raw.githubusercontent.com`), breaking
+multiple packages (`sheng-iio-sensor-proxy`, `libssc`, and their
+dependents). Worked around by temporarily excluding
+`sheng-iio-sensor-proxy` from `xiaomi-sheng-services.nix`; hit the same
+issue on `libssc`/`wait_for_qmi_service.patch` next and left that build
+in the user's hands rather than keep excluding packages one at a time.
+The DRM_MSM/getty reverts themselves are correct either way and don't
+need to wait on that infra issue being resolved.
+
+### Dual-chip + LCD_BIAS fix confirmed correct via instrumentation, still no light -- likely explanation found
+
+Added a new status relay (`sheng,ktz8866-status`, same cache-flush-on-
+write pattern as `sheng_mdss.c`) since `board.c` previously had zero
+visibility into whether `dm_i2c_probe()`/`dm_i2c_write()` actually
+succeeded. Result after flashing `boot-ktz8866-instrumented.img`:
+**both chips report `0` (success)** -- confirmed via direct
+instrumentation, not just "didn't hang". The dual-chip + `LCD_BIAS_CFG1`
+fix is genuinely correct. **Still no visible backlight.**
+
+Realized why, tracing back to something already noted much earlier in
+this file: the currently-running Linux kernel has `CONFIG_DRM_MSM`
+disabled (see the "Aside" section above). The KTZ8866 backlight driver
+is a standalone I2C driver, independent of DRM_MSM -- it probes and
+configures fine regardless, which is exactly what we're seeing. But the
+**panel's own power sequencing** -- `avdd`/`avee` bias regulators +
+reset-GPIO pulse, done in `nt36532e_prepare()`
+(`drivers/gpu/drm/panel/panel-novatek-nt36532e.c`, confirmed live in
+the `sm8550-mainline` checkout: `pinfo->supplies[] = {"vddio","avdd",
+"avee"}`, `reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH)`)
+-- only runs as part of the DRM/panel driver probe chain, which
+requires DRM_MSM. This is a real, previously-documented gap in this
+file (search "real gap, needs separate follow-up" above) that predates
+this session. Many LCD panels are "normally black" -- without proper
+bias voltage, the polarizer stack can block all light transmission
+regardless of backlight brightness, which would explain correctly-
+configured backlight registers, successfully-ACKed DSI commands, and
+still zero visible light, consistently across every test tonight
+(U-Boot's own DSI bypass, and Linux's full sysfs-driven brightness
+test).
+
+Went looking for this board's actual `avdd`/`avee`/`reset-gpios` wiring
+values (needed regardless of whether the NixOS/DRM_MSM path pans out,
+since `sheng_mdss.c`'s own panel init would eventually need them too)
+across all three cloned repos
+(`Xiaomi_Kernel_sheng`, `Xiaomi-pad-6s-pro-Linux-1`,
+`map220v/sm8550-mainline`) -- none contain the actual board-side
+devicetree source (the first two are kernel/build-script repos without
+board DTS at all; only the *driver's own* expected property names came
+from the local `sm8550-mainline` checkout, not this board's specific
+values). Left unresolved -- if the DRM_MSM path doesn't pan out, this
+is the next concrete thing to chase, but needs a real devicetree source
+we don't have yet, not more guessing.
 
 ## Task #5 status: DPU register bus won't come up -- power/clock/interconnect sequencing incomplete
 

@@ -10,10 +10,12 @@
 #define pr_fmt(fmt) "QCOM: " fmt
 
 #include <asm/armv8/mmu.h>
+#include <asm/barriers.h>
 #include <asm/gpio.h>
 #include <asm/io.h>
 #include <asm/psci.h>
 #include <asm/system.h>
+#include <cpu_func.h>
 #include <dm/device.h>
 #include <dm/pinctrl.h>
 #include <dm/uclass-internal.h>
@@ -23,9 +25,11 @@
 #include <power/regulator.h>
 #include <env.h>
 #include <fdt_support.h>
+#include <i2c.h>
 #include <init.h>
 #include <linux/arm-smccc.h>
 #include <linux/bug.h>
+#include <linux/delay.h>
 #include <linux/psci.h>
 #include <linux/sizes.h>
 #include <lmb.h>
@@ -365,6 +369,15 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 			fdt_setprop(blob, nodeoff, "sheng,mdss-log",
 				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3100),
 				    4 + 64 * 8);
+			/* sheng_ktz8866_backlight_init()'s per-chip status
+			 * (see its own comment): [chip_a_ret, chip_b_ret],
+			 * 2 x 4 bytes. Same convention as mdss-status (0 =
+			 * success, negative = errno, 0x7fffffff = not
+			 * reached). Placed well clear of the mdss-log region
+			 * above (ends at 0x3100+516=0x3304). */
+			fdt_setprop(blob, nodeoff, "sheng,ktz8866-status",
+				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3400),
+				    8);
 		}
 	}
 
@@ -572,6 +585,127 @@ void __weak qcom_late_init(void)
 
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
 
+/*
+ * KTZ8866 backlight IC bring-up (SPEC.md task #5 log has the full
+ * investigation trail). GPIO 128 (backlight enable line) is handled
+ * separately in sheng_mdss.c via raw TLMM MMIO; this handles the I2C
+ * side (brightness/current-sink config), which the GPIO enable line
+ * alone doesn't provide -- the KTZ886x family needs these register
+ * writes to actually drive LED current, confirmed against the real
+ * kernel driver (drivers/video/backlight/ktz8866.c in the mainline
+ * checkout).
+ *
+ * This is a PAIRED pair of chips, not one: the real driver's own
+ * ktz8866_ids[] table has "ktz8866a"/"ktz8866b" variants that mirror
+ * writes to each other (ktz8866_write()/update_bits() write to both
+ * ktz->regmap and the paired ktz_b->regmap). Confirmed live under the
+ * booted Linux kernel:
+ *   - "A": /soc@0/geniqup@ac0000/i2c@a84000 (i2c1, already enabled
+ *     above), address 0x11.
+ *   - "B": /soc@0/geniqup@9c0000/i2c@988000 (i2c_hub_2, a SEPARATE
+ *     "qcom,geni-se-i2c-master-hub"-type wrapper, also enabled above),
+ *     address 0x11.
+ * Our first pass at this only wrote chip A -- if the panel's two DSI
+ * halves are each driven by their own chip, that alone could explain
+ * total darkness despite every register on A reading back correct.
+ *
+ * Also added LCD_BIAS_CFG1 (register 0x09 = 0x9F, LCD_BIAS_EN): the
+ * real driver's ktz8866_init() writes this too (gated on the
+ * `kinetic,enable-lcd-bias` boolean property, present on this board's
+ * real kernel-side devicetree node) via a plain, non-mirrored
+ * regmap_write() straight to ktz->regmap -- confirmed live: chip A's
+ * register 0x09 already reads 0x9F (Linux's own driver set it) while
+ * chip B's reads 0x98 (never mirrored there by the real driver either).
+ * Written to both here since we don't know for certain it's A-only by
+ * hardware design rather than a real driver oversight, and it's a
+ * cheap, low-risk extra register write either way.
+ *
+ * Both i2c bus nodes are already `status = "okay"` in this board's
+ * devicetree, meaning U-Boot's automatic GENI SE firmware loader +
+ * geni_i2c driver bind/probe already run on every boot via the
+ * standard, declarative DT-node-enables-driver mechanism -- this
+ * function is the first thing to actually attempt a real transaction
+ * over either. dm_i2c_probe() dynamically creates the chip device at
+ * runtime; no static devicetree child node for the ktz8866 itself is
+ * needed for a plain register write.
+ */
+#define SHENG_KTZ8866_STATUS_ADDR	(CONFIG_PRE_CON_BUF_ADDR + 0x3400)
+#define SHENG_KTZ8866_STATUS_NOT_REACHED	0x7fffffff
+
+/* Raw MMIO breadcrumb, same pattern (and same reason) as sheng_mdss.c's
+ * sheng_mdss_breadcrumb_flush(): D-cache is on for this board, so a
+ * plain volatile store here can sit dirty in a cache line indefinitely
+ * -- must flush + dsb after every write for it to survive to a
+ * subsequent boot/warm-reset reliably. */
+static void sheng_ktz8866_status_set(unsigned int slot, int ret)
+{
+	volatile int *slots = (volatile int *)(uintptr_t)SHENG_KTZ8866_STATUS_ADDR;
+
+	if (!IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
+		return;
+
+	slots[slot] = ret;
+	flush_dcache_range(SHENG_KTZ8866_STATUS_ADDR + slot * sizeof(*slots),
+			    SHENG_KTZ8866_STATUS_ADDR + (slot + 1) * sizeof(*slots));
+	dsb();
+}
+
+static int sheng_ktz8866_write_chip(const char *path)
+{
+	struct udevice *bus, *chip;
+	ofnode i2c_node;
+	u8 val;
+	int ret;
+
+	i2c_node = ofnode_path(path);
+	if (!ofnode_valid(i2c_node)) {
+		log_warning("sheng: ktz8866 ofnode not found: %s\n", path);
+		return -ENOENT;
+	}
+
+	ret = uclass_get_device_by_ofnode(UCLASS_I2C, i2c_node, &bus);
+	if (ret) {
+		log_warning("sheng: ktz8866 bus probe failed (%s): %d\n", path, ret);
+		return ret;
+	}
+
+	ret = dm_i2c_probe(bus, 0x11, 0, &chip);
+	if (ret) {
+		log_warning("sheng: ktz8866 chip probe failed (%s): %d\n", path, ret);
+		return ret;
+	}
+
+	val = 0x7f; /* BL_EN: all 6 current sinks + master enable bit */
+	dm_i2c_write(chip, 0x08, &val, 1);
+	val = 0x07; /* BL_BRT_LSB: brightness 2047 (max), low 3 bits */
+	dm_i2c_write(chip, 0x04, &val, 1);
+	val = 0xff; /* BL_BRT_MSB: brightness 2047 (max), high 8 bits */
+	dm_i2c_write(chip, 0x05, &val, 1);
+	val = 0x9f; /* LCD_BIAS_CFG1: LCD_BIAS_EN, matches real driver's ktz8866_init() */
+	dm_i2c_write(chip, 0x09, &val, 1);
+
+	return 0;
+}
+
+static void sheng_ktz8866_backlight_init(void)
+{
+	int ret;
+
+	sheng_ktz8866_status_set(0, SHENG_KTZ8866_STATUS_NOT_REACHED);
+	sheng_ktz8866_status_set(1, SHENG_KTZ8866_STATUS_NOT_REACHED);
+
+	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@ac0000/i2c@a84000"); /* "A" */
+	sheng_ktz8866_status_set(0, ret);
+
+	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@9c0000/i2c@988000"); /* "B" */
+	sheng_ktz8866_status_set(1, ret);
+
+	/* Give the chips/panel time to actually respond before boot
+	 * continues -- requested to make sure a slow-to-light backlight
+	 * gets a real chance, not just a race against whatever runs next. */
+	mdelay(5000);
+}
+
 /* Stolen from arch/arm/mach-apple/board.c */
 int board_late_init(void)
 {
@@ -626,6 +760,7 @@ int board_late_init(void)
 
 	configure_env();
 	qcom_late_init();
+	sheng_ktz8866_backlight_init();
 
 	qcom_show_boot_source();
 	/* Configure the dfu_string for capsule updates */

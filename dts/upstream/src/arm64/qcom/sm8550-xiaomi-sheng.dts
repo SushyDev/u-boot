@@ -551,6 +551,25 @@
 	status = "okay";
 };
 
+/*
+ * KTZ8866 backlight is a PAIRED pair of chips (kernel driver:
+ * drivers/video/backlight/ktz8866.c) -- "A" on i2c1 (0xa84000, already
+ * enabled above) and "B" on this separate I2C master-hub instance
+ * (0x9c0000 wrapper, 0x988000 sub-bus), confirmed live via
+ * /sys/bus/i2c/devices/0-0011 under the booted Linux kernel (a
+ * completely different geniqup wrapper than chip A's). Master-hub
+ * wrappers are a distinct compatible ("qcom,geni-se-i2c-master-hub")
+ * from the regular "qcom,geni-se-qup" type i2c1 uses -- see qcom_geni.c's
+ * own comment on why they need a separate firmware-loading pass.
+ */
+&i2c_master_hub_0 {
+	status = "okay";
+};
+
+&i2c_hub_2 {
+	status = "okay";
+};
+
 &sleep_clk {
 	clock-frequency = <32764>;
 };

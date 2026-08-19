@@ -421,6 +421,56 @@ static void sheng_mdss_gcc_disp_hf_axi_clk_enable(void)
 	sheng_mdss_log(SHENG_LOG_GCC_HF_AXI_READBACK, *cbcr);
 }
 
+/* Backlight enable, GPIO 128 (TLMM), active-high -- matches the
+ * `backlight-gpio` / `enable-gpios = <&tlmm 128 GPIO_ACTIVE_HIGH>` DT
+ * node already present in sm8550-xiaomi-sheng.dts (added in an earlier
+ * session, CONFIG_BACKLIGHT currently disabled so that node has no
+ * driver acting on it). GPIO 128 itself was independently verified
+ * working in that earlier session via a raw trap-based test; the
+ * backlight IC downstream of it is a KTZ8866A on I2C1, which needs its
+ * own (unrelated, still-broken -- QUP firmware loader timing) I2C probe
+ * for brightness/PWM control, but the enable line alone may be enough
+ * to get default-brightness output, worth trying on its own first.
+ *
+ * Deliberately raw MMIO here rather than U-Boot's gpio-backlight uclass
+ * driver: this session found that even a trivial .bind hook (see
+ * sheng_mdss_probe()'s own history) reliably hangs this board via a
+ * pre-relocation DM bind-pass fragility, and gpio-backlight is a
+ * completely untested (for us) driver-model path. A raw TLMM poke
+ * carries none of that risk and matches this whole session's approach.
+ *
+ * Register layout confirmed from drivers/pinctrl/qcom/pinctrl-sm8550.c's
+ * PINGROUP macro (mainline kernel checkout): per-pin 0x1000 stride from
+ * the tlmm block (0xf100000, sm8550.dtsi's tlmm@f100000), ctl_reg at
+ * +0, io_reg at +0x4; mux_bit=2 (3 bits, msm_mux_gpio=0 selects native
+ * GPIO function), oe_bit=9 (output enable), out_bit=1 (in io_reg,
+ * drive value once OE=1).
+ */
+#define SM8550_TLMM_BASE		0x00f100000
+#define TLMM_GPIO_REG_SIZE		0x1000
+#define TLMM_BACKLIGHT_GPIO		128
+#define TLMM_MUX_FUNC_MASK		(0x7u << 2)
+#define TLMM_OE_BIT			(1u << 9)
+#define TLMM_OUT_BIT			(1u << 1)
+
+static void sheng_mdss_backlight_gpio_enable(void)
+{
+	volatile u32 *ctl = (volatile u32 *)(uintptr_t)
+		(SM8550_TLMM_BASE + TLMM_GPIO_REG_SIZE * TLMM_BACKLIGHT_GPIO);
+	volatile u32 *io = (volatile u32 *)(uintptr_t)
+		(SM8550_TLMM_BASE + 0x4 + TLMM_GPIO_REG_SIZE * TLMM_BACKLIGHT_GPIO);
+	u32 v;
+
+	v = *ctl;
+	v &= ~TLMM_MUX_FUNC_MASK; /* native GPIO function (msm_mux_gpio = 0) */
+	v |= TLMM_OE_BIT;
+	*ctl = v;
+
+	v = *io;
+	v |= TLMM_OUT_BIT;
+	*io = v;
+}
+
 static int sheng_mdss_bcm_vote(const char *bcm_name)
 {
 	u32 addr;
@@ -625,11 +675,17 @@ static int sheng_mdss_probe(struct udevice *dev)
 	if (ret)
 		return ret;
 
+	/* Backlight enable (GPIO 128) -- see its own comment above. Cheap,
+	 * independent peripheral, unrelated to DSI/DPU; done here so it's
+	 * on by the time the test patch below lands, for a chance at an
+	 * actual visible result this time. */
+	sheng_mdss_backlight_gpio_enable();
+
 	/* Push a small solid-red 16x16 RGB888 patch directly to the panel
 	 * over the DSI command-mode DMA engine, entirely bypassing the DPU
 	 * (0xae01000+) -- see sheng_mdss_dsi_test_patch()'s comment in
-	 * sheng_mdss_hw.zig. If this survives and a red square appears
-	 * (backlight permitting -- see SPEC.md's known gap), we have a
+	 * sheng_mdss_hw.zig. If this survives and a red square appears now
+	 * that backlight is on too, we have a genuinely confirmed
 	 * pixel-output path independent of the still-unsolved DPU write
 	 * hang.
 	 */
