@@ -629,6 +629,9 @@ void __weak qcom_late_init(void)
  * runtime; no static devicetree child node for the ktz8866 itself is
  * needed for a plain register write.
  */
+/* Linux's own live brightness on this panel: BL_BRT_MSB 0xbb, LSB 0x04
+ * -> (0xbb << 3) | 0x04 = 1500, matching its backlight sysfs value. */
+#define SHENG_KTZ8866_BRIGHTNESS		1500u
 #define SHENG_KTZ8866_STATUS_ADDR	(CONFIG_PRE_CON_BUF_ADDR + 0x3400)
 #define SHENG_KTZ8866_STATUS_NOT_REACHED	0x7fffffff
 
@@ -908,18 +911,30 @@ static int sheng_ktz8866_write_chip(const char *path, u32 *bl_en_readback_out)
 		*bl_en_readback_out = rb_ret ? (0xdead0000u | (rb_ret & 0xff)) : rb;
 	}
 
-	/* Ramp brightness up from 0 to max (2047) over ~200ms in 16 steps,
-	 * instead of one instantaneous jump -- softens the actual LED
-	 * current inrush, not just the master-enable transition. */
-	for (int step = 1; step <= 16; step++) {
-		unsigned int brightness = (2047u * (unsigned int)step) / 16;
-
-		val = brightness & 0x07;
-		dm_i2c_write(chip, 0x04, &val, 1);
-		val = (brightness >> 3) & 0xff;
-		dm_i2c_write(chip, 0x05, &val, 1);
-		mdelay(12);
-	}
+	/* Brightness set EXACTLY as Linux does (SPEC.md task #5 log): one
+	 * write pair, no ramp, to the same value its driver uses.
+	 *
+	 * ktz8866_backlight_update_status() writes
+	 *   BL_BRT_LSB = brightness & 0x7
+	 *   BL_BRT_MSB = (brightness >> 3) & 0xFF
+	 * and nothing else. Live registers read 0x04/0xbb, i.e.
+	 * (0xbb << 3) | 0x04 = 1500 -- matching
+	 * /sys/class/backlight/ktz8866-backlight/brightness exactly.
+	 *
+	 * This driver previously ramped 0 -> 2047 in 16 steps over ~200ms.
+	 * That is a visible behavioural difference from the reference on a
+	 * chip whose output feeds the panel's bias, and the ramp is
+	 * plainly visible on-device, so it is not a no-op. Matching Linux
+	 * removes it as a variable -- and 2047 vs 1500 was also a
+	 * difference nobody had accounted for. */
+	val = SHENG_KTZ8866_BRIGHTNESS & 0x07;
+	ret = dm_i2c_write(chip, 0x04, &val, 1);
+	if (ret)
+		return ret;
+	val = (SHENG_KTZ8866_BRIGHTNESS >> 3) & 0xff;
+	ret = dm_i2c_write(chip, 0x05, &val, 1);
+	if (ret)
+		return ret;
 
 	return 0;
 }

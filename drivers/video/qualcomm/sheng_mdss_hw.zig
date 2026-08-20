@@ -1958,6 +1958,63 @@ fn dsiCmdDmaTxDual(dsi0_base: usize, dsi1_base: usize, dma_addr: usize, len: usi
 /// links to respond to LP/BTA traffic at all, a DSI0-only trigger
 /// could look malformed to the panel and explain a zero response on
 /// its own, independent of the base driver (which never had this bug).
+/// SINGLE-HOST DCS read (SPEC.md task #5 log).
+///
+/// This is the one test that would POSITIVELY prove the panel is alive:
+/// a read requires the panel to turn the bus around and drive data
+/// back. Everything else we have is one-way -- "success" has only ever
+/// meant our DMA engine shipped bytes. The two liveness tests tried so
+/// far were both invalid: ALL_PIXELS_ON is implementation-defined on a
+/// RAM-less video-mode panel, and DCS 0x51 cannot move the backlight
+/// because the KTZ8866 is in I2C-brightness mode (the visible soft-start
+/// ramp is driven over I2C, not by the panel's PWM).
+///
+/// The existing read path issues the read on BOTH hosts at once via
+/// dsiCmdDmaTxDual(). On a bonded panel each host has its own physical
+/// link, and msm's rx path is explicitly single-host
+/// (msm_dsi_manager_cmd_xfer() reads only from the master). Two
+/// simultaneous bus-turnaround requests is not something the panel is
+/// ever asked to do, so every empty read so far may be OUR bug rather
+/// than evidence about the panel.
+///
+///   non-zero count/data -> the panel RECEIVES, DECODES and RESPONDS.
+///     Everything upstream is proven good and the fault is confined to
+///     the video path.
+///   still zero -> two-way communication genuinely fails on a link
+///     whose every register matches working silicon.
+export fn sheng_mdss_dsi_read_power_mode_single(dsi0_base: usize, dma_scratch: usize) callconv(.c) i64 {
+    const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
+
+    // Set Maximum Return Packet Size = 1, master only.
+    dst[0] = 1;
+    dst[1] = 0;
+    dst[2] = 0x37;
+    dst[3] = 0x80;
+    var ret = dsiCmdDmaTxOne(dsi0_base, dma_scratch, 4);
+    if (ret != 0) return -1;
+
+    mmioWrite32(dsi0_base, DSI_RDBK_DATA_CTRL, RDBK_DATA_CTRL_CLR);
+    mmioWrite32(dsi0_base, DSI_RDBK_DATA_CTRL, 0);
+
+    // DCS read (0x06), cmd 0x0A Get Power Mode, BTA expected.
+    dst[0] = 0x0a;
+    dst[1] = 0x00;
+    dst[2] = 0x06;
+    dst[3] = 0x80 | 0x20;
+    ret = dsiCmdDmaTxOne(dsi0_base, dma_scratch, 4);
+    if (ret != 0) return -2;
+
+    // Give the panel time to turn the bus around and reply.
+    udelay(20000);
+
+    const ctrl = mmioRead32(dsi0_base, DSI_RDBK_DATA_CTRL);
+    const resp = mmioRead32(dsi0_base, DSI_RDBK_DATA0);
+    const status = mmioRead32(dsi0_base, DSI_STATUS0);
+    // high32 = RDBK_DATA_CTRL (bits 23:16 = byte count), low32 = data
+    _ = status;
+    return (@as(i64, ctrl) << 32) | @as(i64, resp);
+}
+
 export fn sheng_mdss_dsi_read_power_mode(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) i64 {
     const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
 
@@ -2212,6 +2269,56 @@ fn dsiSendRawLong(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, data_i
 /// that raw data as compressed and very likely show garbage or nothing.
 /// Pass false to leave DSC off (skips the 0x90/PPS/0x9d/framerate-branch
 /// block entirely) for that test; real use should pass true.
+/// INVERTED TEST (SPEC.md task #5 log): skip the panel reset and the
+/// entire DCS init sequence, leaving the panel in whatever state ABL
+/// left it, and just bring the DSI host up and stream video at it.
+///
+/// ABL initialises this panel (its splash is visible before U-Boot), and
+/// Linux re-initialises it successfully AFTER us on the same hardware --
+/// so the panel is demonstrably re-initialisable and the silicon is
+/// fine. Ours specifically does not take: a properly-formed single-host
+/// DCS read with BTA returns nothing (sheng.rd1 = 0), while every
+/// register in the DSI/DPU/PHY/MDSS spaces and all 128 PPS bytes are
+/// identical to the working kernel.
+///
+/// If the panel is still live from ABL, streaming at it without
+/// touching it at all should produce an image:
+///   image appears -> OUR init sequence is what breaks the panel, and
+///     the fault is in the command path, not the video path.
+///   still black -> ABL did not leave it in a usable state, or the
+///     video path itself cannot drive it, which points away from the
+///     command path entirely.
+///
+/// Host bring-up and the video-mode switch are KEPT -- those touch the
+/// SoC's DSI controller, not the panel.
+const SKIP_PANEL_INIT_TEST: bool = false;
+
+/// Host bring-up + video-mode switch, split out so it can run BEFORE
+/// the panel is powered and reset (SPEC.md task #5 log).
+///
+/// Measured from the working kernel with a ktime-stamped trace:
+///
+///   691.3ms  bridge_pre_enable
+///   743.0ms  host_enable_video      <-- video mode ON
+///   743.058ms panel_prepare enter   <-- panel powered 8us later
+///   743.48ms panel_reset enter      <-- panel reset AFTER video mode
+///   778.6ms  init_seq enter
+///   952.6ms  init_seq exit
+///
+/// So the panel is powered, reset and initialised onto a link that is
+/// ALREADY in video mode. This driver did all three before the host
+/// ever left command mode. An earlier attempt at this reorder moved
+/// only the video-mode switch and left the reset where it was, which
+/// regressed the DSC encoder -- the ordering was right, the
+/// implementation was not: the reset must follow the switch, not
+/// precede it.
+export fn sheng_mdss_dsi_host_video_prepare(dsi0_base: usize, dsi1_base: usize) callconv(.c) void {
+    dsiHostBringUp(dsi0_base);
+    dsiHostBringUp(dsi1_base);
+    dsiHostSwitchToVideoMode(dsi0_base);
+    dsiHostSwitchToVideoMode(dsi1_base);
+}
+
 export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, enable_dsc: bool) callconv(.c) c_int {
     // REAL GAP FOUND (SPEC.md task #5 log): smmuBypassMdssStream() was
     // only ever called inside sheng_mdss_dpu_start(), which runs AFTER
@@ -2222,8 +2329,9 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
     // whole time. Moved here, before any DSI command traffic at all.
     smmuBypassMdssStream();
 
-    dsiHostBringUp(dsi0_base);
-    dsiHostBringUp(dsi1_base);
+    // Host bring-up + video-mode switch now run in
+    // sheng_mdss_dsi_host_video_prepare(), before the panel is powered
+    // and reset -- matching the kernel's measured timeline.
 
     // ORDERING EXPERIMENT REVERTED (SPEC.md task #5 log): switching to
     // video mode HERE (before the DCS sequence, matching the panel

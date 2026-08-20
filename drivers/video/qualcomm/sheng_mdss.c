@@ -815,6 +815,8 @@ extern int sheng_mdss_dispcc_init_thru_mdp_rcg_only(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init_no_mdp_branch(unsigned long dispcc_base);
 extern int sheng_mdss_dsi_phy_init(unsigned long dsi_phy_base, bool is_master);
 extern void sheng_mdss_dsi_reset_both_phys(unsigned long dsi0_base, unsigned long dsi1_base);
+extern void sheng_mdss_dsi_host_video_prepare(unsigned long dsi0_base,
+					     unsigned long dsi1_base);
 extern int sheng_mdss_dsi_panel_init(unsigned long dsi0_base, unsigned long dsi1_base,
 				      unsigned long dma_scratch, bool enable_dsc);
 extern int sheng_mdss_dsi_test_patch(unsigned long dsi0_base, unsigned long dsi1_base,
@@ -843,6 +845,8 @@ extern long long sheng_mdss_smmu_fault_addr(void);
 extern void sheng_mdss_dsi_tpg_enable(unsigned long dsi0_base,
 				     unsigned long dsi1_base);
 extern void sheng_mdss_capture_state(unsigned long dst);
+extern long long sheng_mdss_dsi_read_power_mode_single(unsigned long dsi0_base,
+						       unsigned long dma_scratch);
 extern unsigned int sheng_mdss_dsi_retry_count(void);
 extern long long sheng_mdss_dsi_audit(unsigned long dsi0_base);
 extern long long sheng_mdss_dsi1_audit(unsigned long dsi1_base);
@@ -1166,6 +1170,56 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * the panel is very likely still sitting in hardware reset and/or
 	 * unpowered, and every "successful" DCS write below has been going
 	 * nowhere. */
+	/* ORDERING, measured from the working kernel (SPEC.md task #5 log):
+	 * bring the DSI hosts up and switch them to VIDEO mode FIRST, then
+	 * power and reset the panel, then run the DCS init sequence. The
+	 * kernel's ktime trace shows host_enable_video at 743.050ms,
+	 * panel_prepare at 743.058ms and panel_reset at 743.484ms -- the
+	 * panel is reset onto an already-streaming link.
+	 *
+	 * This driver used to power+reset the panel and run its entire init
+	 * over a command-mode link, switching to video only afterwards. A
+	 * first attempt at the reorder moved just the video-mode switch and
+	 * left the reset ahead of it, which regressed the DSC encoder; the
+	 * reset has to FOLLOW the switch. */
+	/* MEASURED RESULT (SPEC.md task #5 log): replicating the kernel's
+	 * order exactly -- video mode on, THEN power+reset, THEN the DCS
+	 * sequence -- broke command transmission. Commands succeed for a
+	 * while and then time out mid-sequence (panel = -10026, i.e.
+	 * command #26; the single-host read's first command also failed).
+	 * The DSI video engine is streaming with no DPU data behind it for
+	 * the ~200ms the init takes, and eventually wedges the command DMA.
+	 * Linux has the identical window (host_enable_video 743.050ms,
+	 * init_seq exit 952.569ms, INTF timing engine started only after)
+	 * and its commands survive it -- so something about our video
+	 * engine's behaviour with no data differs, which is worth chasing,
+	 * but not at the cost of a working command path.
+	 *
+	 * Reverted to: power+reset, DCS init over a command-mode link, then
+	 * the video-mode switch in dpu_start(). End state is identical
+	 * either way (sheng.verify / sheng.dsiaudit both read 0). */
+	/* KERNEL-ORDER REPLICATION, second attempt (SPEC.md task #5 log).
+	 *
+	 * The traced kernel timeline is now unambiguous:
+	 *   751.075ms host_enable_video   (video mode ON)
+	 *   751.582ms panel_reset
+	 *   786.676ms init_seq enter
+	 *   960.492ms init_seq exit
+	 *   962.660ms intf_timing_engine enable=1   (2.2ms LATER)
+	 *
+	 * So Linux runs the whole DCS sequence on a link that is in video
+	 * mode but carrying no active pixels -- the INTF timing engine is
+	 * started only afterwards. Commands interleave into what is
+	 * effectively 100% blanking.
+	 *
+	 * We reproduced exactly that and the command DMA still wedged at
+	 * command #26. This run is to capture WHY: sheng.timeout_diag holds
+	 * FIFO_STATUS and DLN0_PHY_ERR sampled at the failing command, which
+	 * was never read on the previous attempt. Healthy reference values
+	 * from live silicon: FIFO_STATUS 0x00001210, DLN0_PHY_ERR 0x00088888.
+	 */
+	sheng_mdss_dsi_host_video_prepare(SM8550_MDSS_DSI0_BASE,
+					  SM8550_MDSS_DSI1_BASE);
 	sheng_mdss_panel_power_and_reset();
 
 	/* Backlight now confirmed working in U-Boot itself (order flip +
@@ -1219,6 +1273,11 @@ static int sheng_mdss_probe(struct udevice *dev)
 					 SHENG_MDSS_DSI_DMA_SCRATCH, true);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI_PANEL, ret);
 	env_set_hex("sheng_mdss_panel", (unsigned long)ret);
+	/* Single-host DCS read: the one test that would positively prove
+	 * two-way communication with the panel. See its comment. */
+	env_set_hex("sheng_mdss_rdsingle",
+		    (unsigned long)sheng_mdss_dsi_read_power_mode_single(
+			    SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH));
 	env_set_hex("sheng_mdss_retries",
 		    (unsigned long)sheng_mdss_dsi_retry_count());
 	env_set_hex("sheng_mdss_status0_pre",
