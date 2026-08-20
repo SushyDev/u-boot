@@ -838,6 +838,8 @@ extern void sheng_mdss_dsi_tpg_enable(unsigned long dsi0_base,
 				     unsigned long dsi1_base);
 extern long long sheng_mdss_verify_pipeline(unsigned long dpu_base,
 					    unsigned long dsi0_base);
+extern long long sheng_mdss_dsc_status1(unsigned long dpu_base);
+extern long long sheng_mdss_dsc_status2(unsigned long dpu_base);
 extern long long sheng_mdss_dpu_readback1(unsigned long dpu_base);
 extern int sheng_mdss_dsi_all_pixels_on(unsigned long dsi0_base,
 					unsigned long dsi1_base,
@@ -1421,6 +1423,10 @@ static int sheng_mdss_probe(struct udevice *dev)
 	env_set_hex("sheng_mdss_verify",
 		    (unsigned long)sheng_mdss_verify_pipeline(SM8550_MDSS_DPU_BASE,
 							     SM8550_MDSS_DSI0_BASE));
+	env_set_hex("sheng_mdss_dsc_st1",
+		    (unsigned long)sheng_mdss_dsc_status1(SM8550_MDSS_DPU_BASE));
+	env_set_hex("sheng_mdss_dsc_st2",
+		    (unsigned long)sheng_mdss_dsc_status2(SM8550_MDSS_DPU_BASE));
 	env_set_hex("sheng_mdss_dpu_rb1",
 		    (unsigned long)sheng_mdss_dpu_readback1(SM8550_MDSS_DPU_BASE));
 	env_set_hex("sheng_mdss_dpu_rb2",

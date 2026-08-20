@@ -1541,11 +1541,22 @@ fn dsiHostBringUp(dsi_base: usize) void {
     // TRIG_CTRL_TE|TRIG_CTRL_DMA_TRIGGER_SW guess (0x80000004) was very
     // different from what's actually programmed on working hardware
     // (0x001C1A02).
-    // Command-init variant, NOT the live-Linux value -- see
-    // TRIG_CTRL_CMD_INIT_VALUE's comment. Restored to TRIG_CTRL_VALUE
-    // by sheng_mdss_dsi_trig_ctrl_restore() once the panel is up and
-    // the DPU is about to start driving frames.
-    mmioWrite32(dsi_base, DSI_TRIG_CTRL, TRIG_CTRL_CMD_INIT_VALUE);
+    // REVERTED to Linux's exact live value (SPEC.md task #5 log).
+    //
+    // This briefly ran as TRIG_CTRL_CMD_INIT_VALUE (software trigger
+    // only) on the theory that BLOCK_DMA_WITHIN_FRAME's "wait until cmd
+    // mdp is idle" interlock was deadlocking the command DMA. That
+    // theory was DISPROVEN -- the real cause was GCC_DISP_HF_AXI_CLK
+    // ordering -- so the deviation bought nothing and was left in place
+    // only because it appeared harmless.
+    //
+    // It is not obviously harmless: panel init has since failed
+    // intermittently at random command indices (#5, #11, #54 observed),
+    // always recoverable by a full power cycle. An unnecessary
+    // divergence from a known-good trigger configuration is exactly the
+    // kind of thing that produces marginal, index-independent failures,
+    // so it goes back to the value working silicon uses.
+    mmioWrite32(dsi_base, DSI_TRIG_CTRL, TRIG_CTRL_VALUE);
 
     // Phase 2: mode selection, matching dsi_op_mode_config()'s own
     // read-modify-write -- CMD_MODE_EN added only now, after every
@@ -2439,6 +2450,31 @@ const DSC_RC_RANGE_BPG_OFFSETS_2: usize = 0x98;
 // sblk.ctl-relative (dce_0_0.ctl.base=+0xf00, dce_0_1.ctl.base=+0xf80)
 const DSC_CTL_MUX: usize = 0x00;
 const DSC_CFG: usize = 0x04;
+/// REAL GAP FOUND (SPEC.md task #5 log): the DSC CTL sub-block has two
+/// more registers (dpu_hw_dsc_1_2.c's "DPU_DSC_CTL register offsets"
+/// block) that this driver never wrote at all:
+///
+///   DSC_DATA_IN_SWAP (0x08) -- live 0x0002C688
+///   DSC_CLK_CTRL     (0x0C) -- live 0xC0000000
+///
+/// DSC_CLK_CTRL is a CLOCK GATE on the DSC block. Left clear, the
+/// encoder's registers remain readable over AHB and its status
+/// registers still respond -- which is precisely what was measured:
+/// ENC_GENERAL_STATUS and ENC_INT_STAT non-zero (block alive and
+/// clocked enough to answer), ENC_HSLICE_STATUS stalled at 0x0d
+/// (live 0x00140000), and ENC_OUT_STATUS = 0 against live's 0x002E0000
+/// -- i.e. the encoder emits NOTHING. On a DSC-mandatory panel that
+/// alone is a black screen, with every other register in the pipeline
+/// bit-identical to working silicon (sheng.verify = 0).
+///
+/// Same shape as this session's GCC_DISP_HF_AXI_CLK bug: a clock that
+/// appears in no register diff, gating a block whose configuration was
+/// already correct. These are almost certainly set by ABL and then
+/// wiped by our own mdssCoreBcrReset(), never to be restored.
+const DSC_DATA_IN_SWAP: usize = 0x08;
+const DSC_CLK_CTRL: usize = 0x0c;
+const DSC_DATA_IN_SWAP_VALUE: u32 = 0x0002C688;
+const DSC_CLK_CTRL_VALUE: u32 = 0xC0000000;
 
 const DSC_MODE_SPLIT_PANEL: u32 = 1 << 0;
 const DSC_MODE_VIDEO: u32 = 1 << 2;
@@ -2676,6 +2712,12 @@ fn dscConfigureInstance(dce_base: usize, enc_off: usize, ctl_off: usize, pp_idx:
 
     // DSC_CTL: bind this encoder's output mux to its pingpong block.
     dpuHwWrite(dce_base, ctl_off, DSC_CTL_MUX, pp_idx & 0x7);
+
+    // Ungate the DSC block's clock and restore the data-in swap config
+    // -- see DSC_CLK_CTRL's comment. Written AFTER DSC_CFG so the
+    // encoder is fully configured before its clock is enabled.
+    dpuHwWrite(dce_base, ctl_off, DSC_DATA_IN_SWAP, DSC_DATA_IN_SWAP_VALUE);
+    dpuHwWrite(dce_base, ctl_off, DSC_CLK_CTRL, DSC_CLK_CTRL_VALUE);
 }
 
 // THE REAL ANSWER for why U-Boot's own render never showed pixels
@@ -3337,6 +3379,37 @@ export fn sheng_mdss_dsi_video_readback2(dsi0_base: usize, dsi1_base: usize) cal
         @as(i64, mmioRead32(dsi1_base, DSI_STATUS0));
 }
 
+/// DSC ENCODER STATUS (SPEC.md task #5 log). dpu_hw_dsc_1_2.c names
+/// these as read-only status, not config -- so there is nothing to
+/// write, but they are a direct window into whether the DSC encoder is
+/// actually RUNNING, which no other instrument here provides.
+///
+/// Live, working Linux on this exact panel reads:
+///   ENC_GENERAL_STATUS (0x04) = 0x00000003
+///   ENC_HSLICE_STATUS  (0x08) = 0x00140000
+///   ENC_OUT_STATUS     (0x0C) = 0x002E0000
+///   ENC_INT_STAT       (0x10) = 0x000007B0
+///
+/// This matters because the panel is DSC-mandatory: the DSI test
+/// pattern generator injects pixels DOWNSTREAM of these encoders, so it
+/// can never produce a decodable stream here and both TPG results were
+/// uninformative. The encoder's own status is the instrument that TPG
+/// could not be.
+///
+///   all zero -> the DSC encoder never ran. Everything upstream can be
+///     bit-perfect and nothing decodable ever reaches the panel, which
+///     fits every observation so far.
+///   matching live -> the encoder is producing output, and the fault is
+///     downstream of it (INTF/DSI/panel).
+export fn sheng_mdss_dsc_status1(dpu_base: usize) callconv(.c) i64 {
+    const enc0 = dpu_base + 0x80000 + 0x100;
+    return (@as(i64, mmioRead32(enc0, 0x04)) << 32) | @as(i64, mmioRead32(enc0, 0x08));
+}
+export fn sheng_mdss_dsc_status2(dpu_base: usize) callconv(.c) i64 {
+    const enc0 = dpu_base + 0x80000 + 0x100;
+    return (@as(i64, mmioRead32(enc0, 0x0c)) << 32) | @as(i64, mmioRead32(enc0, 0x10));
+}
+
 export fn sheng_mdss_dpu_readback1(dpu_base: usize) callconv(.c) i64 {
     const ctl_base = dpu_base + 0x15000;
     return (@as(i64, mmioRead32(ctl_base, CTL_FLUSH)) << 32) |
@@ -3505,6 +3578,13 @@ const verify_table = [_]VerifyEntry{
     .{ .block = 1, .off = 0x80134, .expect = 0x07F00BE8 }, // DSC0 PICTURE_SIZE
     .{ .block = 1, .off = 0x80f04, .expect = 0x00001801 }, // DSC0 CFG
     .{ .block = 1, .off = 0x690a0, .expect = 0x00000000 }, // PP0 DSC_MODE
+    // Added to confirm the DSC CTL sub-block writes actually LAND --
+    // writing them produced byte-identical encoder status, which is
+    // only meaningful if the writes stick. See DSC_CLK_CTRL's comment.
+    .{ .block = 1, .off = 0x80f08, .expect = 0x0002C688 }, // DSC0 DATA_IN_SWAP
+    .{ .block = 1, .off = 0x80f0c, .expect = 0xC0000000 }, // DSC0 CLK_CTRL
+    .{ .block = 1, .off = 0x80f88, .expect = 0x0002C688 }, // DSC1 DATA_IN_SWAP
+    .{ .block = 1, .off = 0x80f8c, .expect = 0xC0000000 }, // DSC1 CLK_CTRL
 };
 
 var g_verify_mask: u64 = 0;
