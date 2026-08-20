@@ -461,6 +461,80 @@ const VSYNC_CLK_DIV_REG_VAL: u32 = 1; // F(19200000, P_BI_TCXO, 1, 0, 0) -> 2*1-
 /// here -- they mux from the DSI PHY's own PLL output rather than
 /// DISPCC's internal PLL0, so they belong with DSI PHY bring-up
 /// (sheng_mdss_dsi_phy_init) instead.
+// Backlight-kill bisection (see board.c/sheng_mdss.c SPEC.md task #5
+// log): full sheng_mdss_dispcc_init() kills backlight even for Linux's
+// later re-init; core_reset+GDSC alone don't. Narrowing inside DISPCC
+// itself -- PLL0 lock vs. the AHB/MDP/LUT/VSYNC clock branch enables
+// that follow it.
+export fn sheng_mdss_dispcc_init_pll0_only(dispcc_base: usize) callconv(.c) c_int {
+    return dispCcPll0Enable(dispcc_base);
+}
+
+export fn sheng_mdss_dispcc_init_thru_ahb(dispcc_base: usize) callconv(.c) c_int {
+    var ret = dispCcPll0Enable(dispcc_base);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
+    if (ret != 0) return ret;
+    return clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
+}
+
+export fn sheng_mdss_dispcc_init_thru_mdp_rcg_only(dispcc_base: usize) callconv(.c) c_int {
+    var ret = dispCcPll0Enable(dispcc_base);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
+    if (ret != 0) return ret;
+
+    // MDP clock source configured (src_sel + divider written) but the
+    // CBCR branch itself never enabled -- narrows whether the RCG
+    // config write or the actual clock-branch-on transition is what
+    // disrupts something.
+    return rcg2ConfigureHidOnly(dispcc_base, MDP_CLK_SRC_CMD_RCGR, MDP_CLK_SRC_SEL_PLL0, MDP_CLK_DIV_REG_VAL);
+}
+
+export fn sheng_mdss_dispcc_init_thru_mdp(dispcc_base: usize) callconv(.c) c_int {
+    var ret = dispCcPll0Enable(dispcc_base);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, MDP_CLK_SRC_CMD_RCGR, MDP_CLK_SRC_SEL_PLL0, MDP_CLK_DIV_REG_VAL);
+    if (ret != 0) return ret;
+    return clkBranchEnable(dispcc_base, MDP_CLK_CBCR);
+}
+
+// Bisection landed here: MDP_CLK_CBCR's branch-enable transition
+// (clkBranchEnable) specifically kills backlight (RCG src config alone
+// is harmless; AHB is harmless). The DSI-bypass pixel path
+// (sheng_mdss_dsi_test_patch) never touches the DPU pixel pipeline at
+// all -- it's pure DSI command-mode DMA sourced from DSI's own byte/
+// pixel clocks (DSI PHY PLL) plus AHB, not the MDP core clock. So skip
+// just this one branch enable and keep going through DSI PHY/panel
+// init, to get backlight AND the red square in the same build.
+export fn sheng_mdss_dispcc_init_no_mdp_branch(dispcc_base: usize) callconv(.c) c_int {
+    var ret = dispCcPll0Enable(dispcc_base);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
+    if (ret != 0) return ret;
+
+    // MDP_CLK_CBCR branch enable intentionally skipped.
+    ret = rcg2ConfigureHidOnly(dispcc_base, MDP_CLK_SRC_CMD_RCGR, MDP_CLK_SRC_SEL_PLL0, MDP_CLK_DIV_REG_VAL);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, VSYNC_CLK_SRC_CMD_RCGR, VSYNC_CLK_SRC_SEL_XO, VSYNC_CLK_DIV_REG_VAL);
+    if (ret != 0) return ret;
+    return clkBranchEnable(dispcc_base, VSYNC_CLK_CBCR);
+}
+
 export fn sheng_mdss_dispcc_init(dispcc_base: usize) callconv(.c) c_int {
     var ret = dispCcPll0Enable(dispcc_base);
     if (ret != 0) return ret;
@@ -1301,7 +1375,7 @@ const CTL_DEFAULT_GROUP_ID_SHIFTED: u32 = 0xf << 28;
 // normally to Linux and the (already working) sheng,mdss-status relay
 // confirms whether we got that far without the CPU/bus wedging. Bump
 // this and reflash to bisect; set to 99 for the real full sequence.
-const DPU_TEST_STOP_STAGE: u32 = 1;
+const DPU_TEST_STOP_STAGE: u32 = 99;
 
 fn dpuHwWrite(dpu_base: usize, block_off: usize, reg_off: usize, value: u32) void {
     mmioWrite32(dpu_base, block_off + reg_off, value);

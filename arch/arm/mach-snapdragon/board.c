@@ -632,6 +632,78 @@ void __weak qcom_late_init(void)
 #define SHENG_KTZ8866_STATUS_ADDR	(CONFIG_PRE_CON_BUF_ADDR + 0x3400)
 #define SHENG_KTZ8866_STATUS_NOT_REACHED	0x7fffffff
 
+/* Real board devicetree (sm8550-mainline's arch/arm64/boot/dts/qcom/
+ * sm8550-xiaomi-sheng.dts) declares `enable-gpios = <&tlmm 128
+ * GPIO_ACTIVE_HIGH>` on BOTH ktz8866 backlight@11 nodes. On this chip
+ * the EN pin doesn't just gate the LED current sinks -- it gates the
+ * I2C interface itself, so writes issued before EN is driven high
+ * either NAK or land on a chip that's still in reset. This function
+ * previously lived only in sheng_mdss.c's sheng_mdss_backlight_gpio_
+ * enable(), which doesn't run until sheng_mdss_probe() -- triggered
+ * by the CONFIG_VIDEO uclass_get_device() call *after*
+ * sheng_ktz8866_backlight_init() in misc_init_r() below. So the I2C
+ * writes were always racing a chip that hadn't been enabled yet.
+ * Same raw TLMM MMIO poke, duplicated here (rather than shared)
+ * because board.c can't/shouldn't depend on a driver-internal static
+ * in drivers/video/qualcomm/sheng_mdss.c, and this needs to run even
+ * when CONFIG_VIDEO_SHENG_MDSS is disabled. */
+#define SHENG_TLMM_BASE			0x00f100000
+#define SHENG_TLMM_GPIO_REG_SIZE	0x1000
+#define SHENG_BACKLIGHT_GPIO		128
+#define SHENG_TLMM_MUX_FUNC_MASK	(0x7u << 2)
+#define SHENG_TLMM_OE_BIT		(1u << 9)
+#define SHENG_TLMM_OUT_BIT		(1u << 1)
+
+/* Returns the post-write io_reg readback (bit0 = actual input pin state,
+ * bit1 = driven output value) so the caller can tell a real electrical
+ * change from a write that silently no-op'd (e.g. TZ/XPU pin-ownership
+ * protection on this GPIO, which would make this a no-op even though
+ * nothing reports an error -- direct writes to protected TLMM registers
+ * are typically just dropped, not faulted). */
+static u32 sheng_backlight_gpio_set(int high)
+{
+	volatile u32 *ctl = (volatile u32 *)(uintptr_t)
+		(SHENG_TLMM_BASE + SHENG_TLMM_GPIO_REG_SIZE * SHENG_BACKLIGHT_GPIO);
+	volatile u32 *io = (volatile u32 *)(uintptr_t)
+		(SHENG_TLMM_BASE + 0x4 + SHENG_TLMM_GPIO_REG_SIZE * SHENG_BACKLIGHT_GPIO);
+	u32 v;
+
+	v = *ctl;
+	v &= ~SHENG_TLMM_MUX_FUNC_MASK;
+	v |= SHENG_TLMM_OE_BIT;
+	*ctl = v;
+
+	v = *io;
+	if (high)
+		v |= SHENG_TLMM_OUT_BIT;
+	else
+		v &= ~SHENG_TLMM_OUT_BIT;
+	*io = v;
+
+	return *io;
+}
+
+static u32 sheng_backlight_gpio_enable(void)
+{
+	return sheng_backlight_gpio_set(1);
+}
+
+/* Hail-Mary attempt at clearing a possible latched UVLO/fault condition
+ * inside the KTZ8866's boost converter: if the MDP_CLK_CBCR transient
+ * (proven via ftrace to leave I2C/GPIO digitally identical either way --
+ * see board_late_init()'s comment) trips the chip's own protection
+ * circuit, re-sending I2C bytes to an already-latched-off chip won't
+ * un-latch it; only a real EN-pin power cycle will. Drive it low long
+ * enough for internal caps to actually discharge, then high again,
+ * before ever touching I2C. */
+static void sheng_backlight_gpio_fault_clear_cycle(void)
+{
+	sheng_backlight_gpio_set(0);
+	mdelay(10);
+	sheng_backlight_gpio_set(1);
+	mdelay(2);
+}
+
 /* Raw MMIO breadcrumb, same pattern (and same reason) as sheng_mdss.c's
  * sheng_mdss_breadcrumb_flush(): D-cache is on for this board, so a
  * plain volatile store here can sit dirty in a cache line indefinitely
@@ -650,7 +722,7 @@ static void sheng_ktz8866_status_set(unsigned int slot, int ret)
 	dsb();
 }
 
-static int sheng_ktz8866_write_chip(const char *path)
+static int sheng_ktz8866_write_chip(const char *path, u32 *bl_en_readback_out)
 {
 	struct udevice *bus, *chip;
 	ofnode i2c_node;
@@ -688,26 +760,80 @@ static int sheng_ktz8866_write_chip(const char *path)
 	 * (and can disable output entirely) on an open/disconnected sink
 	 * channel. Confirmed live: Linux's own driver's register 0x08
 	 * reads 0x5f, never 0x7f, on this hardware. */
-	val = 0x5f; /* BL_EN: 5 current sinks (matches current-num-sinks=5) + master enable bit */
-	dm_i2c_write(chip, 0x08, &val, 1);
-	val = 0x07; /* BL_BRT_LSB: brightness 2047 (max), low 3 bits */
-	dm_i2c_write(chip, 0x04, &val, 1);
-	val = 0xff; /* BL_BRT_MSB: brightness 2047 (max), high 8 bits */
-	dm_i2c_write(chip, 0x05, &val, 1);
+	/* Soft-start attempt (see SPEC.md task #5 log): mirrors the real
+	 * ktz8866_init()/ktz8866_backlight_update_status() split exactly --
+	 * enable current sinks WITHOUT the master-enable bit first (0x1f,
+	 * matching Linux's own first BL_EN write), set config/bias with
+	 * brightness still at 0 (no LED current flowing yet), THEN add the
+	 * master-enable bit (0x5f) only once brightness is about to ramp
+	 * up from zero -- rather than slamming max brightness (2047) the
+	 * instant the chip is enabled, which is maximum inrush current on
+	 * a rail that may already be marginal right after the MDP_CLK_CBCR
+	 * transient. */
+	val = 0x1f; /* BL_EN: 5 current sinks, no master enable yet */
+	ret = dm_i2c_write(chip, 0x08, &val, 1);
+	if (ret)
+		return ret;
+	val = 0x00; /* BL_BRT_LSB: brightness 0 */
+	ret = dm_i2c_write(chip, 0x04, &val, 1);
+	if (ret)
+		return ret;
+	val = 0x00; /* BL_BRT_MSB: brightness 0 */
+	ret = dm_i2c_write(chip, 0x05, &val, 1);
+	if (ret)
+		return ret;
 	val = 0x9f; /* LCD_BIAS_CFG1: LCD_BIAS_EN, matches real driver's ktz8866_init() */
-	dm_i2c_write(chip, 0x09, &val, 1);
+	ret = dm_i2c_write(chip, 0x09, &val, 1);
+	if (ret)
+		return ret;
 	/* BL_CFG2: kinetic,current-ramp-delay-ms=256 in the real DT ->
 	 * BIT(7) | ((5 + 256/64) << 3) | PWM_HYST(0x5) = 0xcd, per
 	 * ktz8866_init()'s >128ms branch. Confirmed against live register
 	 * dump (0x03 already reads 0xcd from Linux's own driver). */
 	val = 0xcd;
-	dm_i2c_write(chip, 0x03, &val, 1);
+	ret = dm_i2c_write(chip, 0x03, &val, 1);
+	if (ret)
+		return ret;
 	/* BL_DIMMING: kinetic,led-enable-ramp-delay-ms=8 in the real DT ->
 	 * ramp_off_time=ilog2(8)+1=4, ramp_on_time=4<<4=0x40, OR'd =
 	 * 0x44. Confirmed against live register dump (0x14 already reads
 	 * 0x44 from Linux's own driver). */
 	val = 0x44;
-	dm_i2c_write(chip, 0x14, &val, 1);
+	ret = dm_i2c_write(chip, 0x14, &val, 1);
+	if (ret)
+		return ret;
+
+	/* Add the master-enable bit now, at zero brightness -- minimal
+	 * inrush, matching ktz8866_backlight_update_status()'s own
+	 * update_bits(BL_EN, BL_EN_BIT, BL_EN_BIT) call. */
+	val = 0x5f;
+	ret = dm_i2c_write(chip, 0x08, &val, 1);
+	if (ret)
+		return ret;
+	/* Read BL_EN straight back: if the write really landed in real
+	 * hardware this reads 0x5f. If GENI reported write success without
+	 * a real ACK (or the chip never actually powered up because its
+	 * enable-gpio write was a silent no-op), this reads back stale/0/
+	 * garbage instead -- a much stronger signal than the write's own
+	 * return code. */
+	if (bl_en_readback_out) {
+		u8 rb = 0;
+		int rb_ret = dm_i2c_read(chip, 0x08, &rb, 1);
+		*bl_en_readback_out = rb_ret ? (0xdead0000u | (rb_ret & 0xff)) : rb;
+	}
+
+	/* Ramp brightness up from 0 to max (2047) over ~200ms in 16 steps,
+	 * instead of one instantaneous jump -- softens the actual LED
+	 * current inrush, not just the master-enable transition. */
+	for (int step = 1; step <= 16; step++) {
+		unsigned int brightness = (2047u * (unsigned int)step) / 16;
+
+		val = brightness & 0x07;
+		dm_i2c_write(chip, 0x04, &val, 1);
+		val = (brightness >> 3) & 0xff;
+		dm_i2c_write(chip, 0x05, &val, 1);
+		mdelay(12);
+	}
 
 	return 0;
 }
@@ -719,11 +845,45 @@ static void sheng_ktz8866_backlight_init(void)
 	sheng_ktz8866_status_set(0, SHENG_KTZ8866_STATUS_NOT_REACHED);
 	sheng_ktz8866_status_set(1, SHENG_KTZ8866_STATUS_NOT_REACHED);
 
-	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@ac0000/i2c@a84000"); /* "A" */
-	sheng_ktz8866_status_set(0, ret);
+	/* Must be high before either chip will ACK on I2C -- see the
+	 * comment on sheng_backlight_gpio_enable()'s definition. A couple
+	 * ms is generous for the EN-to-I2C-ready time on this class of
+	 * chip; the real driver's own kinetic,led-enable-ramp-delay-ms=8
+	 * property only bounds the LED current ramp, not I2C readiness.
+	 * Fault-clear cycle (LOW then HIGH) instead of a plain enable now
+	 * -- see its own comment -- in case the MDP_CLK_CBCR transient
+	 * (which now runs before this, per board_late_init()'s reordering)
+	 * latched a UVLO/protection fault inside the chip. */
+	sheng_backlight_gpio_fault_clear_cycle();
+	u32 io_readback = sheng_backlight_gpio_set(1);
+	mdelay(2);
 
-	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@9c0000/i2c@988000"); /* "B" */
+	u32 bl_en_rb_a = 0xffffffff, bl_en_rb_b = 0xffffffff;
+
+	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@ac0000/i2c@a84000", &bl_en_rb_a); /* "A" */
+	sheng_ktz8866_status_set(0, ret);
+	int ret_a = ret;
+
+	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@9c0000/i2c@988000", &bl_en_rb_b); /* "B" */
 	sheng_ktz8866_status_set(1, ret);
+
+	/* The CONFIG_PRE_CON_BUF_ADDR status relay lives in a no-map
+	 * reserved-memory region -- turns out that's NOT readable via
+	 * /dev/mem post-boot after all (STRICT_DEVMEM's RAM check isn't
+	 * the blocker; xlate_dev_mem_ptr() can't get a linear-map pointer
+	 * for a no-map range at all, "Bad address"/EFAULT on read()).
+	 * Stash diagnostics in env vars and fold them into bootargs below
+	 * so `cat /proc/cmdline` on the booted kernel is a trivial,
+	 * always-available readout instead. io_readback's bit1 is the
+	 * driven GPIO128 output value, bit0 the actual pin input state --
+	 * if both writes report success (ret_a/ret_b == 0) but bl_en_rb_a/b
+	 * don't read back 0x5f, the I2C driver is reporting false success
+	 * without a real ACK, or the chip never powered up at all. */
+	env_set_hex("sheng_bl_ret_a", (unsigned long)ret_a);
+	env_set_hex("sheng_bl_ret_b", (unsigned long)ret);
+	env_set_hex("sheng_bl_gpio_io", (unsigned long)io_readback);
+	env_set_hex("sheng_bl_en_rb_a", (unsigned long)bl_en_rb_a);
+	env_set_hex("sheng_bl_en_rb_b", (unsigned long)bl_en_rb_b);
 
 	/* Give the chips/panel time to actually respond before boot
 	 * continues -- requested to make sure a slow-to-light backlight
@@ -785,13 +945,29 @@ int board_late_init(void)
 
 	configure_env();
 	qcom_late_init();
-	sheng_ktz8866_backlight_init();
 
 	qcom_show_boot_source();
 	/* Configure the dfu_string for capsule updates */
 	qcom_configure_capsule_updates();
 
 	/*
+	 * Order flip (see SPEC.md task #5 log): sheng_mdss_probe()'s
+	 * MDP_CLK_CBCR branch enable is a proven electrical disruptor --
+	 * an I2C/GPIO ftrace comparison showed the KTZ8866 backlight
+	 * chips' I2C sequence and GPIO128's TLMM state are BYTE-FOR-BYTE
+	 * IDENTICAL whether backlight is working or not, ruling out any
+	 * software/protocol difference. That points at a real analog
+	 * effect (inrush/UVLO trip inside the KTZ8866's own boost
+	 * converter, or a brief supply-rail sag) during the clock
+	 * transition. Previously backlight was brought up FIRST, then the
+	 * disruptive clock hit it. Flipping the order: let the disruptive
+	 * transient happen first (video probe, unconditionally including
+	 * the MDP clock branch now -- see sheng_mdss_dispcc_init()), give
+	 * the rail real time to resettle, THEN bring up backlight from a
+	 * clean state with a GPIO128 fault-clear cycle and a soft-start
+	 * brightness ramp (see sheng_ktz8866_backlight_init()) instead of
+	 * slamming max brightness immediately.
+	 *
 	 * CONFIG_VIDEO=y only *binds* video devices during early boot
 	 * (video_reserve()'s uclass walk); nothing in this board's flow
 	 * otherwise *probes* one (no splash screen, no CONSOLE_MUX/
@@ -817,7 +993,13 @@ int board_late_init(void)
 			 */
 			*(volatile int *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3020) = vret;
 		}
+		env_set_hex("sheng_mdss_vret", (unsigned long)vret);
 	}
+
+	/* Let the rail resettle after whatever electrical transient the
+	 * video probe above caused, before bringing up backlight fresh. */
+	mdelay(50);
+	sheng_ktz8866_backlight_init();
 
 	return 0;
 }

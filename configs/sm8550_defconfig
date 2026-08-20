@@ -41,16 +41,30 @@ CONFIG_ENV_USE_DEFAULT_ENV_TEXT_FILE=y
 # CONFIG_WDT is not set
 # CONFIG_EFI_LOADER is not set
 # CONFIG_MMC is not set
-# CONFIG_VIDEO / CONFIG_VIDEO_SHENG_MDSS: TEMPORARILY disabled (SPEC.md
-# task #5 log) -- testing the theory that our own driver's hardware
-# pokes (GDSC/DISPCC/DSI-PHY/DPU/RSC, all run before Linux boots) leave
-# something (likely PMIC/LPG-adjacent) in a state Linux's own drm/msm
-# can't fully recover from, even though DPU/DSI itself still binds and
-# renders. Matches the hardware state at commit 2d6803cc (before
-# sheng_mdss.c existed at all), which is confirmed to have worked with
-# debian-sheng + backlight. Re-enable once this is confirmed/ruled out.
-# CONFIG_VIDEO is not set
-# CONFIG_VIDEO_SHENG_MDSS is not set
+# CONFIG_VIDEO / CONFIG_VIDEO_SHENG_MDSS: re-enabled to visually confirm
+# the DSI-bypass test patch (sheng_mdss_dsi_test_patch) with U-Boot's
+# OWN backlight enable (GPIO 128 + corrected I2C BL_EN/BL_CFG2/BL_DIMMING
+# writes, entirely within sheng_mdss_probe(), no dependency on Linux's
+# own driver at all). SPEC.md task #5 log has the full story: disabling
+# these confirmed Linux's OWN backlight only works when U-Boot doesn't
+# touch GDSC/DISPCC/DSI/RSC first -- but that's specifically about
+# LINUX's later re-init, not necessarily about whether OUR OWN direct
+# GPIO+I2C backlight control works while these pokes are active. This
+# build tests that directly.
+# Isolation test result: with CONFIG_VIDEO/SHENG_MDSS off, board.c's
+# backlight bring-up is now PROVEN correct via readback (BL_EN reads
+# back 0x5f on both chips over real I2C, GPIO128's io_reg reads back
+# 0x3 -- driven high AND input pin genuinely high) -- yet still no
+# visible light. Conclusion: the LED driver chip really is outputting
+# current, but the DSI panel itself was never sent exit_sleep/
+# display_on in this build (CONFIG_VIDEO off => sheng_mdss_probe()
+# never runs => no panel init at all), so the LCD glass is almost
+# certainly still sitting in its default-closed/blank state, physically
+# blocking backlight light from getting through regardless of the LEDs
+# being lit. Re-enabling to test backlight + DSI panel init + red
+# square together now that the backlight half is verified correct.
+CONFIG_VIDEO=y
+CONFIG_VIDEO_SHENG_MDSS=y
 # Root cause of the CONFIG_VIDEO hang (see git history / SPEC.md):
 # growing the u-boot binary enough to cross ~1MB loaded size (physical
 # kernel_offset 0x8000 + kernel_size) apparently collides with
