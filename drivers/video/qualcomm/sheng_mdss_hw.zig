@@ -1852,14 +1852,72 @@ fn dsiCmdDmaWait(dsi_base: usize) c_int {
 /// SOT across both links, that time gap could be exactly what causes
 /// the DDIC to see a desync and silently abort. This function
 /// replicates the real driver's trigger-both-then-wait-both ordering.
-fn dsiCmdDmaTxDual(dsi0_base: usize, dsi1_base: usize, dma_addr: usize, len: usize) c_int {
+var g_dma_retries: u32 = 0;
+
+/// Number of command-DMA retries that were needed across the whole
+/// panel init. 0 means every command went out first time.
+export fn sheng_mdss_dsi_retry_count() callconv(.c) u32 {
+    return g_dma_retries;
+}
+
+fn dsiCmdDmaTxDualOnce(dsi0_base: usize, dsi1_base: usize, dma_addr: usize, len: usize) c_int {
+    // msm_dsi_host_xfer_prepare(): temporarily OR in CMD_MODE_EN|ENABLE
+    // for the duration of the command, then restore CTRL exactly
+    // (msm_dsi_host_xfer_restore()):
+    //
+    //   msm_host->dma_cmd_ctrl_restore = dsi_read(msm_host, REG_DSI_CTRL);
+    //   dsi_write(msm_host, REG_DSI_CTRL,
+    //             msm_host->dma_cmd_ctrl_restore |
+    //             DSI_CTRL_CMD_MODE_EN | DSI_CTRL_ENABLE);
+    //
+    // This driver never needed it while the whole init ran in command
+    // mode. Now that the link switches to VIDEO mode before the DCS
+    // sequence (matching the panel driver's prepare_prev_first
+    // ordering), CMD_MODE_EN is clear and commands cannot be issued
+    // without it -- exactly what the first attempt at the reorder hit:
+    // sheng.verify bit0 (DSI CTRL) mismatched and the DSC encoder went
+    // back to producing nothing.
+    const restore0 = mmioRead32(dsi0_base, DSI_CTRL);
+    const restore1 = mmioRead32(dsi1_base, DSI_CTRL);
+    mmioWrite32(dsi0_base, DSI_CTRL, restore0 | CTRL_CMD_MODE_EN | CTRL_ENABLE);
+    mmioWrite32(dsi1_base, DSI_CTRL, restore1 | CTRL_CMD_MODE_EN | CTRL_ENABLE);
+
     dsiCmdDmaTrigger(dsi1_base, dma_addr, len);
     dsiCmdDmaTrigger(dsi0_base, dma_addr, len);
 
     const ret1 = dsiCmdDmaWait(dsi1_base);
     const ret0 = dsiCmdDmaWait(dsi0_base);
+
+    mmioWrite32(dsi0_base, DSI_CTRL, restore0);
+    mmioWrite32(dsi1_base, DSI_CTRL, restore1);
+
     if (ret1 != 0) return ret1;
     return ret0;
+}
+
+/// Retries a timed-out command DMA (SPEC.md task #5 log).
+///
+/// Panel init has been failing intermittently at RANDOM command indices
+/// (#5, #11, #54 observed across many boots), always recoverable by a
+/// full power cycle. The index being random rules out any per-command
+/// content problem: it is a marginal/transient condition in the DMA
+/// path itself. Each such boot returns -(10000+idx) and aborts probe
+/// before any diagnostics are populated, costing a full test cycle.
+///
+/// Two retries with a short settle between them. The retry count is
+/// exported as sheng.retries, so this both stabilises testing AND
+/// measures how marginal the path actually is -- a non-zero count on an
+/// otherwise-successful boot is real evidence the DMA path is not yet
+/// reliable, which a simple pass/fail never showed.
+fn dsiCmdDmaTxDual(dsi0_base: usize, dsi1_base: usize, dma_addr: usize, len: usize) c_int {
+    var attempt: u32 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        const ret = dsiCmdDmaTxDualOnce(dsi0_base, dsi1_base, dma_addr, len);
+        if (ret == 0) return 0;
+        g_dma_retries += 1;
+        udelay(1000);
+    }
+    return dsiCmdDmaTxDualOnce(dsi0_base, dsi1_base, dma_addr, len);
 }
 
 /// Real DCS READ (Get Power Mode, 0x0A) with genuine BTA (bus
@@ -2167,6 +2225,17 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
     dsiHostBringUp(dsi0_base);
     dsiHostBringUp(dsi1_base);
 
+    // ORDERING EXPERIMENT REVERTED (SPEC.md task #5 log): switching to
+    // video mode HERE (before the DCS sequence, matching the panel
+    // driver's prepare_prev_first flag) measurably regressed things --
+    // sheng.verify bit0 (DSI CTRL) mismatched and the DSC encoder went
+    // from OUT_STATUS 0x18xxxx back to 0, INT_STAT 0x7b0 back to 0x180
+    // -- and it stayed regressed even after implementing the
+    // xfer_prepare/restore that video-mode commands require. The
+    // measurement beats the reading of prepare_prev_first; the switch
+    // stays in dpu_start(). The xfer_prepare/restore is KEPT, since
+    // Linux does it unconditionally regardless of link mode.
+
     // LP-11 settle test (SPEC.md task #5 log): U-Boot runs linearly and
     // near-instantly compared to Linux's mutex/scheduler-laden power-on
     // path -- if the panel's physical LP receiver needs the lines held
@@ -2222,6 +2291,42 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
         ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb3, &[_]u8{0x00});
         if (ret != 0) return -20005;
     }
+
+    // ===================================================================
+    // PANEL LIVENESS TEST (SPEC.md task #5 log) -- uses the BACKLIGHT as
+    // the detector, which is the one output on this device we can see.
+    //
+    // Every measurable artifact now matches the working kernel exactly:
+    // the 128-byte DSC PPS byte-for-byte, DSI0 39/39, DSI1 39/39, DPU
+    // 55/55, PHY 31/31, the MDSS wrapper including its three
+    // undocumented registers, the 87-command init sequence, and the DSC
+    // encoder's own status. A colour generated INSIDE the DPU pipe
+    // (solid fill, no memory fetch) still does not appear. Yet we have
+    // never once positively confirmed the panel EXECUTES anything we
+    // send -- "success" has only ever meant the DMA engine shipped the
+    // bytes. ALL_PIXELS_ON was inconclusive (implementation-defined on
+    // a RAM-less panel), DCS reads have never returned data, and the
+    // DSI TPG cannot produce a decodable stream on a DSC panel.
+    //
+    // But the panel driver documents that DCS 0x51 "controls power
+    // output to the ktz8866 chips" -- i.e. the panel itself drives the
+    // backlight brightness. Our init already sends 0x51 0x0f 0xff (max)
+    // and 0x53 0x24 (backlight control on). Re-sending 0x51 with ZERO
+    // therefore has a directly VISIBLE consequence that needs no video
+    // data, no DSC, and no DPU:
+    //
+    //   backlight goes dark/dim -> the panel RECEIVES AND EXECUTES our
+    //     commands. Its display really is on, and the fault is confined
+    //     to the video/DSC datapath.
+    //   backlight stays fully lit -> the panel is NOT executing our
+    //     commands. Every register matching live is then irrelevant,
+    //     because nothing we send is being acted on, and the whole
+    //     investigation belongs on the command path to the panel.
+    //
+    // Deliberately left applied so the result is unambiguous.
+    _ = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x51, &[_]u8{ 0x00, 0x00 });
+    udelay(200000);
+    // ===================================================================
 
     // Exit sleep mode (MIPI DCS 0x11, no args), then the panel needs
     // 120ms before it'll accept display-on.
@@ -2348,6 +2453,74 @@ const SSPP_MULTIRECT_OPMODE: usize = 0x170;
 const SSPP_SRC_FORMAT_REC1: usize = 0x174;
 const SSPP_SRC_UNPACK_PATTERN_REC1: usize = 0x178;
 const SSPP_SRC_OP_MODE_REC1: usize = 0x17c;
+
+/// DECISIVE BISECT (SPEC.md task #5 log): SSPP SOLID FILL.
+///
+/// dpu_hw_sspp.c: DPU_SSPP_SOLID_FILL sets BIT(22) in SSPP_SRC_FORMAT
+/// and the colour comes from SSPP_SRC_CONSTANT_COLOR (0x3c) / _REC1
+/// (0x180). The pipe then SYNTHESISES pixels internally -- no memory
+/// fetch, no SMMU, no framebuffer -- while everything downstream
+/// (LM -> DSC -> INTF -> DSI -> panel) runs exactly as configured,
+/// including real DSC compression. Unlike the DSI test pattern
+/// generator, which injects downstream of the DSC encoders and so can
+/// never produce a decodable stream on this DSC-mandatory panel, this
+/// test IS decodable.
+///
+/// It settles what every current measurement leaves open: the DSC
+/// encoder is verifiably running and emitting a valid compressed
+/// stream -- but a valid compressed stream of a BLACK frame is exactly
+/// what an SSPP delivering no pixels would produce, and every register,
+/// fault and FIFO reading would still look perfect. Which is precisely
+/// the state we are in.
+///
+///   RED appears -> mixer, DSC, INTF, DSI and panel all work; the fault
+///     is the SSPP memory fetch (framebuffer/SMMU/bandwidth), despite
+///     clean fault registers.
+///   Still black -> the fault is downstream of the pipe, and the
+///     framebuffer path is exonerated entirely.
+///
+/// Deliberately RED (0xFF0000FF in this panel's 0xAABBGGRR ordering) so
+/// it cannot be confused with the green framebuffer fill.
+const SSPP_SOLID_FILL_TEST: bool = false;
+const SSPP_SRC_CONSTANT_COLOR: usize = 0x3c;
+const SSPP_SRC_CONSTANT_COLOR_REC1: usize = 0x180;
+const SSPP_SOLID_FILL_FORMAT_BIT: u32 = 1 << 22;
+const SSPP_SOLID_FILL_COLOR: u32 = 0xFF0000FF;
+
+/// REAL GAP FOUND (SPEC.md task #5 log): the SSPP QoS / danger-safe
+/// register group. grep for "danger", "safe_lut", "qos" or "creq" in
+/// this file returned ZERO hits -- none of it was ever written.
+///
+/// These registers decide whether the fetch pipe gets memory bandwidth
+/// priority. SSPP_QOS_CTRL's only bit here is
+/// SSPP_QOS_CTRL_DANGER_SAFE_EN (dpu_hw_sspp.c), which arms the whole
+/// danger/safe escalation mechanism; DANGER_LUT/SAFE_LUT are the FIFO
+/// fill-level thresholds at which the pipe escalates its urgency to the
+/// memory controller, and CREQ_LUT_0/1 the corresponding client-request
+/// priorities. Left at zero with the mechanism disarmed, the pipe never
+/// signals urgency and can be starved indefinitely by other masters.
+///
+/// This is the failure mode that fits the current evidence exactly: the
+/// DSC encoder is demonstrably RUNNING and producing output, the DSI
+/// link is fed (FIFO_STATUS matches live), every register in the DSI,
+/// DPU and PHY spaces is bit-identical to working silicon, and the
+/// panel is black. An SSPP that cannot win bandwidth delivers no pixels
+/// while everything downstream faithfully compresses and transmits a
+/// BLACK frame -- no fault, no underflow flag, nothing to see.
+///
+/// Values are Linux's own live registers on this panel.
+const SSPP_DANGER_LUT: usize = 0x60;
+const SSPP_SAFE_LUT: usize = 0x64;
+const SSPP_CREQ_LUT: usize = 0x68;
+const SSPP_QOS_CTRL: usize = 0x6c;
+const SSPP_CREQ_LUT_0: usize = 0x74;
+const SSPP_CREQ_LUT_1: usize = 0x78;
+const SSPP_DANGER_LUT_VALUE: u32 = 0x0003FFFF;
+const SSPP_SAFE_LUT_VALUE: u32 = 0x0000FE00;
+const SSPP_CREQ_LUT_VALUE: u32 = 0x00000000;
+const SSPP_QOS_CTRL_DANGER_SAFE_EN: u32 = 1 << 0;
+const SSPP_CREQ_LUT_0_VALUE: u32 = 0x22335777;
+const SSPP_CREQ_LUT_1_VALUE: u32 = 0x00112222;
 
 // XRGB8888, computed offline replicating dpu_hw_setup_format_impl()'s
 // bit-packing for INTERLEAVED_RGBX_FMT(XRGB8888, 4, BPC8A, BPC8, BPC8,
@@ -3163,7 +3336,25 @@ export fn sheng_mdss_dpu_start(
     // (dpu_hw_sspp_setup_sourceaddress's non-SOLO path) -- not two planes
     // of the same rect. Both rects read the same buffer/stride here.
     mmioWrite32(sspp_base, SSPP_SRC_YSTRIDE0, (stride & 0xffff) | ((stride & 0xffff) << 16));
-    mmioWrite32(sspp_base, SSPP_SRC_FORMAT, SSPP_XRGB8888_SRC_FORMAT);
+    // QoS / danger-safe writes REVERTED (SPEC.md task #5 log). Copying
+    // Linux's live DANGER_LUT/SAFE_LUT/CREQ_LUT/QOS_CTRL values made
+    // things monotonically WORSE, measured with a fixed settle delay:
+    // ENC_OUT_STATUS went 0x170008 -> 0, ENC_INT_STAT 0x7b0 -> 0x180,
+    // and LM0's OP_MODE stopped matching (sheng.verify bit29) when it
+    // had been stable for many boots. Arming DANGER_SAFE_EN evidently
+    // throttles this pipe rather than prioritising it -- plausibly
+    // because the LUT thresholds are meaningful only alongside the
+    // interconnect/bandwidth votes Linux also makes, which this driver
+    // does not. The register definitions are kept above for reference.
+
+    if (SSPP_SOLID_FILL_TEST) {
+        mmioWrite32(sspp_base, SSPP_SRC_CONSTANT_COLOR, SSPP_SOLID_FILL_COLOR);
+        mmioWrite32(sspp_base, SSPP_SRC_CONSTANT_COLOR_REC1, SSPP_SOLID_FILL_COLOR);
+    }
+    mmioWrite32(sspp_base, SSPP_SRC_FORMAT, if (SSPP_SOLID_FILL_TEST)
+        SSPP_XRGB8888_SRC_FORMAT | SSPP_SOLID_FILL_FORMAT_BIT
+    else
+        SSPP_XRGB8888_SRC_FORMAT);
     mmioWrite32(sspp_base, SSPP_SRC_UNPACK_PATTERN, SSPP_XRGB8888_UNPACK_PATTERN);
     mmioWrite32(sspp_base, SSPP_SRC_OP_MODE, SSPP_OP_MODE_LIVE);
 
@@ -3176,7 +3367,10 @@ export fn sheng_mdss_dpu_start(
     // SRC_XY_REC1's x=half_w crops into the right half via YSTRIDE0's
     // high16 pitch.
     mmioWrite32(sspp_base, SSPP_SRC1_ADDR, @truncate(fb_addr));
-    mmioWrite32(sspp_base, SSPP_SRC_FORMAT_REC1, SSPP_XRGB8888_SRC_FORMAT);
+    mmioWrite32(sspp_base, SSPP_SRC_FORMAT_REC1, if (SSPP_SOLID_FILL_TEST)
+        SSPP_XRGB8888_SRC_FORMAT | SSPP_SOLID_FILL_FORMAT_BIT
+    else
+        SSPP_XRGB8888_SRC_FORMAT);
     mmioWrite32(sspp_base, SSPP_SRC_UNPACK_PATTERN_REC1, SSPP_XRGB8888_UNPACK_PATTERN);
     mmioWrite32(sspp_base, SSPP_SRC_OP_MODE_REC1, SSPP_OP_MODE_LIVE);
     // dpu_hw_sspp_setup_multirect() ORs DPU_SSPP_RECT_0(1) | DPU_SSPP_RECT_1(2)
@@ -3293,10 +3487,10 @@ export fn sheng_mdss_dpu_start(
 
     if (DPU_TEST_STOP_STAGE <= 5) return 0;
 
-    // -- Switch both DSI hosts from command mode (panel init DCS blast)
-    // to video mode before the timing engines start pushing continuous
-    // pixel data -- must happen first, or the DPU's video engine and
-    // the DSI controller are in mismatched modes.
+    // -- Switch both DSI hosts from command mode to video mode before
+    // the timing engines start pushing pixel data. Moving this earlier
+    // (before the DCS sequence) was tried and measurably regressed the
+    // DSC encoder -- see the note in sheng_mdss_dsi_panel_init().
     dsiHostSwitchToVideoMode(dsi0_base);
     dsiHostSwitchToVideoMode(dsi1_base);
 
@@ -3588,6 +3782,207 @@ const verify_table = [_]VerifyEntry{
 };
 
 var g_verify_mask: u64 = 0;
+
+
+/// FULL DSI0 REGISTER-SPACE AUDIT (SPEC.md task #5 log).
+///
+/// The 46-entry verify table covers registers this driver chose to
+/// write. That is a self-selected sample: it cannot find a register
+/// that matters and was never written at all -- which is exactly how
+/// CTL_FETCH_PIPE_ACTIVE and DSC_CLK_CTRL were missed for so long.
+///
+/// This table is built the other way round: a python3 mmap dump of the
+/// ENTIRE live DSI0 register space (0x000-0x300) taken while Linux was
+/// driving this panel, minus the read-only status registers
+/// (STATUS0/FIFO_STATUS/DLN0_PHY_ERR/LANE_STATUS/CLK_STATUS/VERSION)
+/// and the genuinely dynamic ones (DMA_BASE/DMA_LEN/TRIG_DMA). 28 of
+/// these hold non-zero values on working silicon and are never written
+/// by this driver; several are not even modelled in mainline's dsi.xml,
+/// so they are hardware reset defaults that our own mdssCoreBcrReset()
+/// may well be clearing without restoring.
+///
+/// Offsets are LOGICAL (live physical minus the 4-byte DSI 6G shift).
+/// Returns a bitmask: bit N set == entry N differs from live.
+const DsiAuditEntry = struct { off: usize, expect: u32 };
+const dsi_audit_table = [_]DsiAuditEntry{
+    .{ .off = 0x010, .expect = 0x31211101 },
+    .{ .off = 0x014, .expect = 0x3e2e1e0e },
+    .{ .off = 0x018, .expect = 0x00001900 },
+    .{ .off = 0x02c, .expect = 0x00020000 },
+    .{ .off = 0x034, .expect = 0x00020000 },
+    .{ .off = 0x03c, .expect = 0x06100006 },
+    .{ .off = 0x040, .expect = 0x00003c2c },
+    .{ .off = 0x050, .expect = 0x00000900 },
+    .{ .off = 0x078, .expect = 0x22211211 },
+    .{ .off = 0x07c, .expect = 0x001c1a02 },
+    .{ .off = 0x0b4, .expect = 0xffffffff },
+    .{ .off = 0x0b8, .expect = 0x0000ffff },
+    .{ .off = 0x0bc, .expect = 0x00000001 },
+    .{ .off = 0x0c0, .expect = 0x00001a23 },
+    .{ .off = 0x0c4, .expect = 0x010f0f08 },
+    .{ .off = 0x0c8, .expect = 0x00000001 },
+    .{ .off = 0x108, .expect = 0x13ff3be0 },
+    .{ .off = 0x10c, .expect = 0xaa21aa00 },
+    .{ .off = 0x130, .expect = 0xffffffff },
+    .{ .off = 0x134, .expect = 0xffffffff },
+    .{ .off = 0x138, .expect = 0xffffffff },
+    .{ .off = 0x13c, .expect = 0xffffffff },
+    .{ .off = 0x144, .expect = 0x0000ffff },
+    .{ .off = 0x148, .expect = 0x0000ffff },
+    .{ .off = 0x14c, .expect = 0x0000ffff },
+    .{ .off = 0x150, .expect = 0x0000ffff },
+    .{ .off = 0x158, .expect = 0x00000004 },
+    .{ .off = 0x1a4, .expect = 0x00ff0000 },
+    .{ .off = 0x1a8, .expect = 0x00400040 },
+    .{ .off = 0x1ac, .expect = 0x000000ff },
+    .{ .off = 0x1b0, .expect = 0x00000024 },
+    .{ .off = 0x1b4, .expect = 0x00000006 },
+    .{ .off = 0x1c4, .expect = 0xffffffff },
+    .{ .off = 0x1cc, .expect = 0x00290000 },
+    .{ .off = 0x1fc, .expect = 0x80000000 },
+    .{ .off = 0x2a4, .expect = 0x39003900 },
+    .{ .off = 0x2b4, .expect = 0x3e2e0600 },
+    .{ .off = 0x2b8, .expect = 0x0000f000 },
+    .{ .off = 0x2c4, .expect = 0x00000004 },
+};
+
+/// REAL GAP FOUND (SPEC.md task #5 log): the MDSS wrapper's UBWC
+/// configuration block. msm_mdss_enable() writes all three of these on
+/// every MDSS bring-up, BEFORE any child DSI/DPU device is touched:
+///
+///   UBWC_STATIC          (0x144) = 0x0000103E
+///   UBWC_CTRL_2          (0x150) = 0x00000002
+///   UBWC_PREDICTION_MODE (0x154) = 0x00000001
+///
+/// This driver never wrote any of them, and mdssCoreBcrReset() resets
+/// the MDSS core -- so whatever ABL left is destroyed and never
+/// restored, leaving the UBWC decoder block that sits in the MDSS
+/// memory data path at zero.
+///
+/// Same shape as this session's other two real finds
+/// (GCC_DISP_HF_AXI_CLK ordering, DSC_CLK_CTRL): top-level block state
+/// that appears in no per-block register diff, because it lives above
+/// the DSI/DPU register spaces that have all been audited clean
+/// (sheng.verify = 0, sheng.dsiaudit = 0).
+///
+/// Values are Linux's own live registers on this panel.
+const MDSS_UBWC_STATIC: usize = 0x144;
+const MDSS_UBWC_CTRL_2: usize = 0x150;
+const MDSS_UBWC_PREDICTION_MODE: usize = 0x154;
+const MDSS_UBWC_STATIC_VALUE: u32 = 0x0000103E;
+const MDSS_UBWC_CTRL_2_VALUE: u32 = 0x00000002;
+const MDSS_UBWC_PREDICTION_MODE_VALUE: u32 = 0x00000001;
+
+/// The three MDSS wrapper registers that hold non-zero values on live
+/// silicon but appear NOWHERE in mainline's mdss.xml, so Linux never
+/// writes them: they are ABL/hardware state. Our mdssCoreBcrReset()
+/// resets the MDSS core, which may clear them without restoring -- the
+/// same failure shape as the UBWC block above, which WAS a real gap.
+/// Never checked against our own values until now.
+///   0x054 = 0x40000002
+///   0x068 = 0x00038044
+///   0x084 = 0x0000010E
+/// Returns a bitmask: bit0/1/2 set == that register differs from live.
+export fn sheng_mdss_wrapper_audit(mdss_base: usize) callconv(.c) u32 {
+    var mask: u32 = 0;
+    if (mmioRead32(mdss_base, 0x054) != 0x40000002) mask |= 1 << 0;
+    if (mmioRead32(mdss_base, 0x068) != 0x00038044) mask |= 1 << 1;
+    if (mmioRead32(mdss_base, 0x084) != 0x0000010E) mask |= 1 << 2;
+    return mask;
+}
+
+export fn sheng_mdss_ubwc_init(mdss_base: usize) callconv(.c) void {
+    mmioWrite32(mdss_base, MDSS_UBWC_STATIC, MDSS_UBWC_STATIC_VALUE);
+    mmioWrite32(mdss_base, MDSS_UBWC_CTRL_2, MDSS_UBWC_CTRL_2_VALUE);
+    mmioWrite32(mdss_base, MDSS_UBWC_PREDICTION_MODE, MDSS_UBWC_PREDICTION_MODE_VALUE);
+}
+
+/// WHOLESALE STATE CAPTURE (SPEC.md task #5 log).
+///
+/// Block-by-block comparison with hand-picked offsets has now missed
+/// three real bugs (CTL_FETCH_PIPE_ACTIVE, DSC_CLK_CTRL, the MDSS UBWC
+/// block) because a self-selected offset list cannot find a register
+/// nobody thought to look at. This copies the ENTIRE register state of
+/// every block in the display path into a scratch DRAM region that
+/// survives the handoff into Linux (same trick as the ktz8866 status
+/// buffer at CONFIG_PRE_CON_BUF_ADDR + 0x3400, which is readable from
+/// Linux via devmem). The identical ranges can then be dumped from the
+/// live working kernel and diffed wholesale, in one boot, with no
+/// guessing about which register might matter.
+///
+/// Layout at dst: a sequence of blocks, each [base:u32][len:u32] then
+/// len/4 u32 values, terminated by base==0.
+const CaptureRange = struct { base: usize, len: usize };
+const capture_ranges = [_]CaptureRange{
+    // REDUCED SET (SPEC.md task #5 log): the full 16-block list
+    // reproducibly killed the boot before backlight -- almost certainly
+    // a stalled AHB read on a block we never touch, which wedges the
+    // CPU with no abort. Only blocks this driver ALREADY reads on every
+    // boot are listed here, with lengths bounded by registers actually
+    // observed rather than round numbers. Expand one block at a time.
+    .{ .base = 0x0ae94000, .len = 0x300 }, // DSI0 host (read every boot by the audit)
+    .{ .base = 0x0ae16000, .len = 0x140 }, // DPU CTL_0 (read by dpu_readback1/4)
+    .{ .base = 0x0ae25000, .len = 0x190 }, // SSPP DMA0 (read by dpu_readback2)
+    .{ .base = 0x0ae45000, .len = 0x40 }, // LM0 (read by dpu_readback3)
+    .{ .base = 0x0ae46000, .len = 0x40 }, // LM1 (written every boot)
+    .{ .base = 0x0ae81000, .len = 0x400 }, // DSC enc0/enc1 (read by dsc_status)
+    .{ .base = 0x0ae81f00, .len = 0x90 }, // DSC ctl (written every boot)
+};
+
+export fn sheng_mdss_capture_state(dst: usize) callconv(.c) void {
+    var out: [*]volatile u32 = @ptrFromInt(dst);
+    var w: usize = 0;
+    for (capture_ranges) |r| {
+        out[w] = @truncate(r.base);
+        w += 1;
+        out[w] = @truncate(r.len);
+        w += 1;
+        var o: usize = 0;
+        while (o < r.len) : (o += 4) {
+            out[w] = mmioRead32(r.base, o);
+            w += 1;
+        }
+    }
+    out[w] = 0;
+    out[w + 1] = 0;
+}
+
+export fn sheng_mdss_dsi_audit(dsi0_base: usize) callconv(.c) i64 {
+    var mask: u64 = 0;
+    for (dsi_audit_table, 0..) |e, i| {
+        if (mmioRead32(dsi0_base, e.off) != e.expect) mask |= (@as(u64, 1) << @intCast(i));
+    }
+    return @bitCast(mask);
+}
+
+/// Same audit applied to DSI1, the SLAVE host (SPEC.md task #5 log).
+///
+/// DSI0 has been audited exhaustively (39/39 match live) but DSI1 was
+/// only ever spot-checked -- ten registers read identical to DSI0 on
+/// live hardware, and we assumed the rest followed because both hosts
+/// go through the same code path. "Same code path" is an assumption,
+/// not a measurement: dsiHostBringUp() and dsiHostSwitchToVideoMode()
+/// take a base address, and anything that writes only dsi0_base by
+/// mistake would leave the slave half wrong while every DSI0 reading
+/// stayed perfect.
+///
+/// On a bonded dual-DSI panel the slave carries half the picture, so a
+/// misconfigured DSI1 is a plausible cause of a black panel with a
+/// flawless master. Live DSI1 reads identical to DSI0 for every
+/// register checked, so the same expected-value table applies.
+///
+/// NOTE: these are explicit offsets from dsi.xml, NOT a range scan.
+/// Blind range reads of this hardware wedge the bus -- confirmed by
+/// reading register ranges over /dev/mem on the live device, which
+/// reboots it outright, and by sheng_mdss_capture_state() killing the
+/// U-Boot boot twice for the same reason.
+export fn sheng_mdss_dsi1_audit(dsi1_base: usize) callconv(.c) i64 {
+    var mask: u64 = 0;
+    for (dsi_audit_table, 0..) |e, i| {
+        if (mmioRead32(dsi1_base, e.off) != e.expect) mask |= (@as(u64, 1) << @intCast(i));
+    }
+    return @bitCast(mask);
+}
 
 export fn sheng_mdss_verify_pipeline(dpu_base: usize, dsi0_base: usize) callconv(.c) i64 {
     var mask: u64 = 0;

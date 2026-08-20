@@ -782,6 +782,92 @@ static int sheng_ktz8866_write_chip(const char *path, u32 *bl_en_readback_out)
 	ret = dm_i2c_write(chip, 0x05, &val, 1);
 	if (ret)
 		return ret;
+	/* MECHANISM CHECK (SPEC.md task #5 log): read OUTP_CFG/OUTN_CFG
+	 * BEFORE writing them. The theory below is that our EN-pin
+	 * fault-clear cycle resets the chip and wipes ABL's bias config --
+	 * asserted but never measured. Reading them here settles it:
+	 *   0x1e/0x1c already  -> the EN cycle does NOT reset the chip,
+	 *     ABL's config survives, and the restore writes are a no-op
+	 *     (which would match the observed lack of any change).
+	 *   anything else      -> the chip really is being reset and the
+	 *     restore is doing real work.
+	 * Packed as (OUTP << 8) | OUTN into the per-chip status slot's
+	 * neighbour so it survives into Linux via sheng.bl_pre. */
+	{
+		u8 pre_outp = 0xff, pre_outn = 0xff;
+		dm_i2c_read(chip, 0x0d, &pre_outp, 1);
+		dm_i2c_read(chip, 0x0e, &pre_outn, 1);
+		*(volatile u32 *)(uintptr_t)(SHENG_KTZ8866_STATUS_ADDR + 0x10) =
+			((u32)pre_outp << 8) | (u32)pre_outn;
+	}
+
+	/* THEORY DISPROVEN, writes KEPT as defensive (SPEC.md task #5 log).
+	 *
+	 * The reasoning below was that our EN-pin fault-clear cycle resets
+	 * the chip and wipes ABL's bias config. The mechanism check above
+	 * measured sheng.blpre = 0x1e1c, i.e. OUTP_CFG/OUTN_CFG ALREADY
+	 * hold their live values before we write anything: the EN cycle
+	 * does NOT reset the chip, ABL's configuration survives, and these
+	 * writes are a no-op. The panel's +/-5.8V analog supply path is
+	 * exonerated.
+	 *
+	 * Kept anyway because they write exactly the live values and cost
+	 * nothing, so the configuration is explicit rather than inherited.
+	 * Original reasoning retained below for the record.
+	 *
+	 * sheng_backlight_gpio_fault_clear_cycle() drives the KTZ8866's EN
+	 * pin LOW then HIGH, which power-cycles the chip and resets every
+	 * register to its default. Linux never does this: its ktz8866
+	 * driver probes the chip as ABL left it and writes only BL_EN,
+	 * BL_CFG2, BL_DIMMING and LCD_BIAS_CFG1 (see ktz8866_init()) --
+	 * exactly the subset this function used to write. Everything else
+	 * on a live system is ABL's configuration, inherited untouched.
+	 *
+	 * Because we reset the chip first, that inherited state is gone and
+	 * nothing restores it. Critically that includes OUTP_CFG/OUTN_CFG,
+	 * which set the +/-5.8V rails feeding the panel's avdd/avee
+	 * (sm8550-xiaomi-sheng.dts: avdd-supply = <&bl_vddpos_5p8>,
+	 * avee-supply = <&bl_vddneg_5p8>). We were enabling the LCD bias
+	 * without ever telling the chip what voltage to produce.
+	 *
+	 * Same failure shape as mdssCoreBcrReset() wiping the MDSS UBWC
+	 * block: our reset destroys inherited state the reference driver
+	 * never has to restore, so a register-by-register comparison
+	 * against Linux's *driver* finds nothing wrong.
+	 *
+	 * Values are chip A's live registers, read over /dev/i2c-0 with
+	 * I2C_SLAVE_FORCE while Linux was driving the panel. Written BEFORE
+	 * LCD_BIAS_CFG1's enable so the rails come up already configured.
+	 */
+	val = 0xfa; /* BL_CFG1 */
+	ret = dm_i2c_write(chip, 0x02, &val, 1);
+	if (ret)
+		return ret;
+	val = 0x11; /* LCD_BIAS_CFG2 */
+	ret = dm_i2c_write(chip, 0x0a, &val, 1);
+	if (ret)
+		return ret;
+	val = 0x28; /* LCD_BOOST_CFG */
+	ret = dm_i2c_write(chip, 0x0c, &val, 1);
+	if (ret)
+		return ret;
+	val = 0x1e; /* OUTP_CFG: +5.8V rail (panel avdd) */
+	ret = dm_i2c_write(chip, 0x0d, &val, 1);
+	if (ret)
+		return ret;
+	val = 0x1c; /* OUTN_CFG: -5.8V rail (panel avee) */
+	ret = dm_i2c_write(chip, 0x0e, &val, 1);
+	if (ret)
+		return ret;
+	val = 0x80; /* BL_OPTION1 */
+	ret = dm_i2c_write(chip, 0x10, &val, 1);
+	if (ret)
+		return ret;
+	val = 0x77; /* BL_OPTION2 */
+	ret = dm_i2c_write(chip, 0x11, &val, 1);
+	if (ret)
+		return ret;
+
 	val = 0x9f; /* LCD_BIAS_CFG1: LCD_BIAS_EN, matches real driver's ktz8866_init() */
 	ret = dm_i2c_write(chip, 0x09, &val, 1);
 	if (ret)
@@ -884,6 +970,8 @@ static void sheng_ktz8866_backlight_init(void)
 	env_set_hex("sheng_bl_ret_a", (unsigned long)ret_a);
 	env_set_hex("sheng_bl_ret_b", (unsigned long)ret);
 	env_set_hex("sheng_bl_gpio_io", (unsigned long)io_readback);
+	env_set_hex("sheng_bl_pre",
+		    (unsigned long)*(volatile u32 *)(uintptr_t)(SHENG_KTZ8866_STATUS_ADDR + 0x10));
 	env_set_hex("sheng_bl_en_rb_a", (unsigned long)bl_en_rb_a);
 	env_set_hex("sheng_bl_en_rb_b", (unsigned long)bl_en_rb_b);
 

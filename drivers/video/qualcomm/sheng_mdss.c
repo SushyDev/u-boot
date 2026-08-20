@@ -685,6 +685,10 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
 }
 
 #define SM8550_MDSS_WRAPPER_BASE	0x0ae00000
+/* Scratch DRAM for sheng_mdss_capture_state(), clear of the pre-console
+ * buffer regions already in use at CONFIG_PRE_CON_BUF_ADDR + 0x3000.. */
+#define SHENG_MDSS_CAPTURE_ADDR		0x82000000
+#define SM8550_MDSS_BASE		0x0ae00000
 #define SM8550_MDSS_DPU_BASE		0x0ae01000
 
 /* ROOT CAUSE FOUND (SPEC.md task #5 log): dsi_host.c's dsi_get_version()
@@ -800,6 +804,8 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
 extern void sheng_mdss_core_reset(unsigned long dispcc_base);
 extern int sheng_mdss_gdsc_enable(unsigned long dispcc_base);
 extern void sheng_mdss_gdsc_disable(unsigned long dispcc_base);
+extern void sheng_mdss_ubwc_init(unsigned long mdss_base);
+extern unsigned int sheng_mdss_wrapper_audit(unsigned long mdss_base);
 extern int sheng_mdss_dispcc_init(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_dsi_clks_init(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init_pll0_only(unsigned long dispcc_base);
@@ -836,6 +842,10 @@ extern long long sheng_mdss_smmu_fault_diag(void);
 extern long long sheng_mdss_smmu_fault_addr(void);
 extern void sheng_mdss_dsi_tpg_enable(unsigned long dsi0_base,
 				     unsigned long dsi1_base);
+extern void sheng_mdss_capture_state(unsigned long dst);
+extern unsigned int sheng_mdss_dsi_retry_count(void);
+extern long long sheng_mdss_dsi_audit(unsigned long dsi0_base);
+extern long long sheng_mdss_dsi1_audit(unsigned long dsi1_base);
 extern long long sheng_mdss_verify_pipeline(unsigned long dpu_base,
 					    unsigned long dsi0_base);
 extern long long sheng_mdss_dsc_status1(unsigned long dpu_base);
@@ -1060,6 +1070,10 @@ static int sheng_mdss_probe(struct udevice *dev)
 
 	ret = sheng_mdss_dispcc_init(SM8550_DISPCC_BASE);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DISPCC, ret);
+	/* UBWC block config, immediately after the MDSS core reset inside
+	 * dispcc_init() wipes it -- see sheng_mdss_ubwc_init()'s comment.
+	 * Must precede any DSI/DPU programming, matching msm_mdss_enable(). */
+	sheng_mdss_ubwc_init(SM8550_MDSS_BASE);
 	env_set_hex("sheng_mdss_dispcc", (unsigned long)ret);
 	if (ret)
 		return ret;
@@ -1205,6 +1219,8 @@ static int sheng_mdss_probe(struct udevice *dev)
 					 SHENG_MDSS_DSI_DMA_SCRATCH, true);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI_PANEL, ret);
 	env_set_hex("sheng_mdss_panel", (unsigned long)ret);
+	env_set_hex("sheng_mdss_retries",
+		    (unsigned long)sheng_mdss_dsi_retry_count());
 	env_set_hex("sheng_mdss_status0_pre",
 		    (unsigned long)sheng_mdss_dsi_status0_before_first_cmd());
 	env_set_hex("sheng_mdss_timeout_diag", (unsigned long)sheng_mdss_dsi_timeout_diag());
@@ -1420,9 +1436,32 @@ static int sheng_mdss_probe(struct udevice *dev)
 	/* Whole-pipeline check against the live-hardware reference table --
 	 * see sheng_mdss_verify_pipeline()'s comment. 0 == every programmed
 	 * register matches working silicon. */
+	/* Whole-state capture, REDUCED range set after the full list
+	 * reproducibly killed the boot -- see capture_ranges' comment.
+	 * Scratch moved to 0x82000000 (clear of the pre-console buffer at
+	 * 0x81200000+0x4000 and below kernel_addr_r 0x83000000). */
+	/* DISABLED: writing the capture to DRAM reproducibly kills the boot
+	 * before backlight, even with the range list cut to blocks we read
+	 * every boot and the scratch moved clear of everything known. The
+	 * call site is late in probe and cannot precede backlight init, so
+	 * the mechanism is not understood -- replaced by the checksum-based
+	 * block audit below, which needs no DRAM writes at all. */
+	env_set_hex("sheng_mdss_wrap",
+		    (unsigned long)sheng_mdss_wrapper_audit(SM8550_MDSS_BASE));
+	env_set_hex("sheng_mdss_dsi1_audit",
+		    (unsigned long)sheng_mdss_dsi1_audit(SM8550_MDSS_DSI1_BASE));
+	env_set_hex("sheng_mdss_dsi_audit",
+		    (unsigned long)sheng_mdss_dsi_audit(SM8550_MDSS_DSI0_BASE));
 	env_set_hex("sheng_mdss_verify",
 		    (unsigned long)sheng_mdss_verify_pipeline(SM8550_MDSS_DPU_BASE,
 							     SM8550_MDSS_DSI0_BASE));
+	/* Settle before sampling the DSC encoder status (SPEC.md task #5
+	 * log). These are running counters: an early sample catches the
+	 * encoder mid-startup and reads like a stalled one. A previous
+	 * diagnostic happened to insert a 50ms delay here, and removing it
+	 * made a healthy encoder look broken -- so the delay is now
+	 * explicit and fixed, to keep readings comparable across builds. */
+	mdelay(50);
 	env_set_hex("sheng_mdss_dsc_st1",
 		    (unsigned long)sheng_mdss_dsc_status1(SM8550_MDSS_DPU_BASE));
 	env_set_hex("sheng_mdss_dsc_st2",
