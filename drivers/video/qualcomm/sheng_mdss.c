@@ -547,9 +547,34 @@ static void sheng_mdss_panel_power_and_reset(void)
 	mdelay(4);
 	sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 1); /* logical 0 = physical HIGH: deasserted, panel ready */
 	mdelay(16);
+
+	/* Read the reset/bias pins back (SPEC.md task #5 log). Every
+	 * register we can compare -- all 46 DPU registers, the DSI host,
+	 * and 31/31 PHY registers -- now matches live working silicon, the
+	 * framebuffer verifiably contains green, and the panel is still
+	 * black. Three independent signals say the PANEL never acts on
+	 * anything we send: ALL_PIXELS_ON (which needs no video data) did
+	 * nothing, DCS reads have never returned a byte, and the screen is
+	 * uniformly black rather than showing garbage. A panel that never
+	 * received a valid reset behaves exactly like that.
+	 *
+	 * GPIO 133's TARGET value was checked against Linux (CFG 0x2C0 =
+	 * GPIO func + OE, IN_OUT 0x3 = driving high, reset deasserted) but
+	 * it has never been confirmed that OUR writes actually land -- if
+	 * the pin stays an input, the panel is never reset and every
+	 * perfect measurement downstream is irrelevant.
+	 * high32 = GPIO_CFG, low32 = GPIO_IN_OUT. Expect 0x2C0 / 0x3. */
+	{
+		volatile u32 *rst_ctl = (volatile u32 *)(uintptr_t)
+			(SM8550_TLMM_BASE + TLMM_GPIO_REG_SIZE * TLMM_PANEL_RESET_GPIO);
+		volatile u32 *rst_io = (volatile u32 *)(uintptr_t)
+			(SM8550_TLMM_BASE + 0x4 + TLMM_GPIO_REG_SIZE * TLMM_PANEL_RESET_GPIO);
+		env_set_hex("sheng_mdss_rstgpio",
+			    (((unsigned long)*rst_ctl) << 32) | (unsigned long)*rst_io);
+	}
 }
 
-static int __maybe_unused sheng_mdss_bcm_vote(const char *bcm_name)
+static int sheng_mdss_bcm_vote(const char *bcm_name)
 {
 	u32 addr;
 	u32 data;
@@ -559,10 +584,65 @@ static int __maybe_unused sheng_mdss_bcm_vote(const char *bcm_name)
 	if (!addr)
 		return -ENODEV;
 
+	/* First attempt used vote_x=1/vote_y=1 -- accepted (CMD_STATUS_COMPL)
+	 * but made no visible difference. That's the exact same symbolic
+	 * "not literally zero" floor bcm-voter.c's bcm_aggregate() forces
+	 * onto keepalive BCMs (MC0/SH0) when no real master requests
+	 * anything -- not a realistic bandwidth grant. Real masters instead
+	 * get vote_x/vote_y computed from actual requested bandwidth via
+	 * bcm_div(bw * vote_scale, aux_data.unit), which needs live
+	 * unit/width values from cmd_db_read_aux_data("MM0") to compute
+	 * precisely. Rather than guess that scaling blind, vote the
+	 * maximum representable value in this 14-bit field instead of a
+	 * token "1" -- tests whether magnitude (not just non-zero-ness) is
+	 * what actually opens the NoC QoS gate for real video bandwidth. */
 	data = (1u << 30) /* commit */ | (1u << 29) /* valid */ |
-	       ((1u & 0x3fff) << 14) /* vote_x */ | (1u & 0x3fff) /* vote_y */;
+	       ((0x3fffu) << 14) /* vote_x, max */ | (0x3fffu) /* vote_y, max */;
 
 	return rsc_send_active_write(addr, data);
+}
+
+/* RPMh VRM regulator vote (qcom-rpmh-regulator.c's own mechanism --
+ * same underlying RSC/TCS transport as sheng_mdss_bcm_vote() and the
+ * earlier-abandoned MMCX corner vote, but a genuinely different target
+ * and a much simpler encoding: a plain millivolt value, not a
+ * bandwidth-bucket x/y pair. Real driver's sequence when a regulator
+ * has never been touched (vreg->enabled == -EINVAL): voltage-select
+ * write first, then enable write -- mirrored here exactly.
+ *
+ * NEVER ATTEMPTED BEFORE THIS PASS (SPEC.md task #5 log): reading the
+ * board's actual DTS overlay (not just the generic sm8550.dtsi, which
+ * doesn't show board-specific overrides) found &mdss_dsi0_phy has
+ * vdds-supply = <&vreg_l1e_0p88> -- the D-PHY's OWN analog supply --
+ * and panel@0 has vddio-supply = <&vreg_s3g_0p7>, neither ever touched
+ * by this driver (only avdd/avee GPIOs were ever handled). Neither
+ * regulator has regulator-boot-on/always-on in the DTS, so nothing
+ * guarantees ABL leaves them on; confirmed live on a working Linux
+ * boot that both are "enabled" (vreg_l1e_0p88=880000uV,
+ * vreg_s3g_0p7=600000uV) -- but that's Linux's OWN driver turning them
+ * on during its probe, not proof of their state during U-Boot's
+ * earlier run. If the D-PHY's analog transmitters are running without
+ * a real supply, digital control/status registers (PLL lock bit,
+ * REFGEN ready) could still read back fine while the actual HS
+ * differential signal never reaches valid levels -- exactly matching
+ * "frames streaming, zero pixels, no fault" with no software-visible
+ * symptom. Resource names/millivolt values match cmd-db's own lowercase
+ * regulator-ID convention and the live-confirmed voltages above. */
+static int sheng_mdss_regulator_vote(const char *rsc_name, u32 millivolts)
+{
+	u32 addr;
+	int ret;
+
+	addr = cmd_db_read_addr(rsc_name);
+	if (!addr)
+		return -ENODEV;
+
+	ret = rsc_send_active_write(addr + 0x0 /* RPMH_REGULATOR_REG_VRM_VOLTAGE */,
+				     millivolts);
+	if (ret)
+		return ret;
+
+	return rsc_send_active_write(addr + 0x4 /* RPMH_REGULATOR_REG_ENABLE */, 1);
 }
 
 /*
@@ -606,28 +686,105 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
 
 #define SM8550_MDSS_WRAPPER_BASE	0x0ae00000
 #define SM8550_MDSS_DPU_BASE		0x0ae01000
-#define SM8550_MDSS_DSI0_BASE		0x0ae94000
+
+/* ROOT CAUSE FOUND (SPEC.md task #5 log): dsi_host.c's dsi_get_version()
+ * comment, verbatim: "From DSI6G(v3), addition of a 6G_HW_VERSION
+ * register at offset 0 makes all other registers 4-byte shifted down."
+ * SM8550 is DSI6G -- confirmed by the driver's own MSM_DSI_VER_MAJOR_6G
+ * checks throughout dsi_host.c, and by dsi.xml documenting TWO
+ * different registers at offset 0x00000: "CTRL" (the generic/older
+ * register map dsi.xml also carries) and "6G_HW_VERSION" (MAJOR
+ * bits31-28, MINOR bits27-16). Every register offset this driver has
+ * ever used (CTRL, VID_CFG0/1, TRIG_CTRL, DMA_BASE/LEN, LANE_CTRL,
+ * LANE_SWAP_CTRL, CLK_CTRL, RESET, CMD_CFG0/1, CMD_MODE_MDP_CTRL2,
+ * LP/HS_TIMER_CTRL, RDBK_DATA, ACK_ERR_STATUS, TIMEOUT_STATUS,
+ * ACTIVE_H/V/TOTAL/HSYNC/VSYNC_HPOS/VPOS, EOT_PACKET_CTRL,
+ * CLKOUT_TIMING_CTRL) was taken directly from dsi.xml's unshifted
+ * offsets -- meaning every single one of them has been off by 4 bytes
+ * this entire project. dsi_write()/dsi_read() apply the shift once, at
+ * probe time, by baking DSI_6G_REG_SHIFT (dsi_cfg.h, .io_offset) into
+ * ctrl_base itself -- msm_host->ctrl_base = ioremap(...) + io_offset.
+ * Replicated here the same way: shift baked into the base address
+ * constant, so every existing offset in sheng_mdss_hw.zig (already
+ * matching dsi.xml exactly) now resolves correctly without needing to
+ * touch every individual offset. This explains EVERYTHING: our CTRL
+ * writes were landing on the real, read-only 6G_HW_VERSION register
+ * (hence the unconditional, from-the-first-write rejection -- MAJOR=2,
+ * MINOR=7 decodes cleanly from 0x20070000, matching a real HW version
+ * register far better than it ever matched CTRL's documented fields),
+ * while VID_CFG0/LANE_CTRL/etc's "live-stolen" values, read via devmem
+ * at the SAME unshifted offsets we were using, were actually reading
+ * whatever real register sits 4 bytes before the one we intended --
+ * meaning even those "confirmed correct" values were never actually
+ * verified against the register we meant to check. This is the single
+ * root cause underlying the DSI host command/BTA path's complete
+ * silence all session; the DPU/PHY/DISPCC/GDSC/regulator paths are
+ * unaffected (different register blocks, no such HW_VERSION insertion
+ * documented for those). */
+#define DSI_6G_REG_SHIFT		4
+#define SM8550_MDSS_DSI0_BASE		(0x0ae94000 + DSI_6G_REG_SHIFT)
 #define SM8550_MDSS_DSI0_PHY_BASE	0x0ae95000
 #define SM8550_MDSS_DSI1_PHY_BASE	0x0ae97000
-#define SM8550_MDSS_DSI1_BASE		0x0ae96000
+#define SM8550_MDSS_DSI1_BASE		(0x0ae96000 + DSI_6G_REG_SHIFT)
 #define SM8550_DISPCC_BASE		0x0af00000
 
-/* Fixed physical DRAM scratch address the DSI DMA engine reads
- * command packets from. Real usable DRAM starts at 0xa0000000 (see
- * SPEC.md); 1MB in is comfortably clear of anything else touched this
- * early in boot (kernel/dtb loads happen later, in board_late_init,
- * at much higher addresses via lmb_alloc). Only needs to hold the
- * largest single DCS command we send (well under 4KB). */
-#define SHENG_MDSS_DSI_DMA_SCRATCH	0xa0100000
+/* ROOT CAUSE FOUND (SPEC.md task #5 log): 0xa0100000/0xa0200000 (the
+ * old addresses here) sit squarely inside adspslpi_mem, the Audio DSP
+ * remoteproc's own `no-map` reserved-memory carveout (devicetree:
+ * adspslpi-region@9ea00000, reg = <0 0x9ea00000 0 0x4680000>, i.e.
+ * 0x9ea00000-0xa3080000) -- confirmed live via a running kernel's own
+ * /proc/iomem, which shows exactly "9ea00000-a307ffff :
+ * 6800000.remoteproc adspslpi-region@9ea00000" nested under a
+ * "reserved" span, and confirmed via a genuine SIGBUS from `devmem` on
+ * 0xa0200000 post-boot (no-map means Linux never maps it into the
+ * linear map at all -- a completely different failure mode than the
+ * ordinary /dev/mem permission-denied case). This driver has been
+ * writing its entire framebuffer directly into the ADSP's private
+ * firmware memory this whole time -- a different subsystem entirely,
+ * whose remoteproc firmware loader can and likely does stomp on this
+ * region independent of anything the display pipeline does. This is
+ * very likely the real reason nothing has ever rendered, despite every
+ * DSI/DPU register-level fix confirmed correct via live comparison
+ * (D-PHY timing, VID_CFG, LANE_CTRL, CTL_FLUSH bit assignments all
+ * verified byte-for-byte against a working kernel). Moved into
+ * 0xa3080000-0xccd00000 ("a3080000-cccfffff : System RAM" in a live
+ * kernel's own /proc/iomem, ~700MB, genuinely free, no reserved-memory
+ * node covers any of it) -- comfortably above where kernel_addr_r
+ * (0x83000000), fdt_addr_r (0x86000000), and ramdisk_addr_r
+ * (0x87100000) load later in board_late_init.
+ *
+ * MOVED to the HIGH DRAM bank (SPEC.md task #5 log): a real ARM LPAE
+ * page-table walk of the exact context bank the WORKING Linux system
+ * is using right now (TTBR0 read live off /dev/mem, strict-devmem
+ * temporarily disabled in the kernel build to allow it) resolved
+ * Linux's own dma_base=0x1000 IOVA to physical 0x887368000 -- deep in
+ * the HIGH bank (0x880000000+, where /proc/iomem also shows this
+ * exact kernel's own "Kernel code" living, at ~0x9e6c00000), nowhere
+ * near this low <4GB bank at all. DMA_BASE is a plain 32-bit register
+ * (dsi.xml's reg32, and the real msm_dsi_host_cmd_xfer_commit()'s own
+ * `u32 dma_base` parameter) -- it can never express a high-bank
+ * address directly, which is *why* Linux relies on real SMMU
+ * translation for this stream instead of a raw physical pointer.
+ * Every SMMU configuration this driver has tried (original firmware
+ * TRANS/CB, our BYPASS, disabled-S1 passthrough, and a genuine
+ * enabled-S1 identity mapping matching Linux's own live SCTLR/TCR
+ * exactly) targeted this LOW bank and produced the identical
+ * unchanging hang every time -- the one variable never tested was
+ * whether the interconnect/NoC routes this master to the low bank at
+ * all, independent of SMMU validity. Moved to 0x8bb500000 (a real,
+ * unreserved System RAM window confirmed via the same live
+ * /proc/iomem dump, comfortably clear of the kernel/reserved region
+ * at 0x9b6c00000+) with a genuine page-level (not block-level) SMMU
+ * mapping from IOVA 0x1000 -- matching Linux's own exact IOVA choice
+ * -- built in smmuBypassMdssStream()'s replacement. */
+#define SHENG_MDSS_DSI_DMA_SCRATCH	0x8bb500000
 
-/* Fixed physical DRAM framebuffer address, self-allocated by
- * sheng_mdss_probe() (see its comment for why: alloc_fb()'s bind-time
- * automatic reservation path is unusable on this board). 2MB in, clear
- * of SHENG_MDSS_DSI_DMA_SCRATCH above (1MB in, well under 4KB used) and
- * everything else touched this early in boot; needs ~24.8MB
- * (3048*2032*4 XRGB8888), ending well below 0xd8100000 (xbl-sc-region,
- * the nearest higher reserved region per SPEC.md's memory map). */
-#define SHENG_MDSS_FB_ADDR		0xa0200000
+/* 24.8MB (3048*2032*4 XRGB8888), starting 1MB above
+ * SHENG_MDSS_DSI_DMA_SCRATCH, ending ~0xa4b10000 -- comfortably within
+ * the same free System RAM span, well clear of the next reserved
+ * region (0xccd00000, rmtfs_mem). See SHENG_MDSS_DSI_DMA_SCRATCH's
+ * comment for why this moved from its old 0xa0200000. */
+#define SHENG_MDSS_FB_ADDR		0xa3200000
 
 /* 144Hz mode, xiaomi,sheng-nt36532e panel. Confirmed against the live
  * DPU crtc-0 modeline AND panel-novatek-nt36532e.c's sheng_tianma_modes[]
@@ -642,6 +799,7 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
 /* sheng_mdss_hw.zig */
 extern void sheng_mdss_core_reset(unsigned long dispcc_base);
 extern int sheng_mdss_gdsc_enable(unsigned long dispcc_base);
+extern void sheng_mdss_gdsc_disable(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_dsi_clks_init(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init_pll0_only(unsigned long dispcc_base);
@@ -650,10 +808,48 @@ extern int sheng_mdss_dispcc_init_thru_mdp(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init_thru_mdp_rcg_only(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init_no_mdp_branch(unsigned long dispcc_base);
 extern int sheng_mdss_dsi_phy_init(unsigned long dsi_phy_base, bool is_master);
+extern void sheng_mdss_dsi_reset_both_phys(unsigned long dsi0_base, unsigned long dsi1_base);
 extern int sheng_mdss_dsi_panel_init(unsigned long dsi0_base, unsigned long dsi1_base,
 				      unsigned long dma_scratch, bool enable_dsc);
 extern int sheng_mdss_dsi_test_patch(unsigned long dsi0_base, unsigned long dsi1_base,
 				      unsigned long dma_scratch);
+extern long long sheng_mdss_dsi_read_power_mode(unsigned long dsi0_base, unsigned long dsi1_base,
+						 unsigned long dma_scratch);
+extern long long sheng_mdss_dsi_read_error_status(unsigned long dsi0_base);
+extern long long sheng_mdss_dsi_read_ctrl_state(unsigned long dsi0_base);
+extern unsigned int sheng_mdss_dsi_ctrl_writeback_selfcheck(unsigned long dsi_base);
+extern long long sheng_mdss_dsi_block_writeback_selfcheck(unsigned long dsi_base);
+extern unsigned int sheng_mdss_dsi_earliest_ctrl_selfcheck(void);
+extern unsigned int sheng_mdss_dsi_status0_before_first_cmd(void);
+extern long long sheng_mdss_dsi_timeout_diag(void);
+extern long long sheng_mdss_dsi_snapshot_1(void);
+extern long long sheng_mdss_dsi_snapshot_2(void);
+extern long long sheng_mdss_dsi_snapshot_3(void);
+extern long long sheng_mdss_dsi_snapshot_4(void);
+extern unsigned int sheng_mdss_smmu_diag1(void);
+extern long long sheng_mdss_smmu_diag2(void);
+extern unsigned int sheng_mdss_smmu_diag3(void);
+extern long long sheng_mdss_iova_diag1(void);
+extern long long sheng_mdss_iova_diag2(void);
+extern long long sheng_mdss_dmabuf_diag(void);
+extern long long sheng_mdss_smmu_fault_diag(void);
+extern long long sheng_mdss_smmu_fault_addr(void);
+extern void sheng_mdss_dsi_tpg_enable(unsigned long dsi0_base,
+				     unsigned long dsi1_base);
+extern long long sheng_mdss_verify_pipeline(unsigned long dpu_base,
+					    unsigned long dsi0_base);
+extern long long sheng_mdss_dpu_readback1(unsigned long dpu_base);
+extern int sheng_mdss_dsi_all_pixels_on(unsigned long dsi0_base,
+					unsigned long dsi1_base,
+					unsigned long dma_scratch);
+extern long long sheng_mdss_dsi_video_readback1(unsigned long dsi0_base);
+extern long long sheng_mdss_dsi_video_readback2(unsigned long dsi0_base,
+						unsigned long dsi1_base);
+extern long long sheng_mdss_dpu_readback2(unsigned long dpu_base);
+extern long long sheng_mdss_dpu_readback3(unsigned long dpu_base);
+extern long long sheng_mdss_dpu_readback4(unsigned long dpu_base);
+extern void sheng_mdss_dsi_trig_ctrl_restore(unsigned long dsi0_base,
+					     unsigned long dsi1_base);
 extern int sheng_mdss_dpu_start(unsigned long dpu_base,
 				 unsigned long dsi0_base, unsigned long dsi1_base,
 				 unsigned long fb_addr,
@@ -661,10 +857,71 @@ extern int sheng_mdss_dpu_start(unsigned long dpu_base,
 				 u32 hfront_porch, u32 hback_porch, u32 hsync_width,
 				 u32 vfront_porch, u32 vback_porch, u32 vsync_width,
 				 bool enable_dsc);
+extern void sheng_mdss_dpu_stop(unsigned long dpu_base);
+extern void sheng_mdss_dsi_panel_sleep(unsigned long dsi0_base, unsigned long dsi1_base,
+					unsigned long dma_scratch);
+extern void sheng_mdss_full_teardown(unsigned long dpu_base,
+				      unsigned long dsi0_phy_base, unsigned long dsi1_phy_base,
+				      unsigned long dispcc_base);
 
 struct sheng_mdss_priv {
 	fdt_addr_t mdss_base;
 };
+
+/* Called from board.c at the very end of misc_init_r(), AFTER the
+ * backlight bring-up's own 5s visual hold -- gives the picture time to
+ * actually be seen before tearing the pipeline down cleanly right
+ * before U-Boot jumps into Linux.
+ *
+ * Full reverse of sheng_mdss_probe()'s own setup, in the mirror order
+ * (panel first, hardware last), per the "U-Boot must clean up after
+ * itself" principle: a bootloader that leaves the display pipeline
+ * mid-stream and hands off to Linux with zero cleanup is asking for
+ * exactly the class of "framebuffer is not in virtual address space"
+ * GEM/vmap corruption seen earlier, even if that specific message
+ * turned out to be cosmetic -- there's no reason to leave DPU/DSI/PHY
+ * state dangling across the handoff regardless. No-op if
+ * CONFIG_VIDEO_SHENG_MDSS isn't even enabled (sheng_mdss.c/
+ * sheng_mdss_hw.o aren't even compiled in that case). */
+void sheng_mdss_teardown(void)
+{
+	if (!IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS))
+		return;
+
+	/* DIAGNOSTIC TEST RESULT (SPEC.md task #5 log): temporarily
+	 * disabling this teardown reproduced the exact same silent
+	 * "backlight only, no picture" Linux symptom -- confirmed via dmesg
+	 * that NONE of arm-smmu context faults, dsi_tx_timeout/DCS errors,
+	 * or PLL lock timeouts appear. msm_dpu/msm_dsi/adreno gpu all bind
+	 * and initialize cleanly regardless. Whatever U-Boot leaves behind
+	 * that disrupts Linux's render is silent at the kernel fault/
+	 * timeout level -- not a logged hardware fault. This teardown is
+	 * the confirmed, working fix; do not disable it again without a
+	 * specific new hypothesis to test. */
+
+	/* 1. Panel: Display Off (0x28) + Sleep In (0x10) over the DSI
+	 * command channel, while the host/PHY can still carry commands. */
+	sheng_mdss_dsi_panel_sleep(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
+				    SHENG_MDSS_DSI_DMA_SCRATCH);
+
+	/* 2. Hardware: DPU timing engines + CTL_START/FLUSH cleared, both
+	 * DSI PHYs powered down (lanes disabled, REFGEN vote dropped),
+	 * every DSI/MDP DISPCC branch gated off, MDSS core reset pulsed
+	 * once more. */
+	sheng_mdss_full_teardown(SM8550_MDSS_DPU_BASE,
+				  SM8550_MDSS_DSI0_PHY_BASE, SM8550_MDSS_DSI1_PHY_BASE,
+				  SM8550_DISPCC_BASE);
+
+	/* 3. Panel back to its cold-boot state: reset line asserted
+	 * (active-low, physical LOW), avdd/avee bias rails dropped -- the
+	 * exact inverse of sheng_mdss_panel_power_and_reset(), so Linux's
+	 * own nt36532e_prepare() sees a genuinely fresh, unpowered panel
+	 * and re-runs its full init sequence rather than finding a panel
+	 * it thinks is already on. */
+	sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 0); /* logical 1 = physical LOW: reset asserted */
+	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVEE_GPIO, 0);
+	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVDD_GPIO, 0);
+}
 
 static int sheng_mdss_probe(struct udevice *dev)
 {
@@ -679,6 +936,25 @@ static int sheng_mdss_probe(struct udevice *dev)
 
 	for (unsigned int i = 0; i < SHENG_MDSS_STATUS_COUNT; i++)
 		sheng_mdss_status_set(i, SHENG_MDSS_STATUS_NOT_REACHED);
+
+	/* COLD-START RESET PASS (SPEC.md task #5 log): never attempted
+	 * before this pass -- every prior version of this driver assumed a
+	 * clean power-on-reset state and built additively on top of
+	 * whatever ABL/XBL already left behind. This explicitly forces
+	 * everything to a true zero state FIRST: panel bias/reset off, GDSC
+	 * power domain collapsed and settled, MDSS core reset pulsed, THEN
+	 * GDSC brought back up -- so the digital logic gates genuinely
+	 * initialize from power-on defaults rather than whatever latent
+	 * state ABL's own splash/init sequence (which very plausibly uses
+	 * this exact same DPU/DSI hardware for its own boot logo) may have
+	 * left mid-configured. Panel bias/reset off first, matching a real
+	 * cold boot's power sequencing (panel unpowered while the
+	 * controller itself resets). */
+	sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 0); /* reset asserted */
+	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVEE_GPIO, 0);
+	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVDD_GPIO, 0);
+	sheng_mdss_gdsc_disable(SM8550_DISPCC_BASE);
+	mdelay(1);
 
 	/* msm_mdss_reset() in the real driver toggles DISP_CC_MDSS_CORE_BCR
 	 * as the very first thing msm_mdss_init() does, before GDSC or any
@@ -703,6 +979,31 @@ static int sheng_mdss_probe(struct udevice *dev)
 		log_debug("sheng_mdss: GDSC bring-up failed (%d)\n", ret);
 		return ret;
 	}
+
+	/* NEW LEAD (SPEC.md task #5 log): traced the real mdp0-mem
+	 * interconnect path (devicetree: &mmss_noc MASTER_MDP -> &mc_virt
+	 * SLAVE_EBI1) all the way through sm8550.c's icc-rpmh node graph --
+	 * qnm_mdp -> qns_mem_noc_hf -> qnm_mnoc_hf -> ... -> gem_noc
+	 * (bcm_sh0) -> mc_virt (bcm_mc0) -> ebi. Both bcm_sh0 and bcm_mc0
+	 * are marked .keepalive=true in the driver (a permanent non-zero
+	 * RPMh floor vote regardless of what any individual master
+	 * requests -- why CPU/U-Boot's own DRAM access has always worked
+	 * fine, that's a completely different, always-on guarantee). The
+	 * ONE BCM in the whole chain WITHOUT a keepalive floor is MM0,
+	 * covering exactly qns_mem_noc_hf -- the node qnm_mdp (the DPU)
+	 * sits on. bcm_mm1 doesn't apply (camera masters only, not MDP).
+	 * This is the same MM0 this file's sheng_mdss_bcm_vote() was always
+	 * built for (see SHENG_LOG_CMDDB_MM0_ADDR) but never actually
+	 * wired into the active path -- the earlier "MMCX voting dead end"
+	 * finding was about a DIFFERENT vote (MMCX power-domain corner, not
+	 * this bandwidth BCM) and predates the DSI clock/VID_CFG/stride
+	 * fixes, so it doesn't rule this out. Same reliability caveat as
+	 * before applies (CMD_STATUS_COMPL only proves local TCS-controller
+	 * acceptance, not confirmed remote RPMh execution) -- but this is a
+	 * real, previously-untested gap in the actual DMA bandwidth path,
+	 * not another register-content check. */
+	ret = sheng_mdss_bcm_vote("MM0");
+	env_set_hex("sheng_mdss_bcm_mm0", (unsigned long)ret);
 
 	/* MMCX voting dead end (see git history/SPEC.md task #5): tried
 	 * both the computed NOM corner and the sync_state-clamped MAX
@@ -732,6 +1033,29 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * ever powering it up, then bringing it up clean afterward with a
 	 * GPIO fault-clear cycle + soft-start brightness ramp, might avoid
 	 * tripping the latch in the first place. */
+	/* ORDERING BUG (SPEC.md task #5 log): this call used to live ~170
+	 * lines below, AFTER sheng_mdss_dsi_panel_init(). GCC_DISP_HF_AXI_
+	 * CLK is the AXI *data* path clock -- the bus the DSI command DMA
+	 * engine uses to fetch its packet out of DRAM. Gated, that read
+	 * never returns: the engine latches CMD_MODE_DMA_BUSY and holds it
+	 * forever with nothing to show for it.
+	 *
+	 * That is exactly what STATUS/FIFO forensics show. FIFO_STATUS on
+	 * timeout reads 0x11111010 -- DLN0-3_HS_FIFO_EMPTY and DLN0_LP_
+	 * FIFO_EMPTY set, and CMD_DMA_FIFO_RD_WATERMARK_REACH(8) / WR_
+	 * WATERMARK_REACH(9) / UNDERFLOW(10) all CLEAR -- while DLN0_PHY_
+	 * ERR (0x00088888) has every defined error bit clear. Not a
+	 * stalled transmitter (that would leave the HS FIFOs full): the
+	 * engine never fetched a single byte, and never errored, because
+	 * its AXI read had no clock to complete on.
+	 *
+	 * Linux never has this problem because msm_mdss_enable() brings
+	 * this up in the SAME clk_bulk as DISP_CC_MDSS_AHB_CLK/MDP_CLK for
+	 * the mdss wrapper -- before any child DSI device does anything.
+	 * See the comment on the function itself. Enable it here, with the
+	 * rest of the MDSS clock bulk, which is where it always belonged. */
+	sheng_mdss_gcc_disp_hf_axi_clk_enable();
+
 	ret = sheng_mdss_dispcc_init(SM8550_DISPCC_BASE);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DISPCC, ret);
 	env_set_hex("sheng_mdss_dispcc", (unsigned long)ret);
@@ -758,10 +1082,35 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * (sheng_mdss_dispcc_init_no_mdp_branch). Proceeding into DSI PHY/
 	 * panel init/test patch for real now. */
 
+	/* Real analog supply rails for the DSI PHYs/hosts/panel logic --
+	 * see sheng_mdss_regulator_vote()'s comment. Both DSI PHYs share
+	 * vreg_l1e_0p88 (0.88V), both DSI hosts share vreg_l3e_1p2 (1.2V),
+	 * and the panel's own vddio is vreg_s3g_0p7 -- live-confirmed on a
+	 * working Linux boot at 880000uV/1200000uV/600000uV respectively.
+	 * Voted here, before anything that depends on them, since none of
+	 * these three has regulator-boot-on/always-on in the DTS. */
+	/* First attempt guessed "l1e"/"l3e"/"s3g" and then "L1E"/"L3E"/
+	 * "S3G" (matching the DTS regulator label convention) -- both
+	 * wrong, -ENODEV. Read the real cmd-db contents live off a working
+	 * boot via /sys/kernel/debug/cmd-db (confirmed accessible,
+	 * unlike the no-map cmd-db reserved-memory region itself) --
+	 * actual naming convention is "ldo<pmic-letter><index>"/
+	 * "smp<pmic-letter><index>", e.g. "ldoe1", "ldoe3", "smpg3", not
+	 * the DTS label's "l1e"/"s3g" shorthand at all. vreg_l1e_0p88 =
+	 * LDO1 on PMIC E = "ldoe1"; vreg_l3e_1p2 = LDO3 on PMIC E =
+	 * "ldoe3"; vreg_s3g_0p7 = SMPS3 on PMIC G = "smpg3". */
+	ret = sheng_mdss_regulator_vote("ldoe1", 880);
+	env_set_hex("sheng_mdss_vreg_l1e", (unsigned long)ret);
+	ret = sheng_mdss_regulator_vote("ldoe3", 1200);
+	env_set_hex("sheng_mdss_vreg_l3e", (unsigned long)ret);
+	ret = sheng_mdss_regulator_vote("smpg3", 600);
+	env_set_hex("sheng_mdss_vreg_s3g", (unsigned long)ret);
+
 	/* Dual-DSI split-link panel: DSI0 is master (drives its own PLL),
 	 * DSI1 is slave (sources its bit clock from DSI0 over
 	 * qcom,sync-dual-dsi) -- see sheng_mdss_dsi_phy_init()'s comment
 	 * in sheng_mdss_hw.zig. Both must succeed. */
+	sheng_mdss_dsi_reset_both_phys(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE);
 	ret = sheng_mdss_dsi_phy_init(SM8550_MDSS_DSI0_PHY_BASE, true);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI0_PHY, ret);
 	env_set_hex("sheng_mdss_dsi0_phy", (unsigned long)ret);
@@ -825,27 +1174,197 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * same "frames streaming, nothing visible" symptom as DSC-on. DSC
 	 * was never the blocker. Real gap found instead: DSI_VID_CFG0 (see
 	 * dsiHostSwitchToVideoMode()'s comment) was never written at all.
-	 * Back to enable_dsc=true, the real/correct configuration. */
+	 * Back to enable_dsc=true, the real/correct configuration (normal
+	 * path -- NOT used by this diagnostic build, see below). */
+
+	/* DIAGNOSTIC BUILD ONLY (SPEC.md task #5 log): sanity check that
+	 * SOMETHING real is being pushed to the panel, using the simplest
+	 * possible path -- sheng_mdss_dsi_test_patch(), a DPU-bypass
+	 * proof-of-concept built earlier in the project but never retested
+	 * with the SW_RESET pulse / correct regulators / correct stride /
+	 * correct framerate branch fixes now in place. Pushes a small 16x16
+	 * solid-color patch directly over the already-proven command-mode
+	 * DSI DMA engine -- entirely bypassing SSPP/LM/CTL/INTF/DSC. If
+	 * this shows ANYTHING, the physical DSI link + panel are proven
+	 * alive and the bug is DPU-video-pipeline-specific. If nothing
+	 * shows here either, the problem is more fundamental than the DPU
+	 * path we've been exhaustively auditing.
+	 *
+	 * DSI 6G REGISTER SHIFT FIX (SPEC.md task #5 log): SM8550_MDSS_DSI0/
+	 * 1_BASE now include the +4 byte DSI_6G_REG_SHIFT (see their
+	 * definition's comment) -- every DSI host register access in this
+	 * entire driver was landing 4 bytes before where it should have
+	 * been, on offset 0x000 specifically hitting the real, read-only
+	 * 6G_HW_VERSION register instead of CTRL. Diagnostic early-return
+	 * and DSC-incompatible test_patch call removed now that the real
+	 * root cause is fixed -- proceeding into the real enable_dsc=true
+	 * video path below for a genuine end-to-end test. */
 	ret = sheng_mdss_dsi_panel_init(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
 					 SHENG_MDSS_DSI_DMA_SCRATCH, true);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI_PANEL, ret);
 	env_set_hex("sheng_mdss_panel", (unsigned long)ret);
+	env_set_hex("sheng_mdss_status0_pre",
+		    (unsigned long)sheng_mdss_dsi_status0_before_first_cmd());
+	env_set_hex("sheng_mdss_timeout_diag", (unsigned long)sheng_mdss_dsi_timeout_diag());
+	env_set_hex("sheng_mdss_snap1", (unsigned long)sheng_mdss_dsi_snapshot_1());
+	env_set_hex("sheng_mdss_snap2", (unsigned long)sheng_mdss_dsi_snapshot_2());
+	env_set_hex("sheng_mdss_snap3", (unsigned long)sheng_mdss_dsi_snapshot_3());
+	env_set_hex("sheng_mdss_snap4", (unsigned long)sheng_mdss_dsi_snapshot_4());
+	env_set_hex("sheng_mdss_smmu_diag1", (unsigned long)sheng_mdss_smmu_diag1());
+	env_set_hex("sheng_mdss_smmu_diag2", (unsigned long)sheng_mdss_smmu_diag2());
+	env_set_hex("sheng_mdss_smmu_diag3", (unsigned long)sheng_mdss_smmu_diag3());
+	env_set_hex("sheng_mdss_iova_diag1", (unsigned long)sheng_mdss_iova_diag1());
+	env_set_hex("sheng_mdss_iova_diag2", (unsigned long)sheng_mdss_iova_diag2());
+	env_set_hex("sheng_mdss_dmabuf", (unsigned long)sheng_mdss_dmabuf_diag());
+	/* Does U-Boot's own MMU even map the HIGH DRAM bank the scratch
+	 * buffer was moved into this session? build_mem_map() maps only
+	 * what the previous bootloader handed over in gd->dram[]; a bank
+	 * that isn't there is simply not mapped, and every CPU store into
+	 * it goes nowhere. Report which bank (if any) contains the scratch
+	 * address, plus that bank's start/size, rather than assuming. */
+	{
+		unsigned long found = ~0UL, fstart = 0, fsize = 0;
+		int b;
+		for (b = 0; b < CONFIG_NR_DRAM_BANKS; b++) {
+			if (!gd->dram[b].size)
+				continue;
+			if (SHENG_MDSS_DSI_DMA_SCRATCH >= gd->dram[b].start &&
+			    SHENG_MDSS_DSI_DMA_SCRATCH < gd->dram[b].start +
+							 gd->dram[b].size) {
+				found = b;
+				fstart = gd->dram[b].start;
+				fsize = gd->dram[b].size;
+				break;
+			}
+		}
+		env_set_hex("sheng_mdss_scratch_bank", found);
+		/* Same check for the FRAMEBUFFER, which was never verified --
+		 * only the DSI scratch buffer was. SSPP_SRC0_ADDR is a 32-bit
+		 * register and we hand it raw physical 0xa3200000; if that
+		 * address is not in a bank U-Boot owns, the CPU fill goes
+		 * nowhere real and/or the DPU's fetch reads a region it is not
+		 * permitted to read, which looks exactly like the current
+		 * symptom: entire pipeline verified bit-identical to working
+		 * silicon (sheng.verify=0), no FIFO errors, and no pixels. */
+		{
+			unsigned long fb_found = ~0UL, fb_start = 0, fb_size = 0;
+			int fb_b;
+			for (fb_b = 0; fb_b < CONFIG_NR_DRAM_BANKS; fb_b++) {
+				if (!gd->dram[fb_b].size)
+					continue;
+				if (SHENG_MDSS_FB_ADDR >= gd->dram[fb_b].start &&
+				    SHENG_MDSS_FB_ADDR < gd->dram[fb_b].start +
+							 gd->dram[fb_b].size) {
+					fb_found = fb_b;
+					fb_start = gd->dram[fb_b].start;
+					fb_size = gd->dram[fb_b].size;
+					break;
+				}
+			}
+			env_set_hex("sheng_mdss_fb_bank", fb_found);
+			env_set_hex("sheng_mdss_fb_bank_start", fb_start);
+			env_set_hex("sheng_mdss_fb_bank_size", fb_size);
+		}
+		env_set_hex("sheng_mdss_scratch_bank_start", fstart);
+		env_set_hex("sheng_mdss_scratch_bank_size", fsize);
+	}
 	if (ret)
 		return ret;
+
+	/* Ground-truth test: every DCS command sent by this driver up to
+	 * now (including the panel init sequence just above) has been a
+	 * plain write with no BTA/ACK -- the host reporting DMA success
+	 * only proves ITS OWN buffer was shifted out, never that the panel
+	 * actually received or is responding to anything. This is the
+	 * first real DCS READ (Get Power Mode, 0x0A) with genuine BTA in
+	 * this driver's history -- a byte 0-255 here means the panel is
+	 * genuinely alive and responding at the physical layer; a timeout
+	 * (large/negative value) means nothing is getting through even at
+	 * the most basic command level, regardless of DPU/video pipeline
+	 * state. See sheng_mdss_dsi_read_power_mode()'s comment. */
+	{
+		long long power_mode = sheng_mdss_dsi_read_power_mode(SM8550_MDSS_DSI0_BASE,
+									SM8550_MDSS_DSI1_BASE,
+									SHENG_MDSS_DSI_DMA_SCRATCH);
+		long long err_status = sheng_mdss_dsi_read_error_status(SM8550_MDSS_DSI0_BASE);
+		long long ctrl_state = sheng_mdss_dsi_read_ctrl_state(SM8550_MDSS_DSI0_BASE);
+		env_set_hex("sheng_mdss_power_mode", (unsigned long)power_mode);
+		env_set_hex("sheng_mdss_err_status", (unsigned long)err_status);
+		env_set_hex("sheng_mdss_ctrl_state", (unsigned long)ctrl_state);
+		env_set_hex("sheng_mdss_ctrl_selfcheck",
+			    (unsigned long)sheng_mdss_dsi_ctrl_writeback_selfcheck(SM8550_MDSS_DSI0_BASE));
+		env_set_hex("sheng_mdss_block_selfcheck",
+			    (unsigned long)sheng_mdss_dsi_block_writeback_selfcheck(SM8550_MDSS_DSI0_BASE));
+		env_set_hex("sheng_mdss_earliest_selfcheck",
+			    (unsigned long)sheng_mdss_dsi_earliest_ctrl_selfcheck());
+	}
+
+	/* Panel init is done; the DPU is about to start streaming frames,
+	 * so TRIG_CTRL's BLOCK_DMA_WITHIN_FRAME / TE interlock now has a
+	 * live MDP to synchronise against. Put Linux's exact live value
+	 * back. See TRIG_CTRL_CMD_INIT_VALUE in sheng_mdss_hw.zig for why
+	 * panel init itself must NOT run with those bits set. */
+	sheng_mdss_dsi_trig_ctrl_restore(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE);
+
+	/* ALL_PIXELS_ON diagnostic REMOVED from the boot path: it answered
+	 * its question (screen stayed black) and it is a state-changing
+	 * DCS write that must not stay in a normal boot. The helper is
+	 * kept in sheng_mdss_hw.zig for future use. Note the result was
+	 * NOT conclusive -- 0x22/0x23 behaviour is implementation-defined
+	 * on a RAM-less video-mode panel like this one. */
 
 	/* Real panel timings (sheng_tianma_modes[], panel-novatek-
 	 * nt36532e.c): 3048x2032, hfp=142 hsync=4 hbp=92, vfp=26 vsync=2
 	 * vbp=138. */
 	{
+		/* sheng_mdss_dpu_start() now programs SSPP_SRC_YSTRIDE0 with
+		 * the 32-pixel-aligned pitch (align_pitch() in msm_drv.h:
+		 * ALIGN(3048,32)=3072, *4 bytes = 12288 -- matches a live-
+		 * verified working mmap test on this exact panel, 2032*12288
+		 * = 24,969,216 bytes, see SPEC.md task #5), not the naive
+		 * tightly-packed 3048*4=12192. Fill the SAME aligned region
+		 * here so every byte SSPP will actually fetch (including the
+		 * 24 padding pixels/96 bytes per row past column 3048) is
+		 * real, initialized memory -- filling only the tight 3048-
+		 * wide region would leave the last ~187KB of what SSPP reads
+		 * (rows shifted by the stride mismatch) as uninitialized
+		 * memory. */
 		volatile u32 *fb = (volatile u32 *)(uintptr_t)SHENG_MDSS_FB_ADDR;
-		size_t fb_pixels = (size_t)3048 * 2032;
+		size_t aligned_hactive = 3072; /* (3048+31)&~31 */
+		size_t fb_words = aligned_hactive * 2032;
 		size_t px;
 
-		for (px = 0; px < fb_pixels; px++)
+		for (px = 0; px < fb_words; px++)
 			fb[px] = 0xff00ff00u; /* XRGB8888 solid green */
 		flush_dcache_range(SHENG_MDSS_FB_ADDR,
-				    SHENG_MDSS_FB_ADDR + fb_pixels * 4);
+				    SHENG_MDSS_FB_ADDR + fb_words * 4);
 		dsb();
+		/* DELIBERATELY NOT READ BACK HERE (SPEC.md task #5 log): an
+		 * earlier build read fb[0] and fb[fb_words-1] at this point
+		 * and HUNG THE BOARD outright -- no Linux boot at all. A read
+		 * that hangs the CPU is a synchronous external abort, i.e.
+		 * this address range is not readable memory. The fill loop
+		 * above never exposed it because writes are posted and get
+		 * silently swallowed, whereas a read must return data.
+		 *
+		 * That is itself the finding: the framebuffer is (at least
+		 * partly) outside DRAM U-Boot owns. sheng.fbbank below reports
+		 * the bank lookup, which is safe (it only inspects gd->dram)
+		 * and must be consulted BEFORE anything dereferences this
+		 * address again. Do not re-add a readback here until the
+		 * framebuffer has been relocated into a verified bank.
+		 *
+		 * RESOLVED: sheng.fbbank came back 1 (bank 0x811d0000 +
+		 * 0x56e30000, i.e. up to 0xd8000000), so this address IS
+		 * inside DRAM U-Boot owns and the earlier hang was NOT an
+		 * abort here at all -- it was `setenv bootargs` exceeding
+		 * CONFIG_SYS_MAXARGS (64) once the diagnostic variables piled
+		 * up, leaving bootargs unset and Linux with no root=. The
+		 * readback is safe and is restored below, because whether the
+		 * fill actually lands in memory has still never been proven. */
+		env_set_hex("sheng_mdss_fb_readback",
+			    (((unsigned long)fb[0]) << 32) |
+			    (unsigned long)fb[fb_words - 1]);
 	}
 
 	ret = sheng_mdss_dpu_start(SM8550_MDSS_DPU_BASE,
@@ -876,6 +1395,45 @@ static int sheng_mdss_probe(struct udevice *dev)
 		env_set_hex("sheng_intf1_frame_b", (unsigned long)*intf1_frame);
 		env_set_hex("sheng_intf1_line_b", (unsigned long)*intf1_line);
 	}
+
+	/* Sampled AFTER the DPU has been streaming for 500ms, so any SSPP
+	 * pixel-fetch translation fault has had ~28 frames' worth of
+	 * chances to latch. See sheng_mdss_smmu_fault_diag()'s comment for
+	 * the bit decode -- this is what distinguishes "SSPP is starving
+	 * on an unmapped framebuffer" from "translation is fine, the black
+	 * screen is downstream in SSPP/LM/DSC/CTL config". */
+	env_set_hex("sheng_mdss_smmu_fault",
+		    (unsigned long)sheng_mdss_smmu_fault_diag());
+	env_set_hex("sheng_mdss_smmu_far",
+		    (unsigned long)sheng_mdss_smmu_fault_addr());
+
+	/* Datapath readback, same 500ms-later moment -- see
+	 * sheng_mdss_dpu_readback1()'s comment for the decode. */
+	/* DECISIVE BISECT -- see sheng_mdss_dsi_tpg_enable()'s comment. The
+	 * DSI host generates video internally, bypassing the entire DPU.
+	 * Any visible change means the link reaches the panel; pure black
+	 * means nothing we transmit does. Remove once answered. */
+	sheng_mdss_dsi_tpg_enable(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE);
+
+	/* Whole-pipeline check against the live-hardware reference table --
+	 * see sheng_mdss_verify_pipeline()'s comment. 0 == every programmed
+	 * register matches working silicon. */
+	env_set_hex("sheng_mdss_verify",
+		    (unsigned long)sheng_mdss_verify_pipeline(SM8550_MDSS_DPU_BASE,
+							     SM8550_MDSS_DSI0_BASE));
+	env_set_hex("sheng_mdss_dpu_rb1",
+		    (unsigned long)sheng_mdss_dpu_readback1(SM8550_MDSS_DPU_BASE));
+	env_set_hex("sheng_mdss_dpu_rb2",
+		    (unsigned long)sheng_mdss_dpu_readback2(SM8550_MDSS_DPU_BASE));
+	env_set_hex("sheng_mdss_dpu_rb3",
+		    (unsigned long)sheng_mdss_dpu_readback3(SM8550_MDSS_DPU_BASE));
+	env_set_hex("sheng_mdss_dpu_rb4",
+		    (unsigned long)sheng_mdss_dpu_readback4(SM8550_MDSS_DPU_BASE));
+	env_set_hex("sheng_mdss_dsi_vrb1",
+		    (unsigned long)sheng_mdss_dsi_video_readback1(SM8550_MDSS_DSI0_BASE));
+	env_set_hex("sheng_mdss_dsi_vrb2",
+		    (unsigned long)sheng_mdss_dsi_video_readback2(SM8550_MDSS_DSI0_BASE,
+								 SM8550_MDSS_DSI1_BASE));
 
 	/* No large hold here anymore -- board.c calls backlight init
 	 * AFTER this probe() returns, with its own 5s hold at the end.
@@ -909,8 +1467,17 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * hang, DPU reads don't -- it's plausible the same asymmetry
 	 * applies to this GCC clock-controller write too. RESULT: booted
 	 * fine -- this write is NOT the issue. Ruled out.
+	 *
+	 * RESOLVED (SPEC.md task #5 log): the sheng_mdss_gcc_disp_hf_axi_
+	 * clk_enable() call that used to sit here has MOVED UP to the MDSS
+	 * clock bulk beside sheng_mdss_dispcc_init(), where Linux's
+	 * msm_mdss_enable() puts it. Enabling the AXI data-path clock at
+	 * this point in probe -- i.e. AFTER sheng_mdss_dsi_panel_init() --
+	 * was the root cause of this driver's long-standing DSI command
+	 * DMA hang: the engine's packet fetch is an AXI read, and with the
+	 * bus unclocked it never returned. See the call's new site for the
+	 * full FIFO_STATUS forensics. Do not move it back down here.
 	 */
-	sheng_mdss_gcc_disp_hf_axi_clk_enable();
 
 	/* CONFIRMED (see SPEC.md task #5 log): sheng_mdss_bind() itself was
 	 * the cause of every "post-RSC" hang, not the DPU/GCC/RSC/framebuffer

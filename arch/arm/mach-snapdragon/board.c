@@ -838,6 +838,8 @@ static int sheng_ktz8866_write_chip(const char *path, u32 *bl_en_readback_out)
 	return 0;
 }
 
+extern void sheng_mdss_teardown(void);
+
 static void sheng_ktz8866_backlight_init(void)
 {
 	int ret;
@@ -888,7 +890,10 @@ static void sheng_ktz8866_backlight_init(void)
 	/* Give the chips/panel time to actually respond before boot
 	 * continues -- requested to make sure a slow-to-light backlight
 	 * gets a real chance, not just a race against whatever runs next. */
-	mdelay(5000);
+	/* The 5s viewing hold that used to live here has MOVED to the call
+	 * site in board_late_init(): this function now runs BEFORE the video
+	 * probe (see its new call site's comment), and holding here would
+	 * burn the hold before any picture exists. */
 }
 
 /* Stolen from arch/arm/mach-apple/board.c */
@@ -976,6 +981,31 @@ int board_late_init(void)
 	 * around an unrelated early-boot hang). Force a probe attempt
 	 * here so sheng_mdss's probe() actually runs.
 	 */
+	/* ORDERING BUG (SPEC.md task #5 log): this used to run AFTER the
+	 * video probe below. The KTZ8866 is a combined backlight + DISPLAY
+	 * BIAS chip -- sheng_ktz8866_backlight_init() is what drives its EN
+	 * pin and writes LCD_BIAS_CFG1 (0x09 = 0x9F, LCD_BIAS_EN), and the
+	 * panel's avdd/avee are the +/-5.8V rails that chip generates
+	 * (sm8550-xiaomi-sheng.dts: avdd-supply = <&bl_vddpos_5p8>,
+	 * avee-supply = <&bl_vddneg_5p8>; TLMM 30/31 only GATE those rails
+	 * to the panel, they do not create them).
+	 *
+	 * Running it afterwards meant the panel was reset and run through
+	 * its ENTIRE DCS init sequence with no analog source-driver supply,
+	 * then handed a video stream. A panel initialised without AVDD/AVEE
+	 * stays dark and does not recover when the rail appears later -- it
+	 * needs reset + re-init after the supply is stable. Linux has no
+	 * such problem: the ktz8866 backlight driver probes over I2C at
+	 * boot, long before nt36532e_prepare() resets the panel.
+	 *
+	 * This is consistent with every measurement: DSI host, PHY and all
+	 * 46 DPU registers verified bit-identical to working silicon, the
+	 * framebuffer verifiably green, no SMMU faults, a true 144Hz link
+	 * -- and the panel showing nothing even for the DSI host's OWN
+	 * internal test pattern generator, which bypasses the whole DPU.
+	 * Digital side perfect, analog side unpowered. */
+	sheng_ktz8866_backlight_init();
+
 	if (IS_ENABLED(CONFIG_VIDEO)) {
 		struct udevice *vdev = NULL;
 		int vret;
@@ -996,10 +1026,23 @@ int board_late_init(void)
 		env_set_hex("sheng_mdss_vret", (unsigned long)vret);
 	}
 
-	/* Let the rail resettle after whatever electrical transient the
-	 * video probe above caused, before bringing up backlight fresh. */
-	mdelay(50);
-	sheng_ktz8866_backlight_init();
+	/* Visual hold, moved out of sheng_ktz8866_backlight_init() now that
+	 * that runs before the video probe -- gives a real chance to see
+	 * the picture before the teardown below. */
+	mdelay(5000);
+
+	/* Tear the DPU pipeline down cleanly now that the visual hold
+	 * (backlight init's own 5s mdelay, just above) has given a real
+	 * chance to actually see the picture -- see sheng_mdss_teardown()'s
+	 * comment. Must happen right before Linux boots, not right after
+	 * dpu_start(), or there'd be nothing left to look at. Guarded here
+	 * (not just inside sheng_mdss_teardown() itself) because
+	 * sheng_mdss.c/sheng_mdss_teardown() don't even get compiled in at
+	 * all when CONFIG_VIDEO_SHENG_MDSS is off (obj-$(CONFIG_VIDEO_
+	 * SHENG_MDSS) in drivers/video/qualcomm/Makefile) -- calling it
+	 * unconditionally would be a link error in that config. */
+	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS))
+		sheng_mdss_teardown();
 
 	return 0;
 }

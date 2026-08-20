@@ -163,7 +163,24 @@ pub const nt36532e_dsc_144hz = DscConfig{};
 /// MIPI_DSI_PICTURE_PARAMETER_SET (type 0x0A) long packet, not a
 /// generic DCS long write.
 pub const nt36532e_pps_144hz = [128]u8{
-    0x11, 0x00, 0x00, 0x89, 0x30, 0x80, 0x07, 0xf0, 0x05, 0xf4, 0x00, 0x10, 0x02, 0xfa, 0x02, 0xfa,
+    // PPS8-9 CORRECTED (SPEC.md task #5 log): was 0x05, 0xf4 = pic_width
+    // 1524. drm_dsc_pps_payload_pack() puts pic_height at PPS6-7 and
+    // pic_width at PPS8-9, so this told the panel's DSC decoder the
+    // picture is 1524 wide == 2 slices of 762, while the DPU encoder --
+    // now cross-verified against live silicon -- encodes a 3048-wide
+    // picture as 4 slices of 762 (num_active_slice_per_enc = 2 in
+    // CMN_MAIN_CNF, two encoders). The panel is ONE 3048-wide display
+    // driven across both links, so its decoder must be told 3048.
+    //
+    // This is the panel-side half of the "two independently transcribed
+    // DSC parameter sets, never cross-verified against each other" gap
+    // this file has flagged for a long time; sheng_mdss_verify_pipeline()
+    // cannot catch it because the PPS is a transmitted blob, not a
+    // register. Every other PPS field already agrees with the corrected
+    // encoder config: bpc 8, line_buf_depth 9, block_pred 1,
+    // convert_rgb 1, bpp 8.0, pic_height 2032, slice_height 16,
+    // slice_width 762, chunk_size 762.
+    0x11, 0x00, 0x00, 0x89, 0x30, 0x80, 0x07, 0xf0, 0x0b, 0xe8, 0x00, 0x10, 0x02, 0xfa, 0x02, 0xfa,
     0x02, 0x00, 0x02, 0x7d, 0x00, 0x20, 0x01, 0xc6, 0x00, 0x0a, 0x00, 0x0c, 0x06, 0x67, 0x04, 0x82,
     0x18, 0x00, 0x10, 0xf0, 0x03, 0x0c, 0x20, 0x00, 0x06, 0x0b, 0x0b, 0x33, 0x0e, 0x1c, 0x2a, 0x38,
     0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7b, 0x7d, 0x7e, 0x01, 0x02, 0x01, 0x00, 0x09, 0x40,
@@ -196,6 +213,12 @@ fn mmioClearBits32(base: usize, offset: usize, mask: u32) void {
 // U-Boot's global udelay(), from <time.h> -- linked in from the rest of
 // the U-Boot binary, not defined here.
 extern fn udelay(usec: c_ulong) callconv(.c) void;
+extern fn flush_dcache_range(start: usize, stop: usize) callconv(.c) void;
+
+var g_earliest_ctrl_selfcheck: u32 = 0xFFFFFFFF; // sentinel: "never ran"
+var g_status0_before_first_cmd: u32 = 0xFFFFFFFF; // sentinel: "never ran"
+var g_fifo_status_on_timeout: u32 = 0xFFFFFFFF; // sentinel: "never ran"
+var g_dln0_phy_err_on_timeout: u32 = 0xFFFFFFFF; // sentinel: "never ran"
 
 const ETIMEDOUT: c_int = -110;
 
@@ -280,6 +303,23 @@ export fn sheng_mdss_gdsc_enable(dispcc_base: usize) callconv(.c) c_int {
     udelay(1);
 
     return 0;
+}
+
+/// Mirror of gdsc_disable()'s GDSC_OFF path in gdsc.c: hand control
+/// back from hardware-trigger mode, assert SW_COLLAPSE, and wait for
+/// the logic to actually power down (~poll timeout, best-effort --
+/// unlike gdsc_poll_status(GDSC_ON) we don't have a documented "OFF"
+/// status bit offset handy, so this uses a fixed settle delay instead
+/// of polling). Used for a genuine cold-start power cycle before this
+/// driver's own setup runs, so the GDSC's logic gates initialize from
+/// true power-on defaults rather than whatever latent state ABL/XBL's
+/// own splash bring-up may have left behind -- never attempted before
+/// this pass (see SPEC.md task #5 log).
+export fn sheng_mdss_gdsc_disable(dispcc_base: usize) callconv(.c) void {
+    mmioClearBits32(dispcc_base, MDSS_GDSC_OFFSET, HW_CONTROL_MASK);
+    udelay(1);
+    mmioSetBits32(dispcc_base, MDSS_GDSC_OFFSET, SW_COLLAPSE_MASK);
+    udelay(200); // settle: let the power rail genuinely collapse
 }
 
 // --- disp_cc_pll0 (Lucid OLE alpha PLL), from clk_alpha_pll_regs[
@@ -627,7 +667,41 @@ export fn sheng_mdss_dispcc_init_no_mdp_branch(dispcc_base: usize) callconv(.c) 
     return clkBranchEnable(dispcc_base, VSYNC_CLK_CBCR);
 }
 
+// REAL GAP FOUND (SPEC.md task #5 log): sm8550.dtsi's mdss node
+// (display-subsystem@ae00000, the TOP-LEVEL MDSS wrapper block --
+// parent of both the DPU at ae01000 and the DSI hosts at ae94000/
+// ae96000, never touched anywhere in this driver before) declares
+// `resets = <&dispcc DISP_CC_MDSS_CORE_BCR>;`. msm_mdss_reset(),
+// called as the literal first thing in msm_mdss_init() -- before the
+// mdss mmio is even ioremapped, before any clock is enabled, before
+// DPU or DSI is touched at all -- asserts this reset, holds it 20ms
+// ("tests indicate reset has to be held for some period of time...
+// one frame in a typical system", its own comment), then deasserts.
+// DISP_CC_MDSS_CORE_BCR resolves (drivers/clk/qcom/dispcc-sm8550.c's
+// disp_cc_sm8550_resets table) to a single bit0 read-modify-write at
+// dispcc_base+0x8000 (Qualcomm's standard BCR/BLK_ARES convention,
+// confirmed via drivers/clk/qcom/reset.c's generic reset op). This
+// driver has never asserted/deasserted this line -- DSI_RESET
+// (offset 0x114) only resets each DSI host's OWN local state, not
+// the shared MDSS-wide block this reset line covers. Component
+// binding order in the real driver guarantees this runs before the
+// very first DSI command in every real boot; replicate that here,
+// first thing, before any DISPCC clock is even configured.
+const DISP_CC_MDSS_CORE_BCR: usize = 0x8000;
+
+fn mdssCoreBcrReset(dispcc_base: usize) void {
+    var reg = mmioRead32(dispcc_base, DISP_CC_MDSS_CORE_BCR);
+    reg |= 1;
+    mmioWrite32(dispcc_base, DISP_CC_MDSS_CORE_BCR, reg);
+    udelay(20000);
+    reg = mmioRead32(dispcc_base, DISP_CC_MDSS_CORE_BCR);
+    reg &= ~@as(u32, 1);
+    mmioWrite32(dispcc_base, DISP_CC_MDSS_CORE_BCR, reg);
+}
+
 export fn sheng_mdss_dispcc_init(dispcc_base: usize) callconv(.c) c_int {
+    mdssCoreBcrReset(dispcc_base);
+
     var ret = dispCcPll0Enable(dispcc_base);
     if (ret != 0) return ret;
 
@@ -716,6 +790,9 @@ const CMN_GLBL_DIGTOP_SPARE10: usize = 0x1ac;
 
 const CTRL_0_DIGTOP_PWRDN_B: u32 = 1 << 6;
 const CTRL_0_PLL_SHUTDOWNB: u32 = 1 << 5;
+/// bit_clk_div(1) | pix_clk_div(6) << 4 -- see the write site in
+/// dsiPhyInit() for the derivation and the live-hardware confirmation.
+const CMN_CLK_CFG0_VALUE: u32 = 0x61;
 const CLK_CFG1_BITCLK_SEL_MASK: u32 = 0x3 << 2;
 const CLK_CFG1_CLK_EN: u32 = 1 << 5;
 const CLK_CFG1_CLK_EN_SEL: u32 = 1 << 4;
@@ -927,6 +1004,28 @@ fn dsiPhyLaneSettings(phy_base: usize) void {
 /// MSM_DSI_PHY_MASTER/SLAVE. Our panel is dual-DSI split-link, so
 /// this must be called for both DSI0 (is_master=true) and DSI1
 /// (is_master=false).
+/// REAL GAP FOUND (SPEC.md task #5 log): dsi_mgr_phy_enable() in the
+/// real driver (dsi_manager.c) calls msm_dsi_host_reset_phy() on BOTH
+/// hosts before either PHY is enabled, for bonded/dual-DSI setups
+/// specifically -- its own comment: "some registers in PHY1 have been
+/// programmed during PLL0 clock's set_rate. The PHY1 reset called by
+/// host1 here will silently reset those PHY1 registers. Therefore we
+/// need to reset and enable both PHYs before any PLL clock
+/// operation." msm_dsi_host_reset_phy() itself is trivial: pulse
+/// DSI_PHY_RESET (offset 0x128, in the DSI HOST's own register block,
+/// not the PHY's -- confirmed via dsi.xml, distinct from DSI_RESET at
+/// 0x114 which resets the host's own logic) high for ~1ms then low.
+/// This driver never wrote this register at all, on either host, ever
+/// -- a genuine, sourced, dual-DSI-specific gap. Must run before
+/// sheng_mdss_dsi_phy_init() is called for either PHY.
+export fn sheng_mdss_dsi_reset_both_phys(dsi0_base: usize, dsi1_base: usize) callconv(.c) void {
+    mmioWrite32(dsi0_base, DSI_PHY_RESET, 1);
+    mmioWrite32(dsi1_base, DSI_PHY_RESET, 1);
+    udelay(1000);
+    mmioWrite32(dsi0_base, DSI_PHY_RESET, 0);
+    mmioWrite32(dsi1_base, DSI_PHY_RESET, 0);
+}
+
 export fn sheng_mdss_dsi_phy_init(dsi_phy_base: usize, is_master: bool) callconv(.c) c_int {
     // Request REFGEN READY (DSI_PHY_7NM_QUIRK_V5_2 path).
     mmioWrite32(dsi_phy_base, CMN_GLBL_DIGTOP_SPARE10, 0x1);
@@ -981,6 +1080,33 @@ export fn sheng_mdss_dsi_phy_init(dsi_phy_base: usize, is_master: bool) callconv
     // full-rate mode (dphy, not cphy)
     mmioWrite32(dsi_phy_base, CMN_CTRL_2, 0x40);
 
+    // REAL GAP FOUND (SPEC.md task #5 log): CMN_CLK_CFG0 holds the
+    // PHY's two output dividers -- dsi_pll_7nm_restore_state() writes
+    // it as `bit_clk_div | (pix_clk_div << 4)` -- and this driver
+    // declared the register but never wrote it, leaving both dividers
+    // at their hardware reset default. Byte clock was therefore right
+    // (it comes straight off the PLL, whose VCO rate was measured live
+    // and matches) while the PIXEL clock ran at the wrong divisor, so
+    // the DPU fed the DSI link several times faster than it could
+    // transmit.
+    //
+    // Measured consequence, with everything else already verified
+    // correct: DSI0 FIFO_STATUS = 0xdddd1211 while streaming --
+    // VIDEO_MDP_FIFO_OVERFLOW (bit0) set, and all four data lanes
+    // (DLN0-3) simultaneously OVERFLOW *and* UNDERFLOW, i.e. the lane
+    // FIFOs thrashing between full and empty. Classic rate mismatch,
+    // not a configuration error: STATUS0 confirmed both hosts had
+    // VIDEO_MODE_ENGINE_BUSY asserted and the whole DPU datapath read
+    // back correct.
+    //
+    // 0x61 is Linux's own live value on BOTH PHYs (read via devmem on
+    // this exact panel while DRM was driving it), and the arithmetic
+    // independently agrees: pix_clk_div = 6 gives bitclk/6 =
+    // 1,190,718,144/6 = 198,453,024 Hz, exactly dsi_get_pclk_rate()'s
+    // result for this DSC-compressed bonded-DSI mode, and exactly the
+    // standard bpp/lanes = 24/4 = 6 ratio.
+    mmioWrite32(dsi_phy_base, CMN_CLK_CFG0, CMN_CLK_CFG0_VALUE);
+
     // dsi_7nm_set_usecase(): BITCLK_SEL=0 (internal PLL) for master
     // (DSI0), =1 (external/shared PLL) for slave (DSI1).
     {
@@ -1028,10 +1154,123 @@ export fn sheng_mdss_dsi_phy_init(dsi_phy_base: usize, is_master: bool) callconv
 // source). All offsets relative to the qcom,sm8550-dsi-ctrl reg base.
 const DSI_CTRL: usize = 0x000;
 const DSI_STATUS0: usize = 0x004;
+const DSI_FIFO_STATUS: usize = 0x008;
+const DSI_DLN0_PHY_ERR: usize = 0x0b0;
 const DSI_VID_CFG0: usize = 0x00c;
+const DSI_ACTIVE_H: usize = 0x020;
+const DSI_ACTIVE_V: usize = 0x024;
+const DSI_TOTAL: usize = 0x028;
+const DSI_ACTIVE_HSYNC: usize = 0x02c;
+const DSI_ACTIVE_VSYNC_HPOS: usize = 0x030;
+const DSI_ACTIVE_VSYNC_VPOS: usize = 0x034;
 const DSI_VID_CFG1: usize = 0x010;
+/// REAL GAP FOUND (SPEC.md task #5 log): the DSI host's own compression
+/// descriptor, offset 0x29c. This driver never referenced it AT ALL --
+/// grep for "COMPRESSION" found zero hits -- so the host was never told
+/// it was carrying a DSC-compressed stream, and expected uncompressed
+/// RGB at the programmed timing.
+///
+/// That stayed invisible for as long as no pixels were actually being
+/// fetched: with CTL_FETCH_PIPE_ACTIVE unset, FIFO_STATUS read a clean
+/// 0x00001210 because nothing was flowing. The moment the fetch gate
+/// was opened, DSI0 FIFO_STATUS went to 0xdddd1219 -- VIDEO_MDP_FIFO
+/// OVERFLOW *and* UNDERFLOW plus all four lanes thrashing -- i.e. real
+/// compressed data arriving at a host configured to expect something
+/// else entirely.
+///
+/// Live value, identical on DSI0 and DSI1 (dsi.xml bitfields):
+///   WC(31:16)          = 0x05F4 = 1524 compressed bytes per line
+///   DATATYPE(13:8)     = 0x0B   = MIPI compressed pixel stream
+///   PKT_PER_LINE(7:6)  = 0
+///   EOL_BYTE_NUM(5:4)  = 0
+///   EN(0)              = 1
+/// DSI host built-in TEST PATTERN GENERATOR (SPEC.md task #5 log).
+/// msm_dsi_host_test_pattern_en() / msm_dsi_host_video_test_pattern_setup().
+///
+/// This is the decisive bisect for "is the panel receiving anything at
+/// all". The DSI host generates the video stream INTERNALLY and drives
+/// it down the lanes: no framebuffer, no SMMU, no SSPP, no layer mixer,
+/// no DSC encoder, no INTF -- the entire DPU is bypassed. It works on
+/// video-mode panels, unlike the earlier DCS ALL_PIXELS_ON attempt whose
+/// behaviour is implementation-defined on a RAM-less panel.
+///
+///   ANY visible change (checkerboard, noise, garbage, flicker)
+///     -> the DSI link physically reaches the panel and the panel
+///        reacts. The fault is then in the DPU -> DSI data path, and
+///        every register we verified identical to live silicon is
+///        genuinely fine.
+///   Still pure black
+///     -> nothing this SoC transmits reaches the panel's display,
+///        despite PHY/host registers matching working Linux exactly.
+///        That points at the panel's own power/enable state rather
+///        than anything in the display pipeline.
+///
+/// NOTE: the panel is currently in DSC mode, so TPG's uncompressed RGB
+/// will not decode into a clean checkerboard -- garbage or noise is the
+/// EXPECTED positive result here. Only pure black is the negative.
+const DSI_TEST_PATTERN_GEN_CTRL: usize = 0x158;
+const DSI_TEST_PATTERN_GEN_VIDEO_INIT_VAL: usize = 0x160;
+const DSI_TPG_MAIN_CONTROL: usize = 0x198;
+const DSI_TPG_VIDEO_CONFIG: usize = 0x1a0;
+/// CHECKERED_RECTANGLE_PATTERN (bit8)
+const TPG_MAIN_CONTROL_CHECKERED: u32 = 1 << 8;
+/// BPP = VIDEO_CONFIG_24BPP (1) | RGB (bit2)
+const TPG_VIDEO_CONFIG_VALUE: u32 = 1 | (1 << 2);
+/// VIDEO_PATTERN_SEL = VID_MDSS_GENERAL_PATTERN (3) at bits[5:4], EN bit0
+const TPG_GEN_CTRL_VALUE: u32 = (3 << 4) | 1;
+
+fn dsiTpgEnableOne(dsi_base: usize) void {
+    mmioWrite32(dsi_base, DSI_TEST_PATTERN_GEN_VIDEO_INIT_VAL, 0xff);
+    mmioWrite32(dsi_base, DSI_TPG_MAIN_CONTROL, TPG_MAIN_CONTROL_CHECKERED);
+    mmioWrite32(dsi_base, DSI_TPG_VIDEO_CONFIG, TPG_VIDEO_CONFIG_VALUE);
+    mmioWrite32(dsi_base, DSI_TEST_PATTERN_GEN_CTRL, TPG_GEN_CTRL_VALUE);
+}
+
+/// Master first, then slave -- matching msm_dsi_manager_tpg_enable()'s
+/// own explicit "if dual dsi, trigger tpg on master first then slave".
+export fn sheng_mdss_dsi_tpg_enable(dsi0_base: usize, dsi1_base: usize) callconv(.c) void {
+    // TPG DISABLED (SPEC.md task #5 log): it answered its question --
+    // pure black with the whole DPU bypassed -- and it perturbs
+    // FIFO_STATUS (drove it to 0x55551210), which is now the primary
+    // instrument. Kept compiled for future use.
+    if (true) return;
+    dsiTpgEnableOne(dsi0_base);
+    dsiTpgEnableOne(dsi1_base);
+}
+
+/// BISECT (SPEC.md task #5 log): stage NO pipe into either mixer, so
+/// the mixers emit border colour and the DPU produces a frame with ZERO
+/// memory fetch -- while DSC, INTF and DSI stay exactly as configured.
+///
+/// Live working Linux reads FIFO_STATUS = 0x00001210 (lanes FED). Our
+/// current build reads 0x11111210, differing only in the four
+/// DLN*_HS_FIFO_EMPTY bits: our lanes are STARVED. Everything between
+/// framebuffer and lane verifies bit-identical to live, so the open
+/// question is whether SSPP is actually fetching at all.
+///
+///   border-only FIFO_STATUS == 0x00001210 (lanes fed)
+///     -> the DPU->DSC->INTF->DSI path is healthy and the starvation
+///        comes from the SSPP fetch (memory/SMMU), not the pipeline.
+///   border-only still 0x1111xxxx (lanes starved)
+///     -> the starvation is downstream of the mixer and has nothing to
+///        do with the framebuffer or SMMU at all.
+///
+/// Needs no visible colour to be conclusive: FIFO_STATUS carries the
+/// answer either way.
+const DPU_BORDER_ONLY_BISECT: bool = false;
+
+const DSI_VIDEO_COMPRESSION_MODE_CTRL: usize = 0x29c;
+const VIDEO_COMPRESSION_MODE_CTRL_VALUE: u32 = 0x05F40B01;
 const DSI_DMA_BASE: usize = 0x044;
 const DSI_DMA_LEN: usize = 0x048;
+const DSI_CMD_DMA_CTRL: usize = 0x038;
+const DSI_LP_TIMER_CTRL: usize = 0x0b4;
+const DSI_HS_TIMER_CTRL: usize = 0x0b8;
+const DSI_CMD_CFG0: usize = 0x03c;
+const DSI_CMD_CFG1: usize = 0x040;
+const DSI_CMD_MODE_MDP_CTRL2: usize = 0x1b4;
+const DSI_ACK_ERR_STATUS: usize = 0x064;
+const DSI_TIMEOUT_STATUS: usize = 0x0bc;
 const DSI_TRIG_CTRL: usize = 0x080;
 const DSI_TRIG_DMA: usize = 0x08c;
 const DSI_LANE_CTRL: usize = 0x0a8;
@@ -1040,6 +1279,25 @@ const DSI_CLKOUT_TIMING_CTRL: usize = 0x0c0;
 const DSI_EOT_PACKET_CTRL: usize = 0x0c8;
 const DSI_CLK_CTRL: usize = 0x118;
 const DSI_RESET: usize = 0x114;
+const DSI_PHY_RESET: usize = 0x128; // confirmed in dsi.xml, distinct from DSI_RESET -- resets the *connected PHY*, not the host's own logic
+const DSI_RDBK_DATA0: usize = 0x068; // RDBK array, stride 4, entries 0-3
+const DSI_RDBK_DATA_CTRL: usize = 0x1d0;
+const RDBK_DATA_CTRL_CLR: u32 = 1 << 0;
+
+// Confirmed via real dsi.xml (registers/display/dsi.xml) at offsets 0x108/
+// 0x10c. dsi_ctrl_enable() writes ERR_INT_MASK0 + sets INTR_CTRL's
+// MASK_ERROR bit once at bring-up; msm_dsi_host_xfer_prepare()/
+// msm_dsi_host_cmd_xfer_commit() set/clear INTR_CTRL's MASK_CMD_DMA_DONE
+// bit around every single command DMA, which our driver never touched at
+// all before. Real IP designs sometimes gate internal completion-status
+// latching behind the same enable used for the IRQ line, so this is worth
+// testing even though STATUS0 is expected to be a live combinatorial
+// status independent of masking.
+const DSI_ERR_INT_MASK0: usize = 0x108;
+const DSI_INTR_CTRL: usize = 0x10c;
+const DSI_IRQ_MASK_CMD_DMA_DONE: u32 = 1 << 1;
+const DSI_IRQ_MASK_ERROR: u32 = 1 << 25;
+const DSI_ERR_INT_MASK0_VALUE: u32 = 0x13ff3fe0;
 
 // STOLEN OUTPUT, NOT RECOMPUTED (SPEC.md task #5 log): rather than port
 // dsi_host.c's dsi_ctrl_enable() field-by-field (several fields turned
@@ -1055,13 +1313,119 @@ const DSI_RESET: usize = 0x114;
 // dual-link panel. Confirmed real DST_FORMAT is RGB666 (1), not
 // RGB888 (3) as originally assumed -- DSC changes the wire packing
 // format regardless of the source pixel depth.
-const VID_CFG0_VALUE: u32 = 0x00001210;
-const VID_CFG1_VALUE: u32 = 0x02009230;
-const LANE_CTRL_VALUE: u32 = 0x00001F00;
-const LANE_SWAP_CTRL_VALUE: u32 = 0x01000000;
-const CLKOUT_TIMING_CTRL_VALUE: u32 = 0x00000001;
-const EOT_PACKET_CTRL_VALUE: u32 = 0x010F0F08;
-const TRIG_CTRL_VALUE: u32 = 0x001C1A02;
+// RE-STOLEN (SPEC.md task #5 log): every value below was originally
+// captured via devmem at the UNSHIFTED address (base+offset), before
+// the DSI_6G_REG_SHIFT discovery -- meaning every one of them was
+// actually reading whatever register sits one slot before the intended
+// one (SM8550_MDSS_DSI0/1_BASE now bakes in the +4 shift, matching the
+// real driver's ctrl_base). Re-captured live at the CORRECT address
+// (base+4+offset) after the shift fix. Every single value changed.
+const VID_CFG0_VALUE: u32 = 0x02009230;
+const VID_CFG1_VALUE: u32 = 0x31211101;
+const LANE_CTRL_VALUE: u32 = 0x01000000;
+const LANE_SWAP_CTRL_VALUE: u32 = 0x00000000;
+const CLKOUT_TIMING_CTRL_VALUE: u32 = 0x00001A23;
+const EOT_PACKET_CTRL_VALUE: u32 = 0x00000001;
+// Live-confirmed, identical on DSI0/DSI1. dsi.xml's documented
+// bitfields for this register (FROM_FRAME_BUFFER|LOW_POWER, bits
+// 26/28) don't match this value at all -- same incomplete-header
+// situation as LANE_SWAP_CTRL/EOT_PACKET_CTRL, using the live value
+// directly rather than a computed one that's demonstrably wrong.
+const CMD_DMA_CTRL_VALUE: u32 = 0x14000000; // re-stolen post-shift-fix, see VID_CFG0_VALUE's comment
+
+// REAL GAP FOUND (SPEC.md task #5 log): LP_TIMER_CTRL's BTA_TO field
+// (bits 16-31) is the DSI host's own bus-turnaround timeout -- if this
+// is 0 (or any value too short for the panel's actual response time),
+// the host's BTA receive window closes before the panel's physical
+// response ever arrives, and the host reports the transaction as
+// complete with 0 bytes captured -- exactly matching every symptom in
+// this project's own live BTA test. Neither the real Linux driver nor
+// this driver has ever written LP_TIMER_CTRL/HS_TIMER_CTRL -- Linux
+// simply inherits whatever ABL/firmware left behind. Live-confirmed
+// nonzero (0x00088888/0xFFFFFFFF, identical DSI0/DSI1) on a working
+// boot -- but this driver's own DSI_RESET pulse (added earlier this
+// session) could plausibly reset these specific timer registers back
+// to an unusable hardware POR default (most likely 0) before we ever
+// read them, and there's no way to observe U-Boot's own register
+// state mid-boot to check. Writing these explicitly removes that
+// uncertainty entirely rather than assuming the reset leaves them
+// alone.
+const LP_TIMER_CTRL_VALUE: u32 = 0xFFFFFFFF; // re-stolen post-shift-fix
+const HS_TIMER_CTRL_VALUE: u32 = 0x0000FFFF; // re-stolen post-shift-fix
+
+// MOST CONSEQUENTIAL GAP FOUND (SPEC.md task #5 log): dsi_ctrl_enable()
+// in the real driver has an `if (VIDEO) {...} else { /* command mode
+// */ ... }` split. Every fix made to this register set before now only
+// ever ported the VIDEO-mode half (VID_CFG0/VID_CFG1). The COMMAND-
+// MODE half -- CMD_CFG0, CMD_CFG1, CMD_MODE_MDP_CTRL2 -- is taken every
+// time the host is in command mode, i.e. for 100% of this driver's DCS
+// traffic (the entire init sequence, Exit Sleep, Display On, the test
+// patch, every BTA read this whole project has ever attempted) and was
+// NEVER PORTED AT ALL. CMD_CFG1's INSERT_DCS_COMMAND bit in particular
+// is what tells the command-mode engine to actually frame the DCS
+// command byte the way this driver's own buildMsmCmdPacket() assumes
+// -- without it, the hardware's own command-mode packet framing may
+// not match what we're constructing in software at all. Live-verified
+// values, identical DSI0/DSI1.
+const CMD_CFG0_VALUE: u32 = 0x06100006; // re-stolen post-shift-fix
+const CMD_CFG1_VALUE: u32 = 0x00003C2C; // re-stolen post-shift-fix
+const CMD_MODE_MDP_CTRL2_VALUE: u32 = 0x00000006; // re-stolen post-shift-fix
+
+// REAL GAP FOUND (SPEC.md task #5 log): dsi_timing_setup() in the real
+// driver -- called from msm_dsi_host_power_on() BEFORE dsi_sw_reset()/
+// dsi_ctrl_enable(), i.e. before VID_CFG0 is ever written -- programs
+// an entire DSI-HOST-side timing register block (ACTIVE_H/V, TOTAL,
+// ACTIVE_HSYNC, ACTIVE_VSYNC_HPOS/VPOS) that this driver never touched
+// at all. This is separate from the DPU-side INTF_ACTIVE_HCTL/etc we
+// already write -- the DSI host's own packetizer needs its own active-
+// window config independent of the DPU INTF timing generator that
+// drives it. The real formula involves a DSC-adjusted pclk-cycle count
+// (h_total -= hdisplay; hdisplay = DIV_ROUND_UP(bytes_per_line*8,
+// bits_per_pclk); h_total += hdisplay -- dependent on wide_bus_enabled,
+// which wasn't traced) -- rather than risk a subtly wrong recomputation
+// (the exact class of bug that already bit VID_CFG0/LANE_CTRL earlier
+// in this project), these are the exact live register values read
+// directly off this same hardware via devmem while Linux's own working
+// driver had it configured, identical on both DSI0 and DSI1.
+const ACTIVE_H_VALUE: u32 = 0x022C0030; // re-stolen post-shift-fix
+const ACTIVE_V_VALUE: u32 = 0x087C008C; // re-stolen post-shift-fix
+const TOTAL_VALUE: u32 = 0x08950272; // re-stolen post-shift-fix
+const ACTIVE_HSYNC_VALUE: u32 = 0x00020000; // re-stolen post-shift-fix
+const ACTIVE_VSYNC_HPOS_VALUE: u32 = 0x00000000; // re-stolen post-shift-fix
+const ACTIVE_VSYNC_VPOS_VALUE: u32 = 0x00020000; // re-stolen post-shift-fix
+const TRIG_CTRL_VALUE: u32 = 0x80001004; // re-stolen post-shift-fix
+
+/// TRIG_CTRL for the panel-INIT phase only (SPEC.md task #5 log).
+///
+/// TRIG_CTRL_VALUE above is a faithful copy of Linux's live register:
+/// TE(31) | BLOCK_DMA_WITHIN_FRAME(12) | DMA_TRIGGER(SW). Faithful --
+/// and, in U-Boot's context, self-defeating. dsi_host.c's own comment
+/// at msm_dsi_host_xfer_prepare() spells out what bit12 does:
+///
+///   "Since DSI6G v1.2.0, we can set DSI_TRIG_CTRL.BLOCK_DMA_WITHIN_
+///    FRAME to ask H/W to wait until cmd mdp is idle. S/W wait is not
+///    needed."
+///
+/// It is a HARDWARE INTERLOCK gating the command DMA engine on the
+/// MDP/DPU pixel path's frame state. Linux may set it because by the
+/// time it sends panel commands the DPU is fully up and streaming, so
+/// the inter-frame window it waits for opens continuously. In this
+/// driver the DPU has never been started when panel init runs --
+/// dpu_start() is called only AFTER sheng_mdss_dsi_panel_init()
+/// returns. Nothing is generating frames, so the window never opens.
+/// Likewise TE(31) ("always assume dedicated TE pin") points the block
+/// at a tear-effect signal an uninitialised panel is not pulsing.
+///
+/// A DMA engine told to wait for a frame boundary nobody is producing
+/// asserts CMD_MODE_DMA_BUSY and holds it forever -- which is exactly
+/// and only the symptom seen on every boot of this driver. Every
+/// register-content theory chased so far compared our values against
+/// Linux's and found them identical; the bug was never a wrong value,
+/// it was a right value copied into a context where its precondition
+/// (a live MDP) does not hold.
+///
+/// Software-trigger-only: no TE dependency, no frame-window wait.
+const TRIG_CTRL_CMD_INIT_VALUE: u32 = TRIG_CTRL_DMA_TRIGGER_SW;
 
 const CTRL_ENABLE: u32 = 1 << 0;
 const CTRL_VID_MODE_EN: u32 = 1 << 1;
@@ -1081,12 +1445,138 @@ const CTRL_ALL_LANES: u32 = 0xf << 4;
 
 fn dsiHostBringUp(dsi_base: usize) void {
     mmioWrite32(dsi_base, DSI_CLK_CTRL, CLK_CTRL_ENABLE_CLKS);
-    mmioWrite32(dsi_base, DSI_CTRL, CTRL_CLK_EN | CTRL_ALL_LANES | CTRL_CMD_MODE_EN | CTRL_ENABLE);
+
+    // REAL GAP FOUND (SPEC.md task #5 log): dsi_sw_reset() in the real
+    // driver -- called from msm_dsi_host_power_on() as
+    // dsi_timing_setup() -> dsi_sw_reset() -> dsi_ctrl_enable(), i.e.
+    // right here, between enabling DSI_CLK_CTRL and writing DSI_CTRL
+    // -- pulses DSI_RESET (offset 0x114, bit 0) high for
+    // DSI_RESET_TOGGLE_DELAY_MS=20ms then low, explicitly because "dsi
+    // controller can only be reset while clocks are running" (its own
+    // comment). This driver had DSI_RESET's offset defined as a
+    // constant since early in the project but never actually wrote to
+    // it anywhere -- dead code, the pulse itself was never sent. Forces
+    // the DSI host's internal state machine to a genuine POR state
+    // before any config register is written, instead of configuring on
+    // top of whatever state ABL's own splash bring-up (or this exact
+    // same controller's prior use) left behind.
+    mmioWrite32(dsi_base, DSI_RESET, 1);
+    udelay(20000); // mdelay() is a U-Boot macro, not linkable -- see other udelay() call sites in this file
+    mmioWrite32(dsi_base, DSI_RESET, 0);
+
+    // STICKY STATUS CLEAR TEST (SPEC.md task #5 log): force-clear any
+    // residual W1C status/error bits ABL or a prior stage may have left
+    // set, before any command traffic. If the command DMA state machine
+    // treats an uncleared completion/error flag as "still active,"
+    // triggering a new transaction on top of it could explain a clean-
+    // FIFO, clean-PHY-error, permanently-busy hang.
+    mmioWrite32(dsi_base, DSI_ACK_ERR_STATUS, 0xFFFFFFFF);
+    mmioWrite32(dsi_base, DSI_TIMEOUT_STATUS, 0xFFFFFFFF);
+
+    // EARLIEST-POSSIBLE self-check (SPEC.md task #5 log): the original
+    // self-check ran late, after the entire 87-command init sequence,
+    // Sleep Out, Display On, and the test patch had already been
+    // attempted -- if those all silently failed because CTRL's mode
+    // bits never latched, the controller could have drifted into a
+    // DIFFERENT stuck state by the time that self-check ran, which
+    // wouldn't prove whether the very first write, immediately after
+    // reset, also fails. Test that specifically, before anything else
+    // touches the controller. DSI0 only (g_earliest_ctrl_selfcheck is
+    // a single global slot).
+    if (dsi_base == 0x0ae94000) {
+        const probe_val: u32 = 0xC3C3C3C3;
+        mmioWrite32(dsi_base, DSI_CTRL, probe_val);
+        g_earliest_ctrl_selfcheck = mmioRead32(dsi_base, DSI_CTRL);
+    }
+
+    // PHASE SPLIT TEST (SPEC.md task #5 log): the real driver's
+    // dsi_ctrl_enable() writes ONLY CLK_EN | <lane bits> | ENABLE here
+    // -- CMD_MODE_EN/VID_MODE_EN are never part of this write. Mode
+    // selection happens separately, later, via dsi_op_mode_config()'s
+    // own read-modify-write (see the CTRL_CMD_MODE_EN write at the end
+    // of this function). The two approaches are functionally
+    // equivalent in final register content (same bits, different
+    // write count) and don't explain the write-rejection anomaly found
+    // on this exact register (a write-then-immediate-read self-check
+    // showed 0 bits landing at all, including on a garbage test
+    // pattern unrelated to any real driver value) -- but matching the
+    // real driver's exact phase ordering costs nothing and rules out
+    // any sequencing-dependent hardware behavior this register might
+    // have that source-reading alone can't reveal.
+    mmioWrite32(dsi_base, DSI_CTRL, CTRL_CLK_EN | CTRL_ALL_LANES | CTRL_ENABLE);
+
+    // REAL GAP FOUND (SPEC.md task #5 log): dsi_ctrl_enable() in the
+    // real driver writes LANE_SWAP_CTRL/LANE_CTRL unconditionally,
+    // before ANY command-mode traffic -- this driver only wrote them
+    // in dsiHostSwitchToVideoMode(), which runs AFTER the entire DCS
+    // init sequence, Exit Sleep, Display On, and every BTA read this
+    // whole project has ever attempted. The target values themselves
+    // were already correct (stolen from live hardware, confirmed
+    // identical again via a live re-check) -- this was a pure
+    // ordering bug: every single command-mode transaction this driver
+    // has ever sent went out before the lane config it needed was
+    // ever applied. CMD_DMA_CTRL (offset 0x038) was never written at
+    // all anywhere in this driver -- also unconditional in the real
+    // dsi_ctrl_enable(), also live-confirmed (its dsi.xml bitfield
+    // description is incomplete, matching this project's established
+    // pattern for this register family -- using the live value
+    // directly rather than the incomplete computed one).
+    mmioWrite32(dsi_base, DSI_LANE_SWAP_CTRL, LANE_SWAP_CTRL_VALUE);
+    mmioWrite32(dsi_base, DSI_LANE_CTRL, LANE_CTRL_VALUE);
+    mmioWrite32(dsi_base, DSI_CMD_DMA_CTRL, CMD_DMA_CTRL_VALUE);
+
+    // BISECTION TEST (SPEC.md task #5 log): a genuine DMA timeout on
+    // the very first command appeared after the DSI 6G shift fix +
+    // re-stolen values. Temporarily removing these 5 writes (all
+    // added earlier this same session, all previously untested in
+    // combination with the shift fix) to isolate whether one of them
+    // is the new cause. Re-add once isolated.
+    // mmioWrite32(dsi_base, DSI_LP_TIMER_CTRL, LP_TIMER_CTRL_VALUE);
+    // mmioWrite32(dsi_base, DSI_HS_TIMER_CTRL, HS_TIMER_CTRL_VALUE);
+    // mmioWrite32(dsi_base, DSI_CMD_CFG0, CMD_CFG0_VALUE);
+    // mmioWrite32(dsi_base, DSI_CMD_CFG1, CMD_CFG1_VALUE);
+    // mmioWrite32(dsi_base, DSI_CMD_MODE_MDP_CTRL2, CMD_MODE_MDP_CTRL2_VALUE);
+
     // Real live value (see VID_CFG0_VALUE's comment) -- our previous
     // TRIG_CTRL_TE|TRIG_CTRL_DMA_TRIGGER_SW guess (0x80000004) was very
     // different from what's actually programmed on working hardware
     // (0x001C1A02).
-    mmioWrite32(dsi_base, DSI_TRIG_CTRL, TRIG_CTRL_VALUE);
+    // Command-init variant, NOT the live-Linux value -- see
+    // TRIG_CTRL_CMD_INIT_VALUE's comment. Restored to TRIG_CTRL_VALUE
+    // by sheng_mdss_dsi_trig_ctrl_restore() once the panel is up and
+    // the DPU is about to start driving frames.
+    mmioWrite32(dsi_base, DSI_TRIG_CTRL, TRIG_CTRL_CMD_INIT_VALUE);
+
+    // Phase 2: mode selection, matching dsi_op_mode_config()'s own
+    // read-modify-write -- CMD_MODE_EN added only now, after every
+    // other config register above is already in place.
+    var ctrl_mode = mmioRead32(dsi_base, DSI_CTRL);
+    ctrl_mode |= CTRL_CMD_MODE_EN | CTRL_ENABLE;
+    mmioWrite32(dsi_base, DSI_CTRL, ctrl_mode);
+
+    // DIAGNOSTIC (SPEC.md task #5 log): capture STATUS0 right here,
+    // before any command has ever been triggered, to check whether
+    // CMD_MODE_DMA_BUSY (bit1) is already stuck set -- now that CTRL/
+    // CLK_CTRL genuinely take effect for the first time (previously
+    // landing on the wrong, inert register), this may be the first
+    // time "busy" has ever reflected real hardware state. DSI0 only.
+    if (dsi_base == 0x0ae94004) {
+        g_status0_before_first_cmd = mmioRead32(dsi_base, DSI_STATUS0);
+    }
+
+    // REAL GAP FOUND (SPEC.md task #5 log): dsi_ctrl_enable() in the
+    // real driver unconditionally writes ERR_INT_MASK0 (offset 0x108,
+    // confirmed via registers/display/dsi.xml) and sets INTR_CTRL's
+    // (0x10c) MASK_ERROR bit (bit25) before any command traffic --
+    // this driver never wrote either register at all. Unlikely to be
+    // the CMD_MODE_DMA_BUSY hang itself (STATUS0 is expected to be a
+    // live combinatorial status independent of IRQ masking on this
+    // class of IP), but it's a real, sourced, zero-risk gap worth
+    // closing rather than leaving unexamined.
+    mmioWrite32(dsi_base, DSI_ERR_INT_MASK0, DSI_ERR_INT_MASK0_VALUE);
+    var intr_ctrl = mmioRead32(dsi_base, DSI_INTR_CTRL);
+    intr_ctrl |= DSI_IRQ_MASK_ERROR;
+    mmioWrite32(dsi_base, DSI_INTR_CTRL, intr_ctrl);
 }
 
 /// Switch the DSI host from command mode (used for the panel init DCS
@@ -1104,6 +1594,19 @@ fn dsiHostSwitchToVideoMode(dsi_base: usize) void {
     // incrementing) but the controller never knew how to actually
     // transmit it -- explaining "frames counted, nothing visible"
     // regardless of DSC on/off, since this gap exists either way.
+    // dsi_timing_setup() in the real driver runs before dsi_ctrl_enable()
+    // -- see ACTIVE_H_VALUE's comment. Written first here to match.
+    mmioWrite32(dsi_base, DSI_ACTIVE_H, ACTIVE_H_VALUE);
+    mmioWrite32(dsi_base, DSI_ACTIVE_V, ACTIVE_V_VALUE);
+    mmioWrite32(dsi_base, DSI_TOTAL, TOTAL_VALUE);
+    mmioWrite32(dsi_base, DSI_ACTIVE_HSYNC, ACTIVE_HSYNC_VALUE);
+    mmioWrite32(dsi_base, DSI_ACTIVE_VSYNC_HPOS, ACTIVE_VSYNC_HPOS_VALUE);
+    mmioWrite32(dsi_base, DSI_ACTIVE_VSYNC_VPOS, ACTIVE_VSYNC_VPOS_VALUE);
+
+    // Tell the host it is carrying a compressed stream BEFORE enabling
+    // the video engine -- see DSI_VIDEO_COMPRESSION_MODE_CTRL's comment.
+    mmioWrite32(dsi_base, DSI_VIDEO_COMPRESSION_MODE_CTRL, VIDEO_COMPRESSION_MODE_CTRL_VALUE);
+
     mmioWrite32(dsi_base, DSI_VID_CFG0, VID_CFG0_VALUE);
     mmioWrite32(dsi_base, DSI_VID_CFG1, VID_CFG1_VALUE);
     mmioWrite32(dsi_base, DSI_LANE_SWAP_CTRL, LANE_SWAP_CTRL_VALUE);
@@ -1157,18 +1660,375 @@ fn buildMsmCmdPacket(buf: []u8, cmd: u8, args: []const u8) usize {
 /// Commits DMA_BASE/DMA_LEN and fires TRIG_DMA on one DSI host, then
 /// waits for CMD_MODE_DMA_BUSY to clear -- msm_dsi_host_cmd_xfer_commit()
 /// + dsi_cmd_dma_tx()'s completion wait, polled instead of IRQ-driven.
+///
+/// REAL GAP FOUND (SPEC.md task #5 log): every caller writes the DCS
+/// packet into dma_scratch via plain CPU stores (through a `volatile`
+/// pointer, which only stops the compiler from eliding/reordering the
+/// writes -- it does nothing for the CPU's actual data cache), then
+/// this function immediately triggers the DSI DMA engine, which reads
+/// directly from physical DRAM and is NOT cache-coherent with the CPU.
+/// sheng_mdss.c's own framebuffer fill already calls
+/// flush_dcache_range() before the SSPP's DMA fetch for exactly this
+/// reason -- the identical requirement was simply never applied to the
+/// DSI command DMA path. Without it, the DSI engine can transmit
+/// whatever stale/garbage bytes happen to physically be in DRAM,
+/// compute a valid CRC over that garbage, and send a well-formed-but-
+/// meaningless packet -- explaining a panel that silently drops every
+/// command (matches the zero-byte BTA result) while every register
+/// configuration checks out correct, because the packet content itself
+/// was never valid to begin with. __asm_flush_dcache_range() ends with
+/// its own dsb internally (see arch/arm/cpu/armv8/cache_v8.c), so no
+/// separate barrier call is needed here.
 fn dsiCmdDmaTxOne(dsi_base: usize, dma_addr: usize, len: usize) c_int {
-    mmioWrite32(dsi_base, DSI_DMA_BASE, @truncate(dma_addr));
+    dsiCmdDmaTrigger(dsi_base, dma_addr, len);
+    return dsiCmdDmaWait(dsi_base);
+}
+
+var g_pretrigger_snapshot_done: bool = false;
+var g_snap_ctrl: u32 = 0xFFFFFFFF;
+var g_snap_lane_swap: u32 = 0xFFFFFFFF;
+var g_snap_lane_ctrl: u32 = 0xFFFFFFFF;
+var g_snap_cmd_dma_ctrl: u32 = 0xFFFFFFFF;
+var g_snap_cmd_cfg0: u32 = 0xFFFFFFFF;
+var g_snap_cmd_cfg1: u32 = 0xFFFFFFFF;
+var g_snap_trig_ctrl: u32 = 0xFFFFFFFF;
+var g_snap_clk_ctrl: u32 = 0xFFFFFFFF;
+
+fn dsiCmdDmaTrigger(dsi_base: usize, dma_addr: usize, len: usize) void {
+    // FORENSIC PRE-TRIGGER SNAPSHOT (SPEC.md task #5 log): captured
+    // exactly once, DSI0 only, at the very first TRIG_DMA this driver
+    // ever fires -- the exact moment requested for direct comparison
+    // against Linux's live values (CMD_DMA_CTRL=0x00020000 expected --
+    // note: real logical offset, not the physical-unshifted 0x038 the
+    // request used; LANE_CTRL=0x01000000 at this exact register post-
+    // shift-fix, not the older 0x00001F00 pre-fix value).
+    if (!g_pretrigger_snapshot_done and dsi_base == 0x0ae94004) {
+        g_snap_ctrl = mmioRead32(dsi_base, DSI_CTRL);
+        g_snap_lane_swap = mmioRead32(dsi_base, DSI_LANE_SWAP_CTRL);
+        g_snap_lane_ctrl = mmioRead32(dsi_base, DSI_LANE_CTRL);
+        g_snap_cmd_dma_ctrl = mmioRead32(dsi_base, DSI_CMD_DMA_CTRL);
+        g_snap_cmd_cfg0 = mmioRead32(dsi_base, DSI_CMD_CFG0);
+        g_snap_cmd_cfg1 = mmioRead32(dsi_base, DSI_CMD_CFG1);
+        g_snap_trig_ctrl = mmioRead32(dsi_base, DSI_TRIG_CTRL);
+        g_snap_clk_ctrl = mmioRead32(dsi_base, DSI_CLK_CTRL);
+        g_pretrigger_snapshot_done = true;
+    }
+
+    // REAL GAP FOUND (SPEC.md task #5 log): msm_dsi_host_xfer_prepare()/
+    // msm_dsi_host_cmd_xfer_commit() set INTR_CTRL's MASK_CMD_DMA_DONE
+    // bit (bit1) before every single command DMA and clear it after
+    // (msm_dsi_host_xfer_restore()) -- never done anywhere in this
+    // driver before. Replicated here per-trigger since this function is
+    // the real driver's cmd_xfer_commit equivalent; the wait side clears
+    // it in dsiCmdDmaWait().
+    var intr_ctrl_pre = mmioRead32(dsi_base, DSI_INTR_CTRL);
+    intr_ctrl_pre |= DSI_IRQ_MASK_CMD_DMA_DONE;
+    mmioWrite32(dsi_base, DSI_INTR_CTRL, intr_ctrl_pre);
+
+    flush_dcache_range(dma_addr, dma_addr + ((len + 63) & ~@as(usize, 63)));
+
+    // NEVER-VERIFIED ASSUMPTION (SPEC.md task #5 log): every theory so
+    // far has assumed the DCS packet bytes actually EXIST in physical
+    // DRAM at dma_addr. That has never once been proven. The scratch
+    // buffer was moved to the HIGH DRAM bank (0x8bb500000) this session
+    // purely on the strength of /proc/iomem -- if U-Boot's own mem_map
+    // doesn't cover that bank (build_mem_map() only maps what the
+    // previous bootloader handed over in gd->dram[]), or if it maps it
+    // somewhere unexpected, the CPU stores land nowhere real and the
+    // DSI engine fetches whatever garbage is physically there. Read the
+    // first 8 bytes straight back HERE, immediately after the flush --
+    // flush_dcache_range() is dc civac (clean AND invalidate), so this
+    // read misses the now-invalidated line and pulls a fresh copy from
+    // physical DRAM. Expected for command #0: byte0=0xFF, byte1=0x26,
+    // byte2=0x15 (DCS short write, 1 param), byte3=0x80 (VC0 + ECC).
+    if (!g_dmabuf_diag_done and dsi_base == 0x0ae94004) {
+        const src: [*]volatile u8 = @ptrFromInt(dma_addr);
+        var rb: u64 = 0;
+        var b: usize = 0;
+        while (b < 8) : (b += 1) rb |= @as(u64, src[b]) << @intCast(b * 8);
+        g_dmabuf_readback = rb;
+        g_dmabuf_diag_done = true;
+    }
+
+    // REAL GAP FOUND (SPEC.md task #5 log): DMA_BASE is a plain 32-bit
+    // register (dsi.xml's reg32) and this driver's scratch buffer now
+    // lives in the HIGH DRAM bank (SHENG_MDSS_DSI_DMA_SCRATCH_PHYS,
+    // 0x8bb500000 -- a 35-bit address, impossible to express in 32
+    // bits at all). Write the SMMU-mapped IOVA instead of the raw
+    // physical pointer -- smmuBypassMdssStream() builds a real 3-level
+    // page-table entry translating SMMU_MAPPED_IOVA (0x1000, matching
+    // Linux's own live, proven-working IOVA choice exactly) to this
+    // exact physical buffer.
+    const iova: usize = SMMU_MAPPED_IOVA + (dma_addr - @as(usize, @intCast(SHENG_MDSS_DSI_DMA_SCRATCH_PHYS)));
+    if (!g_iova_diag_done and dsi_base == 0x0ae94004) {
+        g_iova_written = @truncate(iova);
+        g_iova_dma_addr = dma_addr;
+        g_iova_l3_readback = smmu_l3_table[1];
+        g_iova_diag_done = true;
+    }
+    mmioWrite32(dsi_base, DSI_DMA_BASE, @truncate(iova));
     mmioWrite32(dsi_base, DSI_DMA_LEN, @truncate(len));
     mmioWrite32(dsi_base, DSI_TRIG_DMA, 1);
+}
 
+var g_dmabuf_diag_done: bool = false;
+var g_dmabuf_readback: u64 = 0xDEADDEADDEADDEAD;
+
+/// First 8 bytes read back out of physical DRAM at the DMA scratch
+/// address, immediately after the clean+invalidate. See the comment at
+/// the read site. 0x...8015_26FF (little-endian byte0=0xFF) means the
+/// packet is genuinely in DRAM and the DSI engine is fetching real
+/// data; anything else (0, 0xFFFFFFFF, junk) means every register-level
+/// theory chased so far was investigating the wrong layer entirely.
+export fn sheng_mdss_dmabuf_diag() callconv(.c) i64 {
+    return @bitCast(g_dmabuf_readback);
+}
+
+var g_iova_diag_done: bool = false;
+var g_iova_written: u32 = 0xFFFFFFFF;
+var g_iova_dma_addr: usize = 0;
+var g_iova_l3_readback: u64 = 0;
+
+export fn sheng_mdss_iova_diag1() callconv(.c) i64 {
+    // high32 = the actual DMA_BASE value written (should be near 0x1000);
+    // low32 = truncated dma_addr passed in (sanity check it's our scratch phys)
+    const dma_addr_low: u32 = @truncate(g_iova_dma_addr);
+    return (@as(i64, g_iova_written) << 32) | @as(i64, dma_addr_low);
+}
+export fn sheng_mdss_iova_diag2() callconv(.c) i64 {
+    return @bitCast(g_iova_l3_readback);
+}
+
+fn dsiCmdDmaWait(dsi_base: usize) c_int {
     var waited: u32 = 0;
     while (waited < DMA_BUSY_POLL_TIMEOUT_US) : (waited += 10) {
         const status = mmioRead32(dsi_base, DSI_STATUS0);
-        if ((status & STATUS0_CMD_MODE_DMA_BUSY) == 0) return 0;
+        if ((status & STATUS0_CMD_MODE_DMA_BUSY) == 0) {
+            var intr_ctrl_post = mmioRead32(dsi_base, DSI_INTR_CTRL);
+            intr_ctrl_post &= ~DSI_IRQ_MASK_CMD_DMA_DONE;
+            mmioWrite32(dsi_base, DSI_INTR_CTRL, intr_ctrl_post);
+            return 0;
+        }
         udelay(10);
     }
+    // DIAGNOSTIC (SPEC.md task #5 log): capture FIFO_STATUS/DLN0_PHY_ERR
+    // at the moment of a genuine timeout, DSI0 only -- these weren't
+    // covered by the earlier err_status diagnostic (ACK_ERR_STATUS/
+    // TIMEOUT_STATUS only) and are the most direct place to see WHY a
+    // real DMA transaction never completes.
+    if (dsi_base == 0x0ae94004) {
+        g_fifo_status_on_timeout = mmioRead32(dsi_base, DSI_FIFO_STATUS);
+        g_dln0_phy_err_on_timeout = mmioRead32(dsi_base, DSI_DLN0_PHY_ERR);
+    }
+    var intr_ctrl_post = mmioRead32(dsi_base, DSI_INTR_CTRL);
+    intr_ctrl_post &= ~DSI_IRQ_MASK_CMD_DMA_DONE;
+    mmioWrite32(dsi_base, DSI_INTR_CTRL, intr_ctrl_post);
     return ETIMEDOUT;
+}
+
+/// REAL GAP FOUND (SPEC.md task #5 log): msm_dsi_host_cmd_xfer_commit()
+/// in the real driver is fire-and-forget -- writes DMA_BASE/DMA_LEN/
+/// TRIG_DMA and returns immediately, with no busy-poll. msm_dsi_manager
+/// _cmd_xfer_trigger() calls it twice back-to-back (DSI1 then DSI0),
+/// so both DMA engines are triggered cycles apart and run genuinely in
+/// parallel -- the wait/completion happens separately, AFTER both are
+/// already triggered. dsiCmdDmaTxOne() (used for every command this
+/// driver has ever sent) is blocking: it polls CMD_MODE_DMA_BUSY to
+/// completion before returning, so calling it twice in sequence
+/// (dsi1 then dsi0) actually serializes the physical transmission --
+/// DSI1 completes its entire burst and returns to LP-11 before DSI0
+/// even starts. For a stitched dual-DSI panel expecting synchronized
+/// SOT across both links, that time gap could be exactly what causes
+/// the DDIC to see a desync and silently abort. This function
+/// replicates the real driver's trigger-both-then-wait-both ordering.
+fn dsiCmdDmaTxDual(dsi0_base: usize, dsi1_base: usize, dma_addr: usize, len: usize) c_int {
+    dsiCmdDmaTrigger(dsi1_base, dma_addr, len);
+    dsiCmdDmaTrigger(dsi0_base, dma_addr, len);
+
+    const ret1 = dsiCmdDmaWait(dsi1_base);
+    const ret0 = dsiCmdDmaWait(dsi0_base);
+    if (ret1 != 0) return ret1;
+    return ret0;
+}
+
+/// Real DCS READ (Get Power Mode, 0x0A) with genuine BTA (bus
+/// turnaround) -- every DCS command sent by this driver up to now,
+/// including the panel init sequence and the test patch, has been a
+/// plain write with no BTA/ACK (dsi_host.c's own comment: "no BTA/ACK
+/// is required for a plain DCS write, so a completely unresponsive
+/// panel looks identical to a working one from the DSI host's point
+/// of view"). This is the first command in this driver that actually
+/// requires the panel to respond -- a definitive test of whether
+/// anything is reaching the panel at the physical layer at all,
+/// separate from whether the DPU/video pipeline is configured
+/// correctly. Mirrors msm_dsi_host_cmd_rx()'s real sequence: Set
+/// Maximum Return Packet Size (type 0x37) first, clear RDBK_DATA_CTRL,
+/// then the actual read command (data type 0x06 = DCS_READ, MSM
+/// packet flags BIT(5) = read/BTA-expected, from dsi_cmd_dma_add()'s
+/// `if (msg->rx_buf && msg->rx_len) data[3] |= BIT(5)`), then read the
+/// response back from RDBK_DATA0. DSI0 (master) only, matching the
+/// real driver's rx path (single host). Returns ((count << 8) |
+/// data_byte) on success, where `count` is RDBK_DATA_CTRL's own COUNT
+/// field (bits 16-23) -- the number of bytes the hardware actually
+/// captured over BTA. This disambiguates a genuine "panel responded
+/// with 0x00" from "panel never responded at all": RDBK_DATA_CTRL is
+/// explicitly cleared right before the read, so DATA0 alone reads 0 in
+/// BOTH cases -- only COUNT being nonzero proves real bytes came back
+/// over the wire. Negative return = DMA-level error/timeout.
+///
+/// BUG FIXED (SPEC.md task #5 log): the first version of this function
+/// only triggered DSI0's DMA. msm_dsi_manager_cmd_xfer_trigger() in the
+/// real driver shows that for sync-dual-dsi, EVERY command commit
+/// mirrors to both DSI0 and DSI1 together (DSI1 committed first, then
+/// DSI0) -- including whatever becomes a read/BTA from DSI0's own
+/// context. dsiSendDcs() already does this correctly for every other
+/// command in this driver; this function didn't, for the trigger step
+/// (RX-side register reads are correctly DSI0-only, matching the real
+/// driver's single-host rx path -- only the trigger was wrong). If
+/// this panel's dual-link stitching needs coordinated activity on both
+/// links to respond to LP/BTA traffic at all, a DSI0-only trigger
+/// could look malformed to the panel and explain a zero response on
+/// its own, independent of the base driver (which never had this bug).
+export fn sheng_mdss_dsi_read_power_mode(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) i64 {
+    const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
+
+    // Set Maximum Return Packet Size (type 0x37, short write, 2-byte
+    // little-endian payload = requested length, here 1). Mirrored to
+    // both hosts, DSI1 first, matching dsiSendDcs()'s own order.
+    dst[0] = 1;
+    dst[1] = 0;
+    dst[2] = 0x37;
+    dst[3] = 0x80; // last, short, no BTA needed for this command itself
+    var ret = dsiCmdDmaTxDual(dsi0_base, dsi1_base, dma_scratch, 4);
+    if (ret != 0) return ret;
+
+    mmioWrite32(dsi0_base, DSI_RDBK_DATA_CTRL, RDBK_DATA_CTRL_CLR);
+    mmioWrite32(dsi0_base, DSI_RDBK_DATA_CTRL, 0);
+
+    // The actual read: data-id 0x06 (DCS_READ), cmd=0x0A (Get Power
+    // Mode), BTA-expected flag set. Triggered on both hosts genuinely
+    // in parallel (see dsiCmdDmaTxDual()'s comment) -- only DSI0's
+    // RDBK/status registers are read back afterward, matching the real
+    // driver's single-host rx path.
+    dst[0] = 0x0a;
+    dst[1] = 0x00;
+    dst[2] = 0x06;
+    dst[3] = 0x80 | 0x20; // last, short, BTA-expected (BIT(5))
+    ret = dsiCmdDmaTxDual(dsi0_base, dsi1_base, dma_scratch, 4);
+    if (ret != 0) return ret;
+
+    const ctrl = mmioRead32(dsi0_base, DSI_RDBK_DATA_CTRL);
+    const count: i64 = @intCast((ctrl >> 16) & 0xff);
+    const resp = mmioRead32(dsi0_base, DSI_RDBK_DATA0);
+    return (count << 8) | @as(i64, @intCast(resp & 0xff));
+}
+
+/// Reads ACK_ERR_STATUS and TIMEOUT_STATUS on DSI0 -- U-Boot polls a
+/// single busy bit and never looks at these, so a BTA timeout or LP-RX
+/// timeout during a transaction has never been visible: DSI_TRIG_DMA's
+/// busy bit clearing only means the host's OWN DMA engine finished,
+/// not that the transaction completed error-free. Packed as
+/// (ack_err_status << 32) | timeout_status.
+export fn sheng_mdss_dsi_read_error_status(dsi0_base: usize) callconv(.c) i64 {
+    const ack_err = mmioRead32(dsi0_base, DSI_ACK_ERR_STATUS);
+    const timeout = mmioRead32(dsi0_base, DSI_TIMEOUT_STATUS);
+    return (@as(i64, @intCast(ack_err)) << 32) | @as(i64, @intCast(timeout));
+}
+
+/// Reads DSI_CTRL and DSI_LANE_CTRL on DSI0 as OUR driver's own
+/// execution actually left them at the moment of the BTA attempt --
+/// not Linux's later, differently-reprogrammed post-teardown value
+/// (which decodes against no documented bitfield at all: 0x20070000
+/// live-read has bits 16/17/18/29 set, none of which match ENABLE/
+/// CLK_EN/LANE0-3/VID_MODE_EN/CMD_MODE_EN/ECC_CHECK/CRC_CHECK per
+/// dsi.xml -- either genuinely undocumented bits this header doesn't
+/// cover, or not directly comparable to our own driver's state at
+/// all). Packed as (DSI_CTRL << 32) | DSI_LANE_CTRL.
+export fn sheng_mdss_dsi_read_ctrl_state(dsi0_base: usize) callconv(.c) i64 {
+    const ctrl = mmioRead32(dsi0_base, DSI_CTRL);
+    const lane_ctrl = mmioRead32(dsi0_base, DSI_LANE_CTRL);
+    return (@as(i64, @intCast(ctrl)) << 32) | @as(i64, @intCast(lane_ctrl));
+}
+
+/// Self-check: write a known test pattern to DSI_CTRL, read back
+/// immediately (nothing else touches the register in between), restore
+/// the real value. Returns the immediate readback. If this comes back
+/// as 0x20070000 (or anything other than the pattern just written),
+/// the write is not landing at all -- not a later overwrite, not a
+/// different execution path, the bus transaction itself is being
+/// dropped or aliased.
+export fn sheng_mdss_dsi_ctrl_writeback_selfcheck(dsi_base: usize) callconv(.c) u32 {
+    const test_pattern: u32 = 0xA5A5A5A5;
+    mmioWrite32(dsi_base, DSI_CTRL, test_pattern);
+    const readback = mmioRead32(dsi_base, DSI_CTRL);
+    mmioWrite32(dsi_base, DSI_CTRL, CTRL_CLK_EN | CTRL_ALL_LANES | CTRL_CMD_MODE_EN | CTRL_ENABLE);
+    return readback;
+}
+
+/// Isolates whether the write-drop is specific to DSI_CTRL or affects
+/// the whole DSI host block (which would point at DSI_CLK_CTRL -- the
+/// block's own internal AHB clock gate -- not actually landing either,
+/// leaving every sub-register in this block unable to accept writes at
+/// all). Tests CLK_CTRL, LANE_SWAP_CTRL (a register already confirmed
+/// correct via live steal, so its pre-test value is known), and CTRL,
+/// each with an immediate write-then-read, restoring real values after.
+/// Packed as (clk_ctrl_readback << 32) | (lane_swap_readback << 16) |
+/// low 16 bits unused (ctrl selfcheck already covered separately).
+/// Result of the write-immediately-after-reset probe done inside
+/// dsiHostBringUp(), before anything else touches the controller.
+/// 0xFFFFFFFF sentinel means it never ran (dsi_base mismatch).
+export fn sheng_mdss_dsi_earliest_ctrl_selfcheck() callconv(.c) u32 {
+    return g_earliest_ctrl_selfcheck;
+}
+
+export fn sheng_mdss_dsi_status0_before_first_cmd() callconv(.c) u32 {
+    return g_status0_before_first_cmd;
+}
+
+export fn sheng_mdss_dsi_snapshot_1() callconv(.c) i64 {
+    return (@as(i64, @intCast(g_snap_ctrl)) << 32) | @as(i64, @intCast(g_snap_lane_swap));
+}
+export fn sheng_mdss_dsi_snapshot_2() callconv(.c) i64 {
+    return (@as(i64, @intCast(g_snap_lane_ctrl)) << 32) | @as(i64, @intCast(g_snap_cmd_dma_ctrl));
+}
+export fn sheng_mdss_dsi_snapshot_3() callconv(.c) i64 {
+    return (@as(i64, @intCast(g_snap_cmd_cfg0)) << 32) | @as(i64, @intCast(g_snap_cmd_cfg1));
+}
+export fn sheng_mdss_dsi_snapshot_4() callconv(.c) i64 {
+    return (@as(i64, @intCast(g_snap_trig_ctrl)) << 32) | @as(i64, @intCast(g_snap_clk_ctrl));
+}
+
+/// Puts TRIG_CTRL back to Linux's exact live value (TE |
+/// BLOCK_DMA_WITHIN_FRAME | DMA_TRIGGER(SW)) now that panel init is
+/// done and the DPU is about to start streaming -- at which point
+/// bit12's "wait until cmd mdp is idle" interlock has a live MDP to
+/// synchronise against and becomes correct rather than deadlocking.
+/// See TRIG_CTRL_CMD_INIT_VALUE's comment for why init needs the other
+/// value.
+export fn sheng_mdss_dsi_trig_ctrl_restore(dsi0_base: usize, dsi1_base: usize) callconv(.c) void {
+    mmioWrite32(dsi0_base, DSI_TRIG_CTRL, TRIG_CTRL_VALUE);
+    mmioWrite32(dsi1_base, DSI_TRIG_CTRL, TRIG_CTRL_VALUE);
+}
+
+export fn sheng_mdss_dsi_timeout_diag() callconv(.c) i64 {
+    return (@as(i64, @intCast(g_fifo_status_on_timeout)) << 32) |
+        @as(i64, @intCast(g_dln0_phy_err_on_timeout));
+}
+
+export fn sheng_mdss_dsi_block_writeback_selfcheck(dsi_base: usize) callconv(.c) i64 {
+    const test_pattern: u32 = 0x5A5A5A5A;
+
+    const saved_clk_ctrl = mmioRead32(dsi_base, DSI_CLK_CTRL);
+    mmioWrite32(dsi_base, DSI_CLK_CTRL, test_pattern);
+    const clk_ctrl_readback = mmioRead32(dsi_base, DSI_CLK_CTRL);
+    mmioWrite32(dsi_base, DSI_CLK_CTRL, saved_clk_ctrl);
+
+    const saved_lane_swap = mmioRead32(dsi_base, DSI_LANE_SWAP_CTRL);
+    mmioWrite32(dsi_base, DSI_LANE_SWAP_CTRL, test_pattern);
+    const lane_swap_readback = mmioRead32(dsi_base, DSI_LANE_SWAP_CTRL);
+    mmioWrite32(dsi_base, DSI_LANE_SWAP_CTRL, saved_lane_swap);
+
+    return (@as(i64, @intCast(clk_ctrl_readback)) << 32) | @as(i64, @intCast(lane_swap_readback));
 }
 
 /// Sends one DCS command to both DSI0 and DSI1 from the SAME DMA
@@ -1178,6 +2038,48 @@ fn dsiCmdDmaTxOne(dsi_base: usize, dma_addr: usize, len: usize) c_int {
 /// on hardware mirroring (see nt36532e_init_sequence's comment in
 /// this file and sheng_tianma_init_sequence() in the kernel panel
 /// driver).
+/// Inverse of the wake-up half of sheng_mdss_dsi_panel_init(): Display
+/// Off (0x28) then Sleep In (0x10), mirroring nt36532e's real
+/// .disable()/.unprepare() DCS sequence. Must be sent host-side (DSI
+/// still in/switched back to command mode) before the PHY/DISPCC/GPIO
+/// teardown below removes the panel's ability to receive commands at
+/// all. Best-effort: DSI is being torn down regardless, so a failure
+/// here doesn't abort the rest of the teardown.
+/// DIAGNOSTIC BISECT (SPEC.md task #5 log): MIPI DCS 0x23,
+/// ALL_PIXELS_ON. The panel drives every pixel to full-on from its own
+/// internal logic -- it needs NO video data, no DSC stream, no DPU
+/// pipeline. It is therefore a direct test of a question none of the
+/// register diagnostics can answer: does this panel actually RECEIVE
+/// AND EXECUTE our commands?
+///
+/// Every command so far has "succeeded" only in the sense that the DSI
+/// DMA engine shipped bytes down the lanes. DCS reads have never
+/// returned data on this hardware (the long-standing zero-byte BTA
+/// result), so sheng.power_mode=0 is a failed read rather than the
+/// panel reporting itself off -- meaning we have never once confirmed
+/// the panel processed anything we sent.
+///
+///   Screen goes WHITE -> panel is alive, command path works end to
+///     end, display is genuinely on. The black screen is then isolated
+///     to the video/DSC data path, and everything downstream of the
+///     DSI host is what needs attention.
+///   Screen stays BLACK -> the panel is not acting on commands at all.
+///     Every DPU/LM/DSC/rate finding is then downstream of a dead
+///     command path, and the entire DPU investigation is misdirected.
+///
+/// Deliberately left ACTIVE (no 0x22 restore) so the result is
+/// unambiguous to the naked eye.
+export fn sheng_mdss_dsi_all_pixels_on(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) c_int {
+    return dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x23, &[_]u8{});
+}
+
+export fn sheng_mdss_dsi_panel_sleep(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) void {
+    _ = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x28, &[_]u8{});
+    udelay(20000); // datasheet-typical gap between display-off and sleep-in
+    _ = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x10, &[_]u8{});
+    udelay(5000);
+}
+
 fn dsiSendDcs(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, cmd: u8, args: []const u8) c_int {
     var buf: [16]u8 = undefined;
     const len = buildMsmCmdPacket(&buf, cmd, args);
@@ -1186,11 +2088,7 @@ fn dsiSendDcs(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, cmd: u8, a
     const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
     for (buf[0..len], 0..) |b, i| dst[i] = b;
 
-    var ret = dsiCmdDmaTxOne(dsi1_base, dma_scratch, len);
-    if (ret != 0) return ret;
-    ret = dsiCmdDmaTxOne(dsi0_base, dma_scratch, len);
-    if (ret != 0) return ret;
-    return 0;
+    return dsiCmdDmaTxDual(dsi0_base, dsi1_base, dma_scratch, len);
 }
 
 /// Sends a raw MIPI DSI long packet with an explicit data_id (NOT a
@@ -1216,11 +2114,7 @@ fn dsiSendRawLong(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, data_i
     const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
     for (buf[0..padded], 0..) |b, j| dst[j] = b;
 
-    var ret = dsiCmdDmaTxOne(dsi1_base, dma_scratch, padded);
-    if (ret != 0) return ret;
-    ret = dsiCmdDmaTxOne(dsi0_base, dma_scratch, padded);
-    if (ret != 0) return ret;
-    return 0;
+    return dsiCmdDmaTxDual(dsi0_base, dsi1_base, dma_scratch, padded);
 }
 
 /// Bring up the DSI host controllers and blast the panel's full init
@@ -1250,44 +2144,85 @@ fn dsiSendRawLong(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, data_i
 /// Pass false to leave DSC off (skips the 0x90/PPS/0x9d/framerate-branch
 /// block entirely) for that test; real use should pass true.
 export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, enable_dsc: bool) callconv(.c) c_int {
+    // REAL GAP FOUND (SPEC.md task #5 log): smmuBypassMdssStream() was
+    // only ever called inside sheng_mdss_dpu_start(), which runs AFTER
+    // this entire panel init sequence -- meaning it was never actually
+    // in effect for the DSI host's OWN command-mode DMA fetches
+    // (dma_scratch), only for the DPU's later SSPP video fetch. Command
+    // #0's DMA read has been hitting an unbypassed SMMU stream this
+    // whole time. Moved here, before any DSI command traffic at all.
+    smmuBypassMdssStream();
+
     dsiHostBringUp(dsi0_base);
     dsiHostBringUp(dsi1_base);
 
+    // LP-11 settle test (SPEC.md task #5 log): U-Boot runs linearly and
+    // near-instantly compared to Linux's mutex/scheduler-laden power-on
+    // path -- if the panel's physical LP receiver needs the lines held
+    // in LP-11 (both HIGH) for a minimum analog settle time before it
+    // will accept a Start-of-Transmission burst, firing the first DCS
+    // command microseconds after lane enable could look like line
+    // noise to the panel rather than a real command. Brute-force test:
+    // hold here before any command traffic.
+    udelay(250000); // bumped 100ms -> 250ms brute-force test (SPEC.md task #5 log)
+
+    // DIAGNOSTIC (SPEC.md task #5 log): a new, genuine DMA timeout
+    // appeared after the DSI 6G register-shift fix + re-stolen values
+    // (previously every command "completed" with no response; now
+    // something actually hangs). Encode WHICH command failed into the
+    // return value (-(10000+index) for the init-sequence loop,
+    // -(20000+stage) for the named stages after it) instead of just
+    // propagating the raw errno, so the failure point is visible via
+    // the sheng.panel env var without needing a live console.
+    var idx: i32 = 0;
     for (nt36532e_init_sequence) |entry| {
         const ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, entry.cmd, entry.args);
-        if (ret != 0) return ret;
+        if (ret != 0) return -(10000 + idx);
+        idx += 1;
     }
 
     if (enable_dsc) {
         // Enable DSC.
         var ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x90, &[_]u8{0x03});
-        if (ret != 0) return ret;
+        if (ret != 0) return -20001;
 
         // DSC Picture Parameter Set.
         ret = dsiSendRawLong(dsi0_base, dsi1_base, dma_scratch, 0x0a, &nt36532e_pps_144hz);
-        if (ret != 0) return ret;
+        if (ret != 0) return -20002;
 
         ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x9d, &[_]u8{0x01});
-        if (ret != 0) return ret;
+        if (ret != 0) return -20003;
 
-        // 144Hz framerate control branch.
-        ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb2, &[_]u8{0x91});
-        if (ret != 0) return ret;
-        ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb3, &[_]u8{0x40});
-        if (ret != 0) return ret;
+        // REAL BUG FOUND (SPEC.md task #5 log): this was mislabeled
+        // "144Hz framerate control branch" and sent 0xb2=0x91/0xb3=0x40
+        // -- those are actually the real driver's `cur_vrefresh == 120
+        // || cur_vrefresh == 60` branch values, not 144Hz at all. The
+        // real sheng_tianma_init_sequence() has three branches on
+        // cur_vrefresh (120/60 -> 0x91/0x40; 90/50/48/30 -> 0x00/0x80;
+        // else -> 0x00/0x00), and nt36532e_get_current_mode() returns
+        // mode index 0 (the *first* entry in sheng_tianma_modes[], the
+        // 144Hz mode) whenever connector->state->crtc is NULL --
+        // exactly our initial-prepare()/first-boot scenario. 144
+        // matches neither explicit branch, so the real driver falls
+        // through to the ELSE branch: 0xb2=0x00, 0xb3=0x00. We were
+        // sending the wrong branch's values.
+        ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb2, &[_]u8{0x00});
+        if (ret != 0) return -20004;
+        ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb3, &[_]u8{0x00});
+        if (ret != 0) return -20005;
     }
 
     // Exit sleep mode (MIPI DCS 0x11, no args), then the panel needs
     // 120ms before it'll accept display-on.
     var ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x11, &[_]u8{});
-    if (ret != 0) return ret;
+    if (ret != 0) return -20006;
     // mdelay() is a U-Boot macro (udelay(n*1000)), not a linkable
     // symbol -- call udelay directly instead.
     udelay(120000);
 
     // Set display on (MIPI DCS 0x29, no args).
     ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x29, &[_]u8{});
-    if (ret != 0) return ret;
+    if (ret != 0) return -20007;
 
     return 0;
 }
@@ -1307,14 +2242,24 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
 /// buildMsmCmdPacket() uses for its own long-write path:
 /// [len_lo,len_hi,0x39,0x80|0x40][cmd byte][payload...], padded to a
 /// 4-byte boundary with 0xff.
-const TEST_PATCH_W: usize = 16;
-const TEST_PATCH_H: usize = 16;
+// Bumped from 16x16 (easy to miss entirely) to 300x300 -- still
+// comfortably under the ~1MB gap between SHENG_MDSS_DSI_DMA_SCRATCH
+// and SHENG_MDSS_FB_ADDR (270005 bytes total packet size), but large
+// enough to be unmistakable on a 3048x2032 panel. The end-coordinate
+// bytes below were also fixed: the old single-byte encoding
+// (TEST_PATCH_W - 1 truncated to u8) only worked by accident for
+// sizes <= 256; a real 4-byte MIPI DCS column/page address set needs
+// the full 16-bit end value split into hi/lo bytes.
+const TEST_PATCH_W: usize = 200;
+const TEST_PATCH_H: usize = 200;
 
 export fn sheng_mdss_dsi_test_patch(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) c_int {
-    var ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x2a, &[_]u8{ 0x00, 0x00, 0x00, @as(u8, TEST_PATCH_W - 1) });
+    const w_end: u16 = @intCast(TEST_PATCH_W - 1);
+    const h_end: u16 = @intCast(TEST_PATCH_H - 1);
+    var ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x2a, &[_]u8{ 0x00, 0x00, @truncate(w_end >> 8), @truncate(w_end & 0xff) });
     if (ret != 0) return ret;
 
-    ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x2b, &[_]u8{ 0x00, 0x00, 0x00, @as(u8, TEST_PATCH_H - 1) });
+    ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x2b, &[_]u8{ 0x00, 0x00, @truncate(h_end >> 8), @truncate(h_end & 0xff) });
     if (ret != 0) return ret;
 
     const npix: usize = TEST_PATCH_W * TEST_PATCH_H;
@@ -1338,10 +2283,7 @@ export fn sheng_mdss_dsi_test_patch(dsi0_base: usize, dsi1_base: usize, dma_scra
     var j: usize = size;
     while (j < padded) : (j += 1) dst[j] = 0xff;
 
-    ret = dsiCmdDmaTxOne(dsi1_base, dma_scratch, padded);
-    if (ret != 0) return ret;
-    ret = dsiCmdDmaTxOne(dsi0_base, dma_scratch, padded);
-    return ret;
+    return dsiCmdDmaTxDual(dsi0_base, dsi1_base, dma_scratch, padded);
 }
 
 // ---------------------------------------------------------------------
@@ -1402,6 +2344,11 @@ const SSPP_SRC_OP_MODE_REC1: usize = 0x17c;
 const SSPP_XRGB8888_SRC_FORMAT: u32 = 0x000236ff;
 const SSPP_XRGB8888_UNPACK_PATTERN: u32 = 0x03020001;
 const SSPP_OP_MODE_PE_OVERRIDE: u32 = 1 << 23;
+// CROSS-VERIFIED: live SSPP SRC_OP_MODE reads 0x80000000 on both rects,
+// not the bit23 PE_OVERRIDE previously assumed here.
+const SSPP_OP_MODE_LIVE: u32 = 0x80000000;
+// Live SSPP_MULTIRECT_OPMODE -- see the write site.
+const SSPP_MULTIRECT_OPMODE_LIVE: u32 = 0x3;
 
 // Multirect: TIME_MX mode with rect index in bits[1:0].
 const SSPP_MULTIRECT_INDEX_REC0: u32 = 0x0;
@@ -1409,14 +2356,53 @@ const SSPP_MULTIRECT_INDEX_REC1: u32 = 0x1;
 const SSPP_MULTIRECT_MODE_TIME_MX: u32 = 1 << 2;
 
 const LM_OP_MODE: usize = 0x00;
+/// REAL GAP FOUND (SPEC.md task #5 log): LM_OP_MODE was being written
+/// as 0, annotated as a "right_mixer" flag. That is a misreading of the
+/// register. In DPU it is written by dpu_hw_lm_setup_color3() (the
+/// .setup_alpha_out op):
+///
+///   op_mode = (op_mode & (BIT(31) | BIT(30))) | mixer_op_mode;
+///   DPU_REG_WRITE(c, LM_OP_MODE, op_mode);
+///
+/// where _dpu_crtc_blend_setup_mixer() builds mixer_op_mode as
+/// `1 << pstate->stage`, and pstate->stage = DPU_STAGE_0 +
+/// normalized_zpos. DPU_STAGE_BASE(0) is the border/background layer,
+/// so DPU_STAGE_0 == 1 and a single plane at zpos 0 needs bit1 set.
+///
+/// Written as 0, NO blend stage is enabled and the layer mixer emits
+/// border colour -- black -- regardless of how correctly the pipe
+/// feeding it is configured. That was the final blocker: SSPP fetch
+/// address/format, LM_OUT_SIZE, blend op, CTL routing, DSC, link rate
+/// and FIFOs all read back correct and the panel still showed nothing.
+///
+/// This also pairs with the CTL_LAYER0 value already in use: its
+/// mix field is (stage_index + 1) = 1, naming the same stage 1 that
+/// this bit enables. Only one half of that pairing was programmed.
+const LM_OP_MODE_STAGE0_ENABLED: u32 = 1 << 1;
 const LM_OUT_SIZE: usize = 0x04;
 const LM_STAGE0_OFFSET: usize = 0x20; // sdm845_lm_sblk.blendstage_base[0]
 const LM_BLEND0_CONST_ALPHA: usize = 0x04;
 const LM_BLEND0_OP: usize = 0x00;
 // DPU_BLEND_FG_ALPHA_FG_CONST(0<<0) | DPU_BLEND_BG_ALPHA_FG_CONST(0<<8) |
 // DPU_BLEND_BG_INV_ALPHA(1<<10): single opaque layer, no blending below it.
-const LM_BLEND_OP_OPAQUE: u32 = 1 << 10;
-const LM_CONST_ALPHA_OPAQUE: u32 = 0xff | (0xff << 16); // fg/bg alpha = 0xff (>>8 of 0xffff)
+// CROSS-VERIFIED AGAINST LIVE HARDWARE (SPEC.md task #5 log): both of
+// these were hand-derived and both were wrong. Dumped from Linux's own
+// LM0/LM1 via devmem while DRM drove this exact panel.
+//
+// blend_op: live reads 0x100 == DPU_BLEND_BG_ALPHA_BG_CONST (bit8), not
+// the bit10 previously guessed here. dpu_hw_lm_setup_blend_config()
+// writes whatever dpu_crtc hands it; for the bottom-most opaque layer
+// that is BG_ALPHA_BG_CONST with FG_ALPHA_FG_CONST(0).
+const LM_BLEND_OP_OPAQUE: u32 = 0x100;
+// const_alpha: live reads 0x00FF0000 -- bg alpha 0xff in the high half,
+// fg alpha 0 in the low half. The previous 0x00FF00FF set both.
+const LM_CONST_ALPHA_OPAQUE: u32 = 0x00FF0000;
+// LM1 additionally carries bit31, which dpu_hw_lm_setup_color3()
+// deliberately preserves through its `op_mode & (BIT(31) | BIT(30))`
+// read-modify-write. Writing OP_MODE blind (as this driver does, having
+// no prior value to preserve) drops it unless set explicitly.
+// Live: LM0 = 0x00000002, LM1 = 0x80000002.
+const LM_OP_MODE_LM1_EXTRA: u32 = 1 << 31;
 
 const PP_DSC_MODE: usize = 0x0a0;
 const PP_DCE_DATA_OUT_SWAP: usize = 0x0c8;
@@ -1479,6 +2465,19 @@ const INTF_FRAME_LINE_COUNT_EN: usize = 0x0a8;
 const INTF_PANEL_FORMAT: usize = 0x090;
 const INTF_MUX: usize = 0x25c;
 
+// CROSS-VERIFIED AGAINST LIVE HARDWARE (SPEC.md task #5 log). Live
+// INTF_CONFIG  = 0x80800000 (was written as 0 here).
+// Live INTF_CONFIG2 = 0x00001011 = DATABUS_WIDEN(0) | DATA_HCTL_EN(4) |
+// bit12 -- note DCE_DATA_COMPRESS(1), the ONLY bit this driver used to
+// set, is NOT set on working hardware. Both INTF1 and INTF2 read
+// identical values.
+const INTF_CONFIG_LIVE: u32 = 0x80800000;
+const INTF_CONFIG2_LIVE: u32 = 0x00001011;
+// INTF_MUX's pingpong-select is the low nibble, but bits[19:16] read
+// 0xF on live hardware and this driver writes the whole register (no
+// read-modify-write), so they must be set explicitly or they get
+// cleared. Live: INTF1 = 0x000F0000 (PP_0), INTF2 = 0x000F0001 (PP_1).
+const INTF_MUX_LIVE_BASE: u32 = 0x000F0000;
 const INTF_CFG2_DATABUS_WIDEN: u32 = 1 << 0;
 const INTF_CFG2_DCE_DATA_COMPRESS: u32 = 1 << 1;
 const INTF_CFG2_DATA_HCTL_EN: u32 = 1 << 4;
@@ -1498,6 +2497,22 @@ const CTL_DSC_ACTIVE: usize = 0x0e8;
 const CTL_INTF_MASTER: usize = 0x134;
 const CTL_DSC_FLUSH: usize = 0x104;
 const CTL_INTF_FLUSH: usize = 0x110;
+/// REAL GAP FOUND (SPEC.md task #5 log): dpu_hw_ctl_set_fetch_pipe_active()
+/// writes a bitmask of which SSPPs are PERMITTED TO FETCH:
+///
+///   for (i = 0; i < SSPP_MAX; i++)
+///           if (test_bit(i, fetch_active) && fetch_tbl[i] != CTL_INVALID_BIT)
+///                   val |= BIT(fetch_tbl[i]);
+///   DPU_REG_WRITE(&ctx->hw, CTL_FETCH_PIPE_ACTIVE, val);
+///
+/// fetch_tbl[SSPP_DMA0] is 0, so the single DMA pipe this driver uses
+/// needs BIT(0). Live hardware reads exactly 0x1. This driver never
+/// wrote the register at all, leaving it 0 -- a hard gate in front of
+/// the whole pixel path: with no pipe marked fetch-active, SSPP does
+/// not fetch, and every downstream block is correctly configured to
+/// carry nothing.
+const CTL_FETCH_PIPE_ACTIVE: usize = 0x0fc;
+const CTL_FETCH_PIPE_SSPP_DMA0: u32 = 1 << 0;
 
 const CTL_MIXER_BORDER_OUT: u32 = 1 << 24;
 const CTL_FLUSH_MASK_CTL: u32 = 1 << 17;
@@ -1539,15 +2554,35 @@ const DSC_RC_BUF_THRESH = [14]u32{ 14, 28, 42, 56, 70, 84, 98, 105, 112, 119, 12
 /// (dpu_base+0x80000, shared by both instances); `enc_off`/`ctl_off`
 /// are the per-instance sblk.enc/sblk.ctl sub-offsets.
 fn dscConfigureInstance(dce_base: usize, enc_off: usize, ctl_off: usize, pp_idx: u32) void {
+    // CROSS-VERIFIED AGAINST LIVE HARDWARE (SPEC.md task #5 log): this
+    // whole function's values were transcribed independently of the
+    // panel-side PPS and never checked against each other -- a gap this
+    // file has flagged as the prime suspect for "video streams but
+    // nothing is visible" for a long time. Dumping Linux's own live DSC
+    // encoder registers via devmem while DRM drove this exact panel and
+    // diffing all 25 of them found 21 identical and 5 wrong. Both
+    // encoder instances read back identical, so one set covers both.
+    //
+    // The five corrections are mutually consistent and describe a
+    // single coherent error: this panel uses FOUR 762-px slices across
+    // the full 3048 width, i.e. TWO soft slices per encoder, whereas
+    // this code described one slice per encoder over a 1524-px picture
+    // -- half the width and half the slices. A DSC decoder whose slice
+    // geometry disagrees with the PPS it was sent emits nothing
+    // decodable, which is precisely the observed symptom (link clean at
+    // 144Hz, FIFOs healthy, panel initialised, screen black).
+    //
     // DSC_CMN_MAIN_CNF: shared register, written identically by both
-    // instances -- SPLIT_PANEL (dual hard-slice, one soft slice each,
-    // no MULTIPLEX) with num_active_slice_per_enc=1 in bits[8:7].
-    dpuHwWrite(dce_base, 0, DSC_CMN_MAIN_CNF, (DSC_MODE_SPLIT_PANEL & 1) | (@as(u32, 1) << 7));
+    // instances -- SPLIT_PANEL with num_active_slice_per_enc in
+    // bits[8:7]. Live = 0x101, i.e. field value 2 (bit8), not 1 (bit7).
+    dpuHwWrite(dce_base, 0, DSC_CMN_MAIN_CNF, (DSC_MODE_SPLIT_PANEL & 1) | (@as(u32, 2) << 7));
 
     // ENC_DF_CTRL: initial_lines(8) | VIDEO_MODE(bit9) | max_addr(bits[18+])
-    // max_addr = 2400/num_softslice - 1 = 2400/1 - 1 = 2399.
+    // max_addr = 2400/num_softslice - 1. num_softslice is 2, not 1 (see
+    // above), giving 1199 -- confirmed by live 0x12BC0202 vs our
+    // previous 0x257C0202, which differ in exactly this field.
     const initial_lines: u32 = 2;
-    const max_addr: u32 = 2400 - 1;
+    const max_addr: u32 = 2400 / 2 - 1;
     dpuHwWrite(dce_base, enc_off, DSC_ENC_DF_CTRL, (initial_lines & 0xff) | (1 << 9) | (max_addr << 18));
 
     // DSC_MAIN_CONF: version_minor(28) | bpp(10, U6.4=128) |
@@ -1556,11 +2591,19 @@ fn dscConfigureInstance(dce_base: usize, enc_off: usize, ctl_off: usize, pp_idx:
     var main_conf: u32 = (@as(u32, 1) << 28); // dsc_version_minor = 1
     main_conf |= (@as(u32, 8 << 4)) << 10; // bits_per_pixel = 8.0bpp in U6.4
     main_conf |= 1 << 20; // block_pred_enable
+    main_conf |= 1 << 4; // convert_rgb -- live hardware has this SET; the
+    // previous "=0 per panel driver" reading was wrong (live 0x...0258
+    // vs our 0x...0248, differing in exactly this bit)
     main_conf |= (9 & 0xf) << 6; // line_buf_depth
     main_conf |= 8 & 0xf; // bits_per_component
     dpuHwWrite(dce_base, enc_off, DSC_MAIN_CONF, main_conf);
 
-    dpuHwWrite(dce_base, enc_off, DSC_PICTURE_SIZE, (1524 & 0xffff) | (@as(u32, 2032) << 16));
+    // pic_width is the FULL panel width, not the per-half 1524 --
+    // dsi_timing_setup() sets dsc->pic_width = mode->hdisplay, and for
+    // bonded DSI the DRM mode carries the complete panel width (see its
+    // own comment: "the current DRM mode has the complete width of the
+    // panel"). Live 0x07F00BE8 = 2032 x 3048.
+    dpuHwWrite(dce_base, enc_off, DSC_PICTURE_SIZE, (3048 & 0xffff) | (@as(u32, 2032) << 16));
     dpuHwWrite(dce_base, enc_off, DSC_SLICE_SIZE, (762 & 0xffff) | (@as(u32, 16) << 16));
     dpuHwWrite(dce_base, enc_off, DSC_MISC_SIZE, 762 & 0xffff);
     dpuHwWrite(dce_base, enc_off, DSC_HRD_DELAYS, (512 & 0xffff) | (@as(u32, 637) << 16));
@@ -1571,9 +2614,10 @@ fn dscConfigureInstance(dce_base: usize, enc_off: usize, ctl_off: usize, pp_idx:
     dpuHwWrite(dce_base, enc_off, DSC_RC_OFFSETS_3, (6144 & 0xffff) | (@as(u32, 4336) << 16));
     dpuHwWrite(dce_base, enc_off, DSC_RC_OFFSETS_4, 0); // nsl_bpg_offset/second_line_offset_adj unused (dsc v1.1)
 
-    // flatness det_thresh = 2^(bpc-8+8)=... drm_dsc_flatness_det_thresh()
-    // for bpc=8 is a fixed constant of 7 << (bpc - 8) = 7.
-    const det_thresh_flatness: u32 = 7;
+    // flatness det_thresh: live hardware reads 2 in this field
+    // (0x0983 >> 10), not the 7 previously derived here -- the
+    // drm_dsc_flatness_det_thresh() reading was wrong for bpc=8.
+    const det_thresh_flatness: u32 = 2;
     dpuHwWrite(dce_base, enc_off, DSC_FLATNESS_QP, (3 & 0x1f) | (@as(u32, 12 & 0x1f) << 5) | (det_thresh_flatness << 10));
     dpuHwWrite(dce_base, enc_off, DSC_RC_MODEL_SIZE, 8192 & 0xffff);
 
@@ -1619,16 +2663,396 @@ fn dscConfigureInstance(dce_base: usize, enc_off: usize, ctl_off: usize, pp_idx:
     // means we'd normally set bit10, but nt36532e's dsc struct leaves
     // convert_rgb at its zero-value default, i.e. NOT converting RGB->
     // YCoCg -- so bit10 (which fires on !convert_rgb) must be set).
+    // CROSS-VERIFIED AGAINST LIVE HARDWARE: live DSC_CFG reads 0x1801 on
+    // both instances = bit0 | bit11 | bit12. Bit10 (!convert_rgb) is
+    // NOT set -- which also resolves a contradiction this file carried:
+    // MAIN_CONF's live value has convert_rgb SET (bit4), so its inverse
+    // must be clear here. The old comment reasoned from the panel
+    // driver's zero-initialised dsc struct and got both halves wrong.
     var dsc_cfg: u32 = 1 << 0; // encoder enable
-    dsc_cfg |= 1 << 10; // !convert_rgb
     dsc_cfg |= 1 << 11; // bits_per_component == 8
     dsc_cfg |= 1 << 12; // SPLIT_PANEL mode
-    dsc_cfg |= 1 << 17; // !VIDEO_MODE would set this -- we ARE video mode, leave clear
-    dsc_cfg &= ~@as(u32, 1 << 17);
     dpuHwWrite(dce_base, ctl_off, DSC_CFG, dsc_cfg);
 
     // DSC_CTL: bind this encoder's output mux to its pingpong block.
     dpuHwWrite(dce_base, ctl_off, DSC_CTL_MUX, pp_idx & 0x7);
+}
+
+// THE REAL ANSWER for why U-Boot's own render never showed pixels
+// (SPEC.md task #5 log): live devmem read of the apps_smmu's SCR0
+// (global config, base 0x15000000) showed USFCFG=1 (bit 8) --
+// unidentified/unmatched IOMMU streams FAULT rather than bypass by
+// default on this hardware. The display subsystem's real stream ID
+// (mdss's `iommus = <&apps_smmu 0x1c00 0x2>` in sm8550.dtsi) has a
+// pre-existing, firmware-provisioned SMR entry (found by scanning all
+// 105 stream-match-register groups: SMR[3] = 0x80021c00, VALID=1,
+// MASK=0x2, ID=0x1c00 -- matching the devicetree exactly, at a fixed
+// slot index, not something any OS driver dynamically allocates).
+// Every raw physical-address SSPP fetch we ever did was almost
+// certainly silently aborted by the SMMU -- explaining precisely why
+// frame/line counters increment fine (pure INTF timing, no memory
+// access needed) while zero real pixel content ever arrived, with no
+// visible hang (the fault interrupt is enabled in SCR0 too, but
+// nothing in U-Boot services it, so it just sits pending harmlessly).
+// Fix: force this exact stream's S2CR entry to BYPASS (TYPE=1) before
+// ever touching the framebuffer -- no page tables needed, physical
+// addresses pass straight through as IOVAs. Whatever S2CR[3] held
+// during U-Boot's actual prior runs can't be observed anymore (Linux's
+// own SMMU driver reprograms it to real translated/context-bank mode
+// during its own probe), so don't guess: just set it ourselves.
+// REAL GAP FOUND (SPEC.md task #5 log, kernel pr_info trace comparison):
+// a real, working Linux boot's msm_dsi_host_cmd_xfer_commit() NEVER
+// passes a raw physical DRAM address into DMA_BASE -- every single
+// command DMA this session's traced kernel captured used dma_base=
+// 0x1000, a tiny SMMU-translated IOVA, proving the real driver
+// genuinely relies on stage-1 translation for this stream, not
+// passthrough. U-Boot's own in-tree ARM SMMU-500 driver
+// (drivers/iommu/qcom-hyp-smmu.c, configure_smr_s2cr()'s comment,
+// verbatim): "WARNING: Don't change this to use S2CR_TYPE_BYPASS!
+// Some Qualcomm boards have angry hypervisor firmware that converts
+// S2CR type BYPASS to type FAULT on write." smmuBypassMdssStream()
+// did exactly the thing that comment warns against -- forcing
+// S2CR[3] to TYPE_BYPASS(1) -- which, if SM8550 is one of those
+// boards, means every DSI command DMA fetch has been silently
+// FAULTED at the SMMU/interconnect boundary this entire session:
+// the bus master's read never reaches the DSI PHY at all, so
+// CMD_MODE_DMA_BUSY never clears and DLN0_PHY_ERR stays zero --
+// exactly this session's unchanging failure signature. Replaced
+// with that same driver's own proven workaround: S2CR_TYPE_TRANS
+// pointing at a context bank whose stage-1 MMU is left disabled
+// (SCTLR.M unset, TCR/TTBR/MAIR all zero) -- physical addresses
+// still pass straight through untranslated, but the word "BYPASS"
+// never appears in the S2CR write the hypervisor is watching for.
+// Must match SHENG_MDSS_DSI_DMA_SCRATCH in sheng_mdss.c exactly -- the
+// one physical buffer every DSI command DMA this driver ever sends
+// uses, now moved to the high DRAM bank (see that constant's comment).
+const SHENG_MDSS_DSI_DMA_SCRATCH_PHYS: u64 = 0x8bb500000;
+const APPS_SMMU_BASE: usize = 0x15000000;
+const SMMU_GR0_ID0: usize = 0x20;
+const SMMU_GR0_ID1: usize = 0x24;
+const SMMU_S2CR_BASE: usize = 0xc00;
+const SMMU_S2CR_MDSS_INDEX: usize = 3; // SMR[3] confirmed matching ID=0x1c00 MASK=0x2
+const SMMU_S2CR_TYPE_TRANS: u32 = 0;
+const SMMU_CBAR_TYPE_S2_TRANS: u32 = 0;
+const SMMU_CBAR_TYPE_S1_TRANS_S2_BYPASS: u32 = 1;
+const SMMU_CBA2R_VA64: u32 = 1;
+const SMMU_SCTLR_CFCFG: u32 = 1 << 7;
+const SMMU_SCTLR_CFIE: u32 = 1 << 6;
+const SMMU_SCTLR_CFRE: u32 = 1 << 5;
+const SMMU_VMID_UNUSED: u32 = 0xff;
+
+// Live-captured off the currently-running, genuinely-rendering Linux
+// system's own MDSS context bank (python /dev/mem walk, SPEC.md task
+// #5 log): SCTLR=0x67, TCR=0x80351c, confirming 4KB granule / T0SZ=28
+// (36-bit input address size, start_level=1 for a 4KB-granule 3-level
+// walk -- so a level-1 descriptor is a valid 1GB block).
+const SMMU_TCR_LIVE_LINUX_VALUE: u32 = 0x80351c;
+const SMMU_SCTLR_LIVE_LINUX_VALUE: u32 = 0x67;
+// MAIR0 byte 0 (AttrIndx=0): Normal memory, Inner/Outer Write-Back,
+// Read/Write-Allocate (0xFF, the standard ARMv8 encoding) -- our own
+// choice, not required to match Linux's own index assignment since
+// this is a separate table or this driver's own context bank.
+const SMMU_MAIR0_NORMAL_WB: u32 = 0xff;
+
+// REAL GAP FOUND (SPEC.md task #5 log): a live LPAE walk of the exact
+// context bank the WORKING Linux system is using right now (strict-
+// devmem temporarily disabled to allow the /dev/mem read) resolved
+// Linux's own dma_base=0x1000 IOVA to physical 0x887368000 -- deep in
+// the HIGH DRAM bank (0x880000000+), nowhere near the low <4GB bank
+// this driver's scratch buffer has always lived in. A 1GB *block*
+// descriptor can't express an independent IOVA->PA mapping (the
+// low-order bits of input and output address must match at block
+// granularity) -- reaching an arbitrary high-bank physical target
+// from a small, 32-bit-representable IOVA (required since DMA_BASE
+// is a plain reg32) needs genuine page-level (4KB) translation: a
+// full 3-level walk, exactly mirroring Linux's own IOVA choice
+// (0x1000) so this exact IOVA value, already proven to work on this
+// silicon/firmware, is reused rather than picking a new untested one.
+const SMMU_MAPPED_IOVA: usize = 0x1000;
+// Table/page descriptor bit layout, shared by all 3 levels here:
+// valid(bit0)=1, table-or-page(bit1)=1 (both L1/L2 "table" descriptors
+// AND the final L3 "page" descriptor require bit1 set -- only L1/L2
+// *block* descriptors would leave it clear, and we don't use those
+// here). Leaf (L3) descriptors additionally need AttrIndx/SH/AF for
+// the actual memory attributes; L1/L2 table descriptors ignore those
+// bits (they just point at the next table).
+const SMMU_DESC_TABLE: u64 = 0x1 | 0x2;
+const SMMU_DESC_PAGE_ATTRS: u64 = (1 << 10) | (0b11 << 8) | (0 << 2) | 0x1 | 0x2; // AF|SH=inner|AttrIndx=0|page|valid
+
+fn smmuTableDescriptor(next_table_phys: u64) u64 {
+    return (next_table_phys & ~@as(u64, 0xfff)) | SMMU_DESC_TABLE;
+}
+fn smmuPageDescriptor(page_phys: u64) u64 {
+    return (page_phys & ~@as(u64, 0xfff)) | SMMU_DESC_PAGE_ATTRS;
+}
+
+/// Level-1 1GB BLOCK descriptor: same attributes as a leaf page, but
+/// bit1 CLEAR (block, not table) -- the one place in this file that
+/// distinguishes the two. Output address must be 1GB-aligned.
+fn smmuBlockDescriptor1G(block_phys: u64) u64 {
+    return (block_phys & ~@as(u64, 0x3fffffff)) |
+        ((1 << 10) | (0b11 << 8) | (0 << 2) | 0x1); // AF|SH=inner|AttrIndx=0|valid, bit1=0 => block
+}
+
+/// The DPU's SSPP framebuffer fetch goes through this SAME context
+/// bank -- sm8550.dtsi gives the whole `mdss` node one stream mapping
+/// (`iommus = <&apps_smmu 0x1c00 0x2>`), so DSI's command DMA and the
+/// DPU's pixel fetch share it. Stage 1 is enabled here, which means
+/// every MDSS master's addresses are now translated, not just DSI's.
+///
+/// The 3-level table above maps exactly ONE 4KB page (IOVA 0x1000 ->
+/// the DSI scratch buffer). SHENG_MDSS_FB_ADDR, which SSPP is
+/// programmed with as a raw physical address, is not in it -- so the
+/// pixel fetch translation-faults, SSPP starves, and the panel shows
+/// black while INTF1's frame/line counters advance perfectly normally
+/// (timing generator and pixel fetch are independent).
+///
+/// Identity-map the whole 0x80000000-0xC0000000 GB with a single
+/// level-1 block descriptor so the framebuffer's physical address is
+/// also a valid IOVA. L1 index = IOVA >> 30 = 2 for 0x80000000.
+const SMMU_FB_IDENTITY_BLOCK_BASE: u64 = 0x80000000;
+const SMMU_FB_IDENTITY_L1_INDEX: usize = SMMU_FB_IDENTITY_BLOCK_BASE >> 30;
+
+// 4KB-aligned 3-level translation table for the MDSS context bank's
+// TTBR0 -- board.c's build_mem_map() identity-maps every DRAM bank
+// (MT_NORMAL | INNER_SHARE), so these globals' own virtual addresses
+// (BSS, within the low DRAM bank) equal their physical addresses.
+// SMMU_MAPPED_IOVA (0x1000) needs L1 idx=0, L2 idx=0, L3 idx=1 (see
+// the earlier live python walk's own index derivation).
+var smmu_l1_table: [512]u64 align(4096) = [_]u64{0} ** 512;
+var smmu_l2_table: [512]u64 align(4096) = [_]u64{0} ** 512;
+var smmu_l3_table: [512]u64 align(4096) = [_]u64{0} ** 512;
+
+var g_smmu_id1: u32 = 0xFFFFFFFF;
+var g_smmu_cbx: i32 = -2; // -2 = function never ran; -1 = ran but found no free CB
+var g_smmu_s2cr_before: u32 = 0xFFFFFFFF;
+var g_smmu_s2cr_after: u32 = 0xFFFFFFFF;
+
+fn smmuBypassMdssStream() void {
+    const id1 = mmioRead32(APPS_SMMU_BASE, SMMU_GR0_ID1);
+    g_smmu_id1 = id1;
+    g_smmu_s2cr_before = mmioRead32(APPS_SMMU_BASE, SMMU_S2CR_BASE + 4 * SMMU_S2CR_MDSS_INDEX);
+    const num_cb: u32 = id1 & 0xff;
+    const pgshift: u6 = if ((id1 & (1 << 31)) != 0) 16 else 12;
+    const numpagendxb: u32 = (id1 >> 28) & 0x7;
+    const cb_pg_offset: usize = @as(usize, 1) << @intCast(numpagendxb + 1);
+    const page_size: usize = @as(usize, 1) << pgshift;
+    const gr1_base = APPS_SMMU_BASE + page_size * 1;
+
+    var cbx: i32 = -1;
+    var i: usize = 0;
+    while (i < num_cb) : (i += 1) {
+        const cbar = mmioRead32(gr1_base, 4 * i);
+        const ctype = (cbar >> 16) & 0x3;
+        const vmid = cbar & 0xff;
+        // Available (matching alloc_cb()'s own check): already S2_TRANS
+        // (the likely reset value), or S1_TRANS_S2_BYPASS with no VMID
+        // claimed yet.
+        if (ctype == SMMU_CBAR_TYPE_S2_TRANS or
+            (ctype == SMMU_CBAR_TYPE_S1_TRANS_S2_BYPASS and vmid == SMMU_VMID_UNUSED))
+        {
+            var new_cbar = cbar & ~@as(u32, (0x3 << 16) | 0xff);
+            new_cbar |= (SMMU_CBAR_TYPE_S1_TRANS_S2_BYPASS << 16);
+            mmioWrite32(gr1_base, 4 * i, new_cbar);
+
+            const cba2r_off = 0x800 + 4 * i;
+            var cba2r = mmioRead32(gr1_base, cba2r_off);
+            cba2r |= SMMU_CBA2R_VA64;
+            mmioWrite32(gr1_base, cba2r_off, cba2r);
+
+            cbx = @intCast(i);
+            break;
+        }
+    }
+    g_smmu_cbx = cbx;
+    if (cbx < 0) return; // no free context bank -- shouldn't happen, we're first touch
+
+    // REAL GAP FOUND (SPEC.md task #5 log, live SMMU register read off
+    // the exact CB the WORKING Linux boot is using right now): SCTLR=
+    // 0x67 has bit0 (M, stage-1 MMU enable) SET -- Linux genuinely runs
+    // this stream through real, enabled translation, not bypass and
+    // not a disabled-S1-behind-TYPE_TRANS trick. That trick (this
+    // driver's previous approach, live-confirmed to leave S2CR
+    // genuinely reprogrammed via smmu2/smmu3 diagnostics) still
+    // produced the exact same unchanging hang -- meaning disabled-S1
+    // passthrough isn't accepted as a substitute for real translation
+    // on this silicon/firmware. Build an actual minimal identity
+    // mapping instead: one valid 1GB block descriptor (level 1, 4KB
+    // granule -- matches Linux's own live TCR's start_level=1 exactly)
+    // covering the 1GB-aligned region containing both
+    // SHENG_MDSS_DSI_DMA_SCRATCH (0xa3100000) and SHENG_MDSS_FB_ADDR
+    // (0xa3200000, both within [0x80000000,0xc0000000)) mapped
+    // identity (IOVA == PA), with SCTLR.M genuinely enabled. TCR
+    // copied verbatim from Linux's own live, proven-working CB
+    // register (0x80351c) rather than hand-derived, to avoid getting
+    // any of its many field encodings subtly wrong.
+    //
+    // SUPERSEDED (still SPEC.md task #5 log): that identity mapping,
+    // despite genuinely enabling S1 translation exactly like Linux,
+    // still produced the identical unchanging hang -- because it was
+    // still targeting the LOW bank. Real fix: page-level 3-level walk
+    // mapping SMMU_MAPPED_IOVA (0x1000) to SHENG_MDSS_DSI_DMA_SCRATCH's
+    // real physical address (now itself moved to the HIGH bank,
+    // 0x8bb500000 -- see that constant's comment in sheng_mdss.c).
+    const l2_phys: u64 = @intFromPtr(&smmu_l2_table);
+    const l3_phys: u64 = @intFromPtr(&smmu_l3_table);
+    smmu_l1_table[0] = smmuTableDescriptor(l2_phys);
+    smmu_l2_table[0] = smmuTableDescriptor(l3_phys);
+    smmu_l3_table[1] = smmuPageDescriptor(SHENG_MDSS_DSI_DMA_SCRATCH_PHYS);
+    // ...and the framebuffer GB, identity-mapped, for the DPU's SSPP
+    // pixel fetch through this same context bank -- see
+    // SMMU_FB_IDENTITY_BLOCK_BASE's comment.
+    smmu_l1_table[SMMU_FB_IDENTITY_L1_INDEX] =
+        smmuBlockDescriptor1G(SMMU_FB_IDENTITY_BLOCK_BASE);
+
+    const l1_table_addr = @intFromPtr(&smmu_l1_table);
+    flush_dcache_range(l1_table_addr, l1_table_addr + @sizeOf(@TypeOf(smmu_l1_table)));
+    flush_dcache_range(l2_phys, l2_phys + @sizeOf(@TypeOf(smmu_l2_table)));
+    flush_dcache_range(l3_phys, l3_phys + @sizeOf(@TypeOf(smmu_l3_table)));
+
+    const cbx_page = cb_pg_offset + @as(usize, @intCast(cbx));
+    const cbx_base = APPS_SMMU_BASE + page_size * cbx_page;
+    g_smmu_cbx_base = cbx_base; // for sheng_mdss_smmu_fault_diag()
+    const ttbr0: u64 = @intFromPtr(&smmu_l1_table); // identity VA==PA (board.c maps all DRAM banks 1:1)
+    mmioWrite32(cbx_base, 0x20, @truncate(ttbr0)); // TTBR0 low
+    mmioWrite32(cbx_base, 0x24, @truncate(ttbr0 >> 32)); // TTBR0 high
+    mmioWrite32(cbx_base, 0x28, 0); // TTBR1 (unused, T1SZ/EPD1 disabled)
+    mmioWrite32(cbx_base, 0x38, SMMU_MAIR0_NORMAL_WB); // S1_MAIR0: index0 = Normal WB RW-Alloc
+    mmioWrite32(cbx_base, 0x3c, 0); // S1_MAIR1
+    mmioWrite32(cbx_base, 0x30, SMMU_TCR_LIVE_LINUX_VALUE); // TCR -- copied from Linux's own live CB
+    mmioWrite32(cbx_base, 0x0, SMMU_SCTLR_LIVE_LINUX_VALUE); // SCTLR -- M bit set, matches Linux exactly
+
+    const s2cr_val: u32 = (SMMU_S2CR_TYPE_TRANS << 16) | @as(u32, @intCast(cbx));
+    mmioWrite32(APPS_SMMU_BASE, SMMU_S2CR_BASE + 4 * SMMU_S2CR_MDSS_INDEX, s2cr_val);
+    g_smmu_s2cr_after = mmioRead32(APPS_SMMU_BASE, SMMU_S2CR_BASE + 4 * SMMU_S2CR_MDSS_INDEX);
+}
+
+var g_smmu_cbx_base: usize = 0;
+
+/// Reads the MDSS context bank's fault status AFTER the DPU has been
+/// streaming, plus the SMMU's global fault status. This stops the
+/// SSPP-starvation question being a guess: ARM SMMUv2 latches every
+/// translation fault here and holds it until written back.
+///
+///   CB_FSR   (0x058): TF(1)=translation fault, AFF(2), PF(3),
+///                     EF(4)=external fault, TLBMCF(5), TLBLKF(6),
+///                     SS(30)=stall, MULTI(31)=multiple faults
+///   CB_FAR   (0x060): the faulting IOVA, 64-bit -- if SSPP is
+///                     starving on an unmapped framebuffer this reads
+///                     back an address inside SHENG_MDSS_FB_ADDR's
+///                     region, naming the culprit outright
+///   sGFSR    (0x048 in GR0): global faults, incl. USF(1) = unmatched
+///                     stream -- set if our SMR/S2CR index is wrong
+///                     and MDSS transactions aren't hitting our
+///                     context bank at all
+///
+/// FSR == 0 and sGFSR == 0 means translation is NOT the problem and
+/// the black screen is downstream (SSPP/LM/DSC/CTL config), which
+/// redirects the search rather than leaving it ambiguous.
+export fn sheng_mdss_smmu_fault_diag() callconv(.c) i64 {
+    if (g_smmu_cbx_base == 0) return -1;
+    const fsr = mmioRead32(g_smmu_cbx_base, 0x058);
+    const gfsr = mmioRead32(APPS_SMMU_BASE, 0x048);
+    return (@as(i64, fsr) << 32) | @as(i64, gfsr);
+}
+
+export fn sheng_mdss_smmu_fault_addr() callconv(.c) i64 {
+    if (g_smmu_cbx_base == 0) return -1;
+    const far_lo = mmioRead32(g_smmu_cbx_base, 0x060);
+    const far_hi = mmioRead32(g_smmu_cbx_base, 0x064);
+    return @bitCast((@as(u64, far_hi) << 32) | @as(u64, far_lo));
+}
+
+export fn sheng_mdss_smmu_diag1() callconv(.c) u32 {
+    return g_smmu_id1;
+}
+export fn sheng_mdss_smmu_diag2() callconv(.c) i64 {
+    return (@as(i64, g_smmu_cbx) << 32) | @as(i64, g_smmu_s2cr_before);
+}
+export fn sheng_mdss_smmu_diag3() callconv(.c) u32 {
+    return g_smmu_s2cr_after;
+}
+
+/// Disable the timing engines and clear CTL_START/pending flush before
+/// handing off to Linux -- previously this driver never did any
+/// teardown at all, leaving the DPU actively streaming (continuous
+/// memory fetch from our framebuffer) when U-Boot jumps straight into
+/// booti with zero cleanup. Reprogramming IOMMU stream tables (which
+/// Linux's own arm-smmu driver does during its probe) while a master
+/// has live in-flight transactions is a known class of bug that can
+/// corrupt IOMMU/GEM state -- matching exactly the "framebuffer is not
+/// in virtual address space" GEM/vmap failure Linux hits when this
+/// driver runs first. Mirrors dpu_encoder_phys_vid_disable()'s
+/// approach: disable timing engines, then let CTL_START's own next
+/// flush cycle naturally not re-trigger since nothing keeps poking it.
+export fn sheng_mdss_dpu_stop(dpu_base: usize) callconv(.c) void {
+    const ctl_base = dpu_base + 0x15000;
+    const intf1_base = dpu_base + 0x35000;
+    const intf2_base = dpu_base + 0x36000;
+
+    mmioWrite32(intf1_base, INTF_TIMING_ENGINE_EN, 0);
+    mmioWrite32(intf2_base, INTF_TIMING_ENGINE_EN, 0);
+    mmioWrite32(ctl_base, CTL_START, 0);
+    mmioWrite32(ctl_base, CTL_FLUSH, 0);
+}
+
+/// dsi_7nm_phy_disable()'s exact sequence, mirrored: drop the REFGEN
+/// vote, disable LPRX/CDRX on logical lane 0, clear the lane-enable
+/// bits out of CTRL_0, zero LANE_CTRL0, then power down all PHY blocks.
+/// Called on both DSI0 and DSI1 PHYs during full teardown so Linux's
+/// own dsi_7nm_phy_enable() starts from a genuinely powered-down PHY
+/// instead of one this driver left mid-HS-burst.
+fn dsiPhyDisable(phy_base: usize) void {
+    const lane = phy_base + LANE_BASE_OFFSET;
+
+    mmioWrite32(lane, 0 * LANE_STRIDE + LN_LPRX_CTRL, 0);
+
+    mmioWrite32(phy_base, CMN_GLBL_DIGTOP_SPARE10, 0x0);
+    udelay(2);
+
+    mmioClearBits32(phy_base, CMN_CTRL_0, 0x1f);
+    mmioWrite32(phy_base, CMN_LANE_CTRL0, 0x0);
+    mmioWrite32(phy_base, CMN_CTRL_0, 0x0);
+}
+
+fn clkBranchDisable(dispcc_base: usize, cbcr_off: usize) void {
+    mmioClearBits32(dispcc_base, cbcr_off, CBCR_ENABLE);
+}
+
+/// Inverse of sheng_mdss_dispcc_dsi_clks_init(): gate off every DSI
+/// pclk/byte/byte_intf/esc branch this driver turned on, plus the MDP
+/// core clock -- so Linux's own dispcc probe re-enables each branch
+/// from a clean OFF state (clk_branch2_check_halt-style enable/poll)
+/// instead of finding them already running with this driver's
+/// configuration (wrong parent for Linux's own clk tree bookkeeping,
+/// even though the physical rate happens to be correct).
+export fn sheng_mdss_dispcc_dsi_clks_stop(dispcc_base: usize) callconv(.c) void {
+    clkBranchDisable(dispcc_base, PCLK0_CLK_CBCR);
+    clkBranchDisable(dispcc_base, PCLK1_CLK_CBCR);
+    clkBranchDisable(dispcc_base, BYTE0_CLK_CBCR);
+    clkBranchDisable(dispcc_base, BYTE1_CLK_CBCR);
+    clkBranchDisable(dispcc_base, BYTE0_INTF_CLK_CBCR);
+    clkBranchDisable(dispcc_base, BYTE1_INTF_CLK_CBCR);
+    clkBranchDisable(dispcc_base, ESC0_CLK_CBCR);
+    clkBranchDisable(dispcc_base, ESC1_CLK_CBCR);
+    clkBranchDisable(dispcc_base, MDP_CLK_CBCR);
+}
+
+/// Full pre-handoff teardown (see board.c/sheng_mdss.c's
+/// sheng_mdss_teardown()): DPU pipeline stop, both DSI PHYs powered
+/// down, all DSI/MDP DISPCC branches gated off, then MDSS core reset
+/// pulsed once more (msm_mdss_reset()'s own pattern -- idempotent,
+/// matches what Linux's real probe does as its own first step anyway,
+/// but pulsing it here too means the digital logic starts from a known
+/// state even before Linux's driver runs). Panel-side reset/avdd/avee
+/// teardown (DCS sleep-in, GPIO reset assert) is handled separately in
+/// board.c, since those are TLMM GPIO writes, not MMIO register pokes.
+export fn sheng_mdss_full_teardown(dpu_base: usize, dsi0_phy_base: usize, dsi1_phy_base: usize, dispcc_base: usize) callconv(.c) void {
+    sheng_mdss_dpu_stop(dpu_base);
+    dsiPhyDisable(dsi0_phy_base);
+    dsiPhyDisable(dsi1_phy_base);
+    sheng_mdss_dispcc_dsi_clks_stop(dispcc_base);
+    sheng_mdss_core_reset(dispcc_base);
 }
 
 /// Configure the DPU SSPP to source from `fb_addr` and the INTF timing
@@ -1652,7 +3076,19 @@ export fn sheng_mdss_dpu_start(
     enable_dsc: bool,
 ) callconv(.c) c_int {
     const half_w: u32 = hactive / 2; // 1524
-    const stride: u32 = hactive * 4; // XRGB8888, full-scanline stride
+    // msm_drv.h's align_pitch(): "adreno needs pitch aligned to 32
+    // pixels" -- (hactive+31)&~31 = 3072 for hactive=3048, *4 bytes =
+    // 12288, matching a live-verified working mmap test on this exact
+    // panel (2032*12288 = 24,969,216 bytes, confirmed against a real
+    // captured framebuffer-testing log -- see SPEC.md task #5). Our
+    // own self-allocated framebuffer isn't required to match Linux's
+    // GEM stolen-fb allocation, but DSC slice-boundary/SSPP burst
+    // alignment could plausibly care about this even outside that
+    // specific Adreno comment's stated reason, and it costs nothing to
+    // match a value independently proven correct on this hardware
+    // rather than the naive tightly-packed 12192 previously used here.
+    const aligned_hactive: u32 = (hactive + 31) & ~@as(u32, 31);
+    const stride: u32 = aligned_hactive * 4; // XRGB8888, 32px-aligned stride
     const half_stride: u32 = stride / 2;
 
     const ctl_base = dpu_base + 0x15000;
@@ -1665,9 +3101,18 @@ export fn sheng_mdss_dpu_start(
     const intf1_base = dpu_base + 0x35000; // DSI0 (master)
     const intf2_base = dpu_base + 0x36000; // DSI1 (slave)
 
+    // Force the display's IOMMU stream to bypass before any memory
+    // fetch is attempted -- see smmuBypassMdssStream()'s comment. This
+    // is likely THE reason nothing has ever rendered from this driver.
+    smmuBypassMdssStream();
+
     // -- SSPP: single DMA pipe, multirect TIME_MX, rect0=left half,
     // rect1=right half of the framebuffer.
-    mmioWrite32(sspp_base, SSPP_SRC_SIZE, (vactive << 16) | hactive);
+    // CROSS-VERIFIED AGAINST LIVE HARDWARE (SPEC.md task #5 log): each
+    // multirect rect fetches a HALF-WIDTH window (rect0 at x=0, rect1 at
+    // x=half_w), so SRC_SIZE is half_w -- not the full hactive this used
+    // to program. Live SSPP SRC_SIZE reads 0x07F005F4 = 2032 x 1524.
+    mmioWrite32(sspp_base, SSPP_SRC_SIZE, (vactive << 16) | half_w);
     mmioWrite32(sspp_base, SSPP_SRC_XY, 0);
     mmioWrite32(sspp_base, SSPP_OUT_SIZE, (vactive << 16) | half_w);
     mmioWrite32(sspp_base, SSPP_OUT_XY, 0);
@@ -1678,21 +3123,24 @@ export fn sheng_mdss_dpu_start(
     mmioWrite32(sspp_base, SSPP_SRC_YSTRIDE0, (stride & 0xffff) | ((stride & 0xffff) << 16));
     mmioWrite32(sspp_base, SSPP_SRC_FORMAT, SSPP_XRGB8888_SRC_FORMAT);
     mmioWrite32(sspp_base, SSPP_SRC_UNPACK_PATTERN, SSPP_XRGB8888_UNPACK_PATTERN);
-    mmioWrite32(sspp_base, SSPP_SRC_OP_MODE, SSPP_OP_MODE_PE_OVERRIDE);
-    mmioWrite32(sspp_base, SSPP_MULTIRECT_OPMODE, SSPP_MULTIRECT_INDEX_REC0 | SSPP_MULTIRECT_MODE_TIME_MX);
+    mmioWrite32(sspp_base, SSPP_SRC_OP_MODE, SSPP_OP_MODE_LIVE);
 
-    mmioWrite32(sspp_base, SSPP_SRC_SIZE_REC1, (vactive << 16) | hactive);
+    mmioWrite32(sspp_base, SSPP_SRC_SIZE_REC1, (vactive << 16) | half_w);
     mmioWrite32(sspp_base, SSPP_SRC_XY_REC1, half_w); // x offset = half_w, y=0
     mmioWrite32(sspp_base, SSPP_OUT_SIZE_REC1, (vactive << 16) | half_w);
-    mmioWrite32(sspp_base, SSPP_OUT_XY_REC1, 0);
+    // Live OUT_XY_REC1 = 0x000005F4 (x = half_w), not 0.
+    mmioWrite32(sspp_base, SSPP_OUT_XY_REC1, half_w);
     // rect1 fetches through SRC1_ADDR, not SRC0_ADDR -- same buffer base,
     // SRC_XY_REC1's x=half_w crops into the right half via YSTRIDE0's
     // high16 pitch.
     mmioWrite32(sspp_base, SSPP_SRC1_ADDR, @truncate(fb_addr));
     mmioWrite32(sspp_base, SSPP_SRC_FORMAT_REC1, SSPP_XRGB8888_SRC_FORMAT);
     mmioWrite32(sspp_base, SSPP_SRC_UNPACK_PATTERN_REC1, SSPP_XRGB8888_UNPACK_PATTERN);
-    mmioWrite32(sspp_base, SSPP_SRC_OP_MODE_REC1, SSPP_OP_MODE_PE_OVERRIDE);
-    mmioSetBits32(sspp_base, SSPP_MULTIRECT_OPMODE, SSPP_MULTIRECT_INDEX_REC1 | SSPP_MULTIRECT_MODE_TIME_MX);
+    mmioWrite32(sspp_base, SSPP_SRC_OP_MODE_REC1, SSPP_OP_MODE_LIVE);
+    // dpu_hw_sspp_setup_multirect() ORs DPU_SSPP_RECT_0(1) | DPU_SSPP_RECT_1(2)
+    // and sets BIT(2) ONLY for TIME_MX. Live reads 0x3 -- both rects,
+    // parallel, NOT time-multiplexed as this previously programmed (0x5).
+    mmioWrite32(sspp_base, SSPP_MULTIRECT_OPMODE, SSPP_MULTIRECT_OPMODE_LIVE);
 
     _ = half_stride;
 
@@ -1700,12 +3148,12 @@ export fn sheng_mdss_dpu_start(
 
     // -- LM: single opaque blendstage each, output = per-half size.
     mmioWrite32(lm0_base, LM_OUT_SIZE, (vactive << 16) | half_w);
-    mmioWrite32(lm0_base, LM_OP_MODE, 0); // right_mixer=0: each LM is a solo half, not a source-split pair
+    mmioWrite32(lm0_base, LM_OP_MODE, LM_OP_MODE_STAGE0_ENABLED);
     mmioWrite32(lm0_base, LM_STAGE0_OFFSET + LM_BLEND0_CONST_ALPHA, LM_CONST_ALPHA_OPAQUE);
     mmioWrite32(lm0_base, LM_STAGE0_OFFSET + LM_BLEND0_OP, LM_BLEND_OP_OPAQUE);
 
     mmioWrite32(lm1_base, LM_OUT_SIZE, (vactive << 16) | half_w);
-    mmioWrite32(lm1_base, LM_OP_MODE, 0);
+    mmioWrite32(lm1_base, LM_OP_MODE, LM_OP_MODE_STAGE0_ENABLED | LM_OP_MODE_LM1_EXTRA);
     mmioWrite32(lm1_base, LM_STAGE0_OFFSET + LM_BLEND0_CONST_ALPHA, LM_CONST_ALPHA_OPAQUE);
     mmioWrite32(lm1_base, LM_STAGE0_OFFSET + LM_BLEND0_OP, LM_BLEND_OP_OPAQUE);
 
@@ -1713,9 +3161,32 @@ export fn sheng_mdss_dpu_start(
     // LM_1 stage 0 (ctl_blend_config[SSPP_DMA0][rect] from dpu_hw_ctl.c:
     // rect0 -> idx0/shift18 in CTL_LAYER(lm); rect1 -> idx2/shift8 in
     // CTL_LAYER_EXT2(lm)). Stage index i=0 -> mix=(i+1)&0x7=1.
-    mmioWrite32(ctl_base, CTL_LAYER0, CTL_MIXER_BORDER_OUT | (@as(u32, 1) << 18));
-    mmioWrite32(ctl_base, CTL_LAYER1, CTL_MIXER_BORDER_OUT);
-    mmioWrite32(ctl_base, CTL_LAYER_EXT2_1, @as(u32, 1) << 8);
+    // CROSS-VERIFIED AGAINST LIVE HARDWARE (SPEC.md task #5 log):
+    // dpu_hw_ctl_setup_blendstage() writes mix = (stage_index + 1) into
+    // the per-SSPP field. The plane sits at DPU_STAGE_0, which is 1
+    // (DPU_STAGE_BASE = 0 is the border), so the stage index is 1 and
+    // mix is 2 -- the same stage 1 that LM_OP_MODE bit1 enables. This
+    // previously wrote mix = 1, disagreeing with its own LM_OP_MODE.
+    // Live: CTL_LAYER0 = CTL_LAYER1 = 0x01080000,
+    //       CTL_LAYER_EXT2_0 = CTL_LAYER_EXT2_1 = 0x00000200.
+    // Note LM1 needs the pipe staged too -- it was previously left with
+    // BORDER_OUT only, i.e. the right half of the panel was explicitly
+    // configured to show nothing but border colour.
+    if (DPU_BORDER_ONLY_BISECT) {
+        // See DPU_BORDER_ONLY_BISECT's comment: no pipe staged, mixers
+        // emit border, zero memory fetch.
+        mmioWrite32(ctl_base, CTL_LAYER0, CTL_MIXER_BORDER_OUT);
+        mmioWrite32(ctl_base, CTL_LAYER1, CTL_MIXER_BORDER_OUT);
+        mmioWrite32(ctl_base, CTL_LAYER_EXT2_0, 0);
+        mmioWrite32(ctl_base, CTL_LAYER_EXT2_1, 0);
+        mmioWrite32(lm0_base, LM_OP_MODE, 0);
+        mmioWrite32(lm1_base, LM_OP_MODE, LM_OP_MODE_LM1_EXTRA);
+    } else {
+        mmioWrite32(ctl_base, CTL_LAYER0, CTL_MIXER_BORDER_OUT | (@as(u32, 2) << 18));
+        mmioWrite32(ctl_base, CTL_LAYER1, CTL_MIXER_BORDER_OUT | (@as(u32, 2) << 18));
+        mmioWrite32(ctl_base, CTL_LAYER_EXT2_0, @as(u32, 2) << 8);
+        mmioWrite32(ctl_base, CTL_LAYER_EXT2_1, @as(u32, 2) << 8);
+    }
 
     if (DPU_TEST_STOP_STAGE <= 2) return 0;
 
@@ -1726,10 +3197,19 @@ export fn sheng_mdss_dpu_start(
     // really what's blocking a visible image, at the cost of needing
     // ~3x the bandwidth for the same resolution.
     if (enable_dsc) {
-        mmioSetBits32(pp0_base, PP_DCE_DATA_OUT_SWAP, 1 << 18);
-        mmioWrite32(pp0_base, PP_DSC_MODE, 1);
-        mmioSetBits32(pp1_base, PP_DCE_DATA_OUT_SWAP, 1 << 18);
-        mmioWrite32(pp1_base, PP_DSC_MODE, 1);
+        // CROSS-VERIFIED AGAINST LIVE HARDWARE (SPEC.md task #5 log):
+        // both of these read 0 on working silicon, on BOTH pingpongs,
+        // while DSC is active. This driver used to set PP_DSC_MODE=1 and
+        // PP_DCE_DATA_OUT_SWAP bit18. Consistent with live INTF_CONFIG2
+        // NOT carrying DCE_DATA_COMPRESS: on this hardware revision the
+        // DSC path is selected through CTL_DSC_ACTIVE/CTL_DSC_FLUSH and
+        // the DSC block itself, not via the pingpong. Written explicitly
+        // rather than skipped so the state is deterministic regardless
+        // of what the previous bootloader left behind.
+        mmioWrite32(pp0_base, PP_DCE_DATA_OUT_SWAP, 0);
+        mmioWrite32(pp0_base, PP_DSC_MODE, 0);
+        mmioWrite32(pp1_base, PP_DCE_DATA_OUT_SWAP, 0);
+        mmioWrite32(pp1_base, PP_DSC_MODE, 0);
 
         // -- DSC: two hard-slice encoder instances sharing the DCE base,
         // dce_0_0 sblk (enc+0x100/ctl+0xf00) for DSC_0, dce_0_1 sblk
@@ -1754,8 +3234,8 @@ export fn sheng_mdss_dpu_start(
     setupIntfTiming(intf1_base, intf_w, vactive, half_hfront, half_hback, half_hsync, vfront_porch, vback_porch, vsync_width);
     setupIntfTiming(intf2_base, intf_w, vactive, half_hfront, half_hback, half_hsync, vfront_porch, vback_porch, vsync_width);
 
-    mmioWrite32(intf1_base, INTF_MUX, 0); // bind to PINGPONG_0
-    mmioWrite32(intf2_base, INTF_MUX, 1); // bind to PINGPONG_1
+    mmioWrite32(intf1_base, INTF_MUX, INTF_MUX_LIVE_BASE | 0); // bind to PINGPONG_0
+    mmioWrite32(intf2_base, INTF_MUX, INTF_MUX_LIVE_BASE | 1); // bind to PINGPONG_1
 
     if (DPU_TEST_STOP_STAGE <= 4) return 0;
 
@@ -1766,6 +3246,8 @@ export fn sheng_mdss_dpu_start(
     mmioWrite32(ctl_base, CTL_INTF_ACTIVE, (@as(u32, 1) << 1) | (@as(u32, 1) << 2)); // INTF_1, INTF_2
     mmioWrite32(ctl_base, CTL_DSC_ACTIVE, if (enable_dsc) @as(u32, 0x3) else 0); // DSC_0, DSC_1
     mmioWrite32(ctl_base, CTL_INTF_MASTER, @as(u32, 1) << 1); // INTF_1 is master
+    // Permit SSPP_DMA0 to fetch -- see CTL_FETCH_PIPE_ACTIVE's comment.
+    mmioWrite32(ctl_base, CTL_FETCH_PIPE_ACTIVE, CTL_FETCH_PIPE_SSPP_DMA0);
 
     if (DPU_TEST_STOP_STAGE <= 5) return 0;
 
@@ -1807,6 +3289,77 @@ export fn sheng_mdss_dpu_start(
     return 0;
 }
 
+/// Post-start datapath readback (SPEC.md task #5 log). The panel is
+/// lit, DSI commands all succeed, INTF1's frame counter advances
+/// (~28 frames/500ms) and the SMMU reports zero faults -- so timing,
+/// link and translation are all proven good and the black screen has
+/// to be a datapath-config problem between the framebuffer and the
+/// mixer output. Rather than keep inspecting write-side code that
+/// "looks right", read the pipeline back after it has been running.
+///
+/// diag1 = CTL_FLUSH  << 32 | CTL_START
+///   CTL_FLUSH bits are cleared BY HARDWARE as each block's config is
+///   latched. Non-zero here, hundreds of frames after CTL_START, means
+///   the commit never completed and none of the SSPP/LM/DSC config
+///   below ever took effect -- INTF would then happily stream timing
+///   with nothing behind it, which is exactly the symptom.
+/// diag2 = SSPP_SRC0_ADDR << 32 | SSPP_SRC_FORMAT
+///   Confirms the fetch address and pixel format survived the commit
+///   (0 => the block was reset/never latched).
+/// diag3 = LM0 OUT_SIZE << 32 | LM0 blend-stage0 OP
+///   The mixer's own view: output size and whether stage 0 is actually
+///   blending the pipe in rather than emitting border colour (black).
+/// DSI-side readback while the DPU is supposedly streaming video.
+///
+/// The single most informative bit here is STATUS0's
+/// VIDEO_MODE_ENGINE_BUSY (bit3, per dsi.xml). If the DSI host is
+/// genuinely transmitting a video stream it is ~always asserted; if it
+/// reads 0 while INTF1's frame counter is advancing, then the DPU is
+/// clocking out timing into a DSI host that is not actually sending
+/// anything, and the black panel is explained without any of the
+/// SSPP/LM/DSC config being at fault (all of which read back correct).
+///
+/// diag5 = DSI0 CTRL << 32 | DSI0 STATUS0
+///   CTRL confirms the command->video mode switch actually stuck
+///   (VID_MODE_EN bit1 set, CMD_MODE_EN bit2 clear).
+/// diag6 = DSI0 FIFO_STATUS << 32 | DSI1 STATUS0
+///   FIFO_STATUS shows video-path underflow (VIDEO_MDP_FIFO_UNDERFLOW
+///   bit3 / OVERFLOW bit0) -- i.e. the DSI host starving or drowning
+///   on pixel data from the DPU, distinct from the command-DMA FIFO
+///   bits that cracked the AXI clock bug. DSI1's STATUS0 checks the
+///   slave half of the bonded link is in the same state as the master.
+export fn sheng_mdss_dsi_video_readback1(dsi0_base: usize) callconv(.c) i64 {
+    return (@as(i64, mmioRead32(dsi0_base, DSI_CTRL)) << 32) |
+        @as(i64, mmioRead32(dsi0_base, DSI_STATUS0));
+}
+export fn sheng_mdss_dsi_video_readback2(dsi0_base: usize, dsi1_base: usize) callconv(.c) i64 {
+    return (@as(i64, mmioRead32(dsi0_base, DSI_FIFO_STATUS)) << 32) |
+        @as(i64, mmioRead32(dsi1_base, DSI_STATUS0));
+}
+
+export fn sheng_mdss_dpu_readback1(dpu_base: usize) callconv(.c) i64 {
+    const ctl_base = dpu_base + 0x15000;
+    return (@as(i64, mmioRead32(ctl_base, CTL_FLUSH)) << 32) |
+        @as(i64, mmioRead32(ctl_base, CTL_START));
+}
+export fn sheng_mdss_dpu_readback2(dpu_base: usize) callconv(.c) i64 {
+    const sspp_base = dpu_base + 0x24000;
+    return (@as(i64, mmioRead32(sspp_base, SSPP_SRC0_ADDR)) << 32) |
+        @as(i64, mmioRead32(sspp_base, SSPP_SRC_FORMAT));
+}
+export fn sheng_mdss_dpu_readback3(dpu_base: usize) callconv(.c) i64 {
+    const lm0_base = dpu_base + 0x44000;
+    return (@as(i64, mmioRead32(lm0_base, LM_OUT_SIZE)) << 32) |
+        @as(i64, mmioRead32(lm0_base, LM_STAGE0_OFFSET + LM_BLEND0_OP));
+}
+/// diag4 = CTL_LAYER0 << 32 | CTL_LAYER_EXT2_1 -- the actual routing
+/// of the SSPP rects into the two mixers, read back from hardware.
+export fn sheng_mdss_dpu_readback4(dpu_base: usize) callconv(.c) i64 {
+    const ctl_base = dpu_base + 0x15000;
+    return (@as(i64, mmioRead32(ctl_base, CTL_LAYER0)) << 32) |
+        @as(i64, mmioRead32(ctl_base, CTL_LAYER_EXT2_1));
+}
+
 fn setupIntfTiming(
     intf_base: usize,
     width: u32,
@@ -1835,7 +3388,15 @@ fn setupIntfTiming(
     // matches dpu_hw_intf_setup_timing_engine's "active_h_end==0" path.
     const polarity_ctl: u32 = 0; // DSI: hsync/vsync/den polarity forced low
 
-    const data_width = width; // compression_en, !wide_bus_en -> data_width == width (dce_bytes_per_line path skipped, 1:1 for our fixed mode)
+    // CROSS-VERIFIED AGAINST LIVE HARDWARE (SPEC.md task #5 log): this
+    // interface runs a WIDENED databus -- live INTF_CONFIG2 has
+    // DATABUS_WIDEN (bit0) set, and live DISPLAY_DATA_HCTL ends at 301
+    // rather than 555, i.e. a data width of 254 == width/2. A widened
+    // bus carries 2 pixels per pclk, halving the data-phase width.
+    // This code previously asserted "our wide_bus_en is false" and
+    // programmed the full width, telling INTF to expect twice as many
+    // data beats per line as the DSC engine actually emits.
+    const data_width = width / 2;
     const hsync_data_start_x = hsync_start_x;
     const hsync_data_end_x = hsync_start_x +% data_width -% 1;
     const display_data_hctl = (hsync_data_end_x << 16) | hsync_data_start_x;
@@ -1853,8 +3414,11 @@ fn setupIntfTiming(
     mmioWrite32(intf_base, INTF_UNDERFLOW_COLOR, 0xff);
     mmioWrite32(intf_base, INTF_HSYNC_SKEW, 0);
     mmioWrite32(intf_base, INTF_POLARITY_CTL, polarity_ctl);
+    // Live reads 0 here; 0x3 is kept deliberately because this register
+    // only enables the frame/line counters this driver uses for its own
+    // scanout diagnostics (sheng.f1a/f1b) and has no effect on output.
     mmioWrite32(intf_base, INTF_FRAME_LINE_COUNT_EN, 0x3);
-    mmioWrite32(intf_base, INTF_CONFIG, 0); // no ACTIVE_H/V_EN, no prog-fetch
+    mmioWrite32(intf_base, INTF_CONFIG, INTF_CONFIG_LIVE);
     mmioWrite32(intf_base, INTF_PANEL_FORMAT, INTF_PANEL_FORMAT_RGB888);
 
     // compression_en && !wide_bus_en -> DATA_HCTL_EN would normally be
@@ -1862,8 +3426,97 @@ fn setupIntfTiming(
     // wide_bus_en is false and compression_en is true, so per the exact
     // condition `!(compression_en && !wide_bus_en)` DATA_HCTL_EN stays
     // OFF here (both terms true -> negation false).
-    const intf_cfg2 = INTF_CFG2_DCE_DATA_COMPRESS;
-    mmioWrite32(intf_base, INTF_CONFIG2, intf_cfg2);
+    mmioWrite32(intf_base, INTF_CONFIG2, INTF_CONFIG2_LIVE);
     mmioWrite32(intf_base, INTF_DISPLAY_DATA_HCTL, display_data_hctl);
     mmioWrite32(intf_base, INTF_ACTIVE_DATA_HCTL, 0);
+}
+
+// ===========================================================================
+// SELF-VERIFICATION AGAINST LIVE-HARDWARE REFERENCE (SPEC.md task #5 log)
+//
+// Roughly two dozen individually-plausible register values in this driver
+// turned out to be wrong, each found by dumping Linux's own registers via
+// devmem while DRM drove this exact panel and diffing. Rather than keep
+// discovering those one boot at a time, this table holds every reference
+// value captured so far and checks the WHOLE pipeline in one shot, after
+// dpu_start() has run and committed.
+//
+// Every entry is a value read from working silicon in the same 144Hz DSC
+// bonded-DSI mode this driver targets (verified: INTF timing registers
+// match ours bit-for-bit, so Linux was in the identical mode).
+//
+// Returns a bitmask: bit N set == entry N does NOT hold its reference
+// value. 0 means the entire programmed pipeline matches working hardware,
+// which would prove the remaining fault is NOT a register-content problem
+// and redirect the search entirely.
+// ===========================================================================
+
+const VerifyEntry = struct {
+    block: u8, // 0=dsi0, 1=dpu-absolute-offset
+    off: usize,
+    expect: u32,
+};
+
+// block 1 offsets are relative to dpu_base.
+const verify_table = [_]VerifyEntry{
+    .{ .block = 0, .off = 0x000, .expect = 0x000001F3 }, // DSI CTRL
+    .{ .block = 0, .off = 0x00c, .expect = 0x02009230 }, // DSI VID_CFG0
+    .{ .block = 0, .off = 0x020, .expect = 0x022C0030 }, // DSI ACTIVE_H
+    .{ .block = 0, .off = 0x024, .expect = 0x087C008C }, // DSI ACTIVE_V
+    .{ .block = 0, .off = 0x028, .expect = 0x08950272 }, // DSI TOTAL
+    .{ .block = 0, .off = 0x038, .expect = 0x14000000 }, // DSI CMD_DMA_CTRL
+    .{ .block = 0, .off = 0x080, .expect = 0x80001004 }, // DSI TRIG_CTRL
+    .{ .block = 0, .off = 0x0a8, .expect = 0x01000000 }, // DSI LANE_CTRL
+    .{ .block = 0, .off = 0x0ac, .expect = 0x00000000 }, // DSI LANE_SWAP_CTRL
+    .{ .block = 0, .off = 0x118, .expect = 0x0000023F }, // DSI CLK_CTRL
+    .{ .block = 0, .off = 0x29c, .expect = 0x05F40B01 }, // DSI VIDEO_COMPRESSION
+    .{ .block = 1, .off = 0x15000, .expect = 0x01080000 }, // CTL_LAYER0
+    .{ .block = 1, .off = 0x15004, .expect = 0x01080000 }, // CTL_LAYER1
+    .{ .block = 1, .off = 0x15070, .expect = 0x00000200 }, // CTL_LAYER_EXT2_0
+    .{ .block = 1, .off = 0x15074, .expect = 0x00000200 }, // CTL_LAYER_EXT2_1
+    .{ .block = 1, .off = 0x15014, .expect = 0xF0000000 }, // CTL_TOP
+    .{ .block = 1, .off = 0x150e8, .expect = 0x00000003 }, // CTL_DSC_ACTIVE
+    .{ .block = 1, .off = 0x150f4, .expect = 0x00000006 }, // CTL_INTF_ACTIVE
+    .{ .block = 1, .off = 0x15134, .expect = 0x00000002 }, // CTL_INTF_MASTER
+    .{ .block = 1, .off = 0x150fc, .expect = 0x00000001 }, // CTL_FETCH_PIPE_ACTIVE
+    .{ .block = 1, .off = 0x24000, .expect = 0x07F005F4 }, // SSPP SRC_SIZE
+    .{ .block = 1, .off = 0x2400c, .expect = 0x07F005F4 }, // SSPP OUT_SIZE
+    .{ .block = 1, .off = 0x24024, .expect = 0x30003000 }, // SSPP YSTRIDE0
+    .{ .block = 1, .off = 0x24030, .expect = 0x000236FF }, // SSPP SRC_FORMAT
+    .{ .block = 1, .off = 0x24034, .expect = 0x03020001 }, // SSPP UNPACK
+    .{ .block = 1, .off = 0x24038, .expect = 0x80000000 }, // SSPP OP_MODE
+    .{ .block = 1, .off = 0x24170, .expect = 0x00000003 }, // SSPP MULTIRECT_OPMODE
+    .{ .block = 1, .off = 0x2416c, .expect = 0x07F005F4 }, // SSPP SRC_SIZE_REC1
+    .{ .block = 1, .off = 0x24164, .expect = 0x000005F4 }, // SSPP OUT_XY_REC1
+    .{ .block = 1, .off = 0x44000, .expect = 0x00000002 }, // LM0 OP_MODE
+    .{ .block = 1, .off = 0x44004, .expect = 0x07F005F4 }, // LM0 OUT_SIZE
+    .{ .block = 1, .off = 0x44020, .expect = 0x00000100 }, // LM0 BLEND0_OP
+    .{ .block = 1, .off = 0x44024, .expect = 0x00FF0000 }, // LM0 CONST_ALPHA
+    .{ .block = 1, .off = 0x45000, .expect = 0x80000002 }, // LM1 OP_MODE
+    .{ .block = 1, .off = 0x35004, .expect = 0x80800000 }, // INTF1 CONFIG
+    .{ .block = 1, .off = 0x35060, .expect = 0x00001011 }, // INTF1 CONFIG2
+    .{ .block = 1, .off = 0x35008, .expect = 0x02730002 }, // INTF1 HSYNC_CTL
+    .{ .block = 1, .off = 0x3503c, .expect = 0x022B0030 }, // INTF1 DISPLAY_HCTL
+    .{ .block = 1, .off = 0x35064, .expect = 0x012D0030 }, // INTF1 DISPLAY_DATA_HCTL
+    .{ .block = 1, .off = 0x35090, .expect = 0x00002100 }, // INTF1 PANEL_FORMAT
+    .{ .block = 1, .off = 0x3525c, .expect = 0x000F0000 }, // INTF1 MUX
+    .{ .block = 1, .off = 0x80000, .expect = 0x00000101 }, // DSC CMN_MAIN_CNF
+    .{ .block = 1, .off = 0x80130, .expect = 0x10120258 }, // DSC0 MAIN_CONF
+    .{ .block = 1, .off = 0x80134, .expect = 0x07F00BE8 }, // DSC0 PICTURE_SIZE
+    .{ .block = 1, .off = 0x80f04, .expect = 0x00001801 }, // DSC0 CFG
+    .{ .block = 1, .off = 0x690a0, .expect = 0x00000000 }, // PP0 DSC_MODE
+};
+
+var g_verify_mask: u64 = 0;
+
+export fn sheng_mdss_verify_pipeline(dpu_base: usize, dsi0_base: usize) callconv(.c) i64 {
+    var mask: u64 = 0;
+    for (verify_table, 0..) |e, i| {
+        const base = if (e.block == 0) dsi0_base else dpu_base;
+        const off = if (e.block == 0) e.off else e.off;
+        const got = mmioRead32(base, off);
+        if (got != e.expect) mask |= (@as(u64, 1) << @intCast(i));
+    }
+    g_verify_mask = mask;
+    return @bitCast(mask);
 }

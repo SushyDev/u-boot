@@ -92,8 +92,24 @@ CONFIG_ENV_USE_DEFAULT_ENV_TEXT_FILE=y
 # Reverting to disabled: this is the one config confirmed to actually
 # work (Linux shows a real login prompt). Don't regress past this
 # known-good point; resume investigation from here next time.
-# CONFIG_VIDEO is not set
-# CONFIG_VIDEO_SHENG_MDSS is not set
+#
+# REAL LIKELY ANSWER FOUND (SPEC.md task #5 log): live devmem read of
+# apps_smmu's SCR0 (0x15000000) showed USFCFG=1 -- unidentified/
+# unmatched IOMMU streams FAULT by default on this hardware, not
+# bypass. The display's real stream ID (mdss's iommus property,
+# 0x1c00/mask 0x2 in sm8550.dtsi) has a firmware-provisioned SMR entry
+# at a fixed slot (SMR[3] = 0x80021c00, confirmed by scanning all 105
+# stream-match groups) -- every raw physical-address SSPP fetch this
+# driver ever did was almost certainly silently aborted by the SMMU,
+# explaining precisely why frame/line counters increment fine (pure
+# INTF timing, no memory access) while zero real pixel content ever
+# showed up, with no visible hang. Added smmuBypassMdssStream()
+# (forces S2CR[3] to BYPASS before any framebuffer fetch) and
+# sheng_mdss_dpu_stop()/sheng_mdss_teardown() (clean pipeline teardown
+# before Linux boots, likely fixing the GEM/vmap corruption too).
+# Re-enabling to test both fixes together.
+CONFIG_VIDEO=y
+CONFIG_VIDEO_SHENG_MDSS=y
 # Root cause of the CONFIG_VIDEO hang (see git history / SPEC.md):
 # growing the u-boot binary enough to cross ~1MB loaded size (physical
 # kernel_offset 0x8000 + kernel_size) apparently collides with
