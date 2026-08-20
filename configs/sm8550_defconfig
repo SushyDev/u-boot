@@ -61,10 +61,39 @@ CONFIG_ENV_USE_DEFAULT_ENV_TEXT_FILE=y
 # never runs => no panel init at all), so the LCD glass is almost
 # certainly still sitting in its default-closed/blank state, physically
 # blocking backlight light from getting through regardless of the LEDs
-# being lit. Re-enabling to test backlight + DSI panel init + red
-# square together now that the backlight half is verified correct.
-CONFIG_VIDEO=y
-CONFIG_VIDEO_SHENG_MDSS=y
+# being lit.
+#
+# GROUND-TRUTH TEST (SPEC.md task #5 log): user confirmed this exact
+# NixOS rootfs DID show a login prompt on screen before, with an
+# earlier boot.img -- meaning Linux's own complete driver stack CAN
+# drive this panel successfully. With CONFIG_VIDEO_SHENG_MDSS active
+# (all our GDSC/DISPCC/DSI/DPU register pokes), Linux's fbdev path now
+# fails with "framebuffer is not in virtual address space" (a GEM/vmap
+# failure) -- almost certainly our own hardware pokes leaving IOMMU/
+# SMMU or DPU state Linux's later re-init can't cleanly recover from,
+# the same class of problem as the backlight disruption, just
+# manifesting differently. Disabling entirely to test whether Linux's
+# OWN complete init succeeds again with sheng_mdss_probe() never
+# running at all -- the cleanest possible isolation.
+#
+# Ground truth confirmed (SPEC.md task #5 log): with this off, Linux
+# shows a real login prompt -- hardware is fully capable. Re-enabling
+# now that MDP_CLK is back to the real 514MHz rate (see
+# sheng_mdss_hw.zig's MDP_CLK_DIV_REG_VAL comment) combined with the
+# pclk0/byte0/esc0 clock fix and the VID_CFG0/lane/timing register fix
+# -- none of these three fixes have ever been tested together before.
+# RESULT: still broken on both sides -- our own pixel push shows
+# nothing, and Linux's fbdev vmap failure reproduces identically at
+# 514MHz too, same as at the lowered SVS rate. No SMMU/IOMMU fault
+# messages in dmesg either (ruling out a translation-fault theory).
+# The clock-rate mismatch was a real, worthwhile fix in isolation but
+# not the actual disruptor -- whatever sheng_mdss_probe() does still
+# corrupts state Linux can't recover from, independent of clock rate.
+# Reverting to disabled: this is the one config confirmed to actually
+# work (Linux shows a real login prompt). Don't regress past this
+# known-good point; resume investigation from here next time.
+# CONFIG_VIDEO is not set
+# CONFIG_VIDEO_SHENG_MDSS is not set
 # Root cause of the CONFIG_VIDEO hang (see git history / SPEC.md):
 # growing the u-boot binary enough to cross ~1MB loaded size (physical
 # kernel_offset 0x8000 + kernel_size) apparently collides with

@@ -643,6 +643,7 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
 extern void sheng_mdss_core_reset(unsigned long dispcc_base);
 extern int sheng_mdss_gdsc_enable(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init(unsigned long dispcc_base);
+extern int sheng_mdss_dispcc_dsi_clks_init(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init_pll0_only(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init_thru_ahb(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_init_thru_mdp(unsigned long dispcc_base);
@@ -658,7 +659,8 @@ extern int sheng_mdss_dpu_start(unsigned long dpu_base,
 				 unsigned long fb_addr,
 				 u32 hactive, u32 vactive,
 				 u32 hfront_porch, u32 hback_porch, u32 hsync_width,
-				 u32 vfront_porch, u32 vback_porch, u32 vsync_width);
+				 u32 vfront_porch, u32 vback_porch, u32 vsync_width,
+				 bool enable_dsc);
 
 struct sheng_mdss_priv {
 	fdt_addr_t mdss_base;
@@ -772,6 +774,21 @@ static int sheng_mdss_probe(struct udevice *dev)
 	if (ret)
 		return ret;
 
+	/* THE REAL MISSING PIECE (SPEC.md task #5 log): live clk_summary
+	 * from a working Linux boot showed disp_cc_mdss_{byte,pclk,esc}
+	 * {0,1}_clk (and byte{0,1}_intf_clk) all genuinely enabled and
+	 * feeding the DSI hosts -- clocks this driver never touched at
+	 * all. pclk0/1 is almost certainly what actually drives
+	 * INTF_FRAME_COUNT/LINE_COUNT, not MDP_CLK -- explaining why every
+	 * MDP_CLK/MMCX/BCM experiment left frame counters frozen at 0
+	 * regardless of clock rate or voltage. Must run after both DSI PHY
+	 * PLLs are locked (just above), since these mux from the DSI PHY's
+	 * own PLL output, not DISPCC's internal PLL0. */
+	ret = sheng_mdss_dispcc_dsi_clks_init(SM8550_DISPCC_BASE);
+	env_set_hex("sheng_mdss_dsi_clks", (unsigned long)ret);
+	if (ret)
+		return ret;
+
 	/* BISECTION: reset-toggle + GDSC + DISPCC + both DSI PHYs confirmed
 	 * reaching Linux. Next: add DSI panel init back and stop right
 	 * after it -- this re-creates the last known-good stopping point
@@ -792,8 +809,23 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * actually SEE pixels with, swap the DSI-bypass command-mode patch
 	 * for the real DPU video path -- the panel is video-mode
 	 * (MIPI_DSI_MODE_VIDEO in the real driver) and structurally can't
-	 * show anything from a one-shot command-mode write. enable_dsc=true
-	 * now since the real DPU pipeline needs it. */
+	 * show anything from a one-shot command-mode write.
+	 *
+	 * DSC ISOLATION TEST (SPEC.md task #5 log): real video is now
+	 * confirmed streaming (INTF_FRAME_COUNT/LINE_COUNT genuinely
+	 * incrementing) but nothing is visible -- most likely a mismatch
+	 * between the DPU-side DSC encoder config and the panel-side PPS
+	 * we send it, which are two independently-transcribed sets of
+	 * parameters never cross-verified against each other. Disabling
+	 * DSC entirely on BOTH sides isolated it -- PPS bytes cross-checked
+	 * against the DPU-side DSC encoder config (pic_height=2032,
+	 * pic_width=1524, slice_height=16, slice_width=762, chunk_size=762,
+	 * initial_xmit_delay=512, initial_dec_delay=637 -- every field
+	 * matches exactly), and disabling DSC entirely produced the exact
+	 * same "frames streaming, nothing visible" symptom as DSC-on. DSC
+	 * was never the blocker. Real gap found instead: DSI_VID_CFG0 (see
+	 * dsiHostSwitchToVideoMode()'s comment) was never written at all.
+	 * Back to enable_dsc=true, the real/correct configuration. */
 	ret = sheng_mdss_dsi_panel_init(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
 					 SHENG_MDSS_DSI_DMA_SCRATCH, true);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI_PANEL, ret);
@@ -821,10 +853,29 @@ static int sheng_mdss_probe(struct udevice *dev)
 				    SHENG_MDSS_FB_ADDR,
 				    3048, 2032,
 				    142, 92, 4,
-				    26, 138, 2);
+				    26, 138, 2,
+				    true); /* DSC ruled out as the blocker -- see comment above */
 	env_set_hex("sheng_mdss_dpu_start", (unsigned long)ret);
 	if (ret)
 		return ret;
+
+	/* Frame/line counters (dpu_hw_intf.c: INTF_FRAME_COUNT=0xAC,
+	 * INTF_LINE_COUNT=0xB0, relative to each intf_N_base) increment
+	 * purely from real active video timing -- independent of whether
+	 * backlight/panel actually show anything visibly. Read twice with
+	 * a delay: if they're incrementing, video is genuinely streaming. */
+	{
+		volatile u32 *intf1_frame = (volatile u32 *)(uintptr_t)
+			(SM8550_MDSS_DPU_BASE + 0x35000 + 0xac);
+		volatile u32 *intf1_line = (volatile u32 *)(uintptr_t)
+			(SM8550_MDSS_DPU_BASE + 0x35000 + 0xb0);
+
+		env_set_hex("sheng_intf1_frame_a", (unsigned long)*intf1_frame);
+		env_set_hex("sheng_intf1_line_a", (unsigned long)*intf1_line);
+		mdelay(500);
+		env_set_hex("sheng_intf1_frame_b", (unsigned long)*intf1_frame);
+		env_set_hex("sheng_intf1_line_b", (unsigned long)*intf1_line);
+	}
 
 	/* No large hold here anymore -- board.c calls backlight init
 	 * AFTER this probe() returns, with its own 5s hold at the end.
@@ -924,7 +975,8 @@ static int sheng_mdss_probe(struct udevice *dev)
 				    SHENG_PANEL_HFRONT_PORCH, SHENG_PANEL_HBACK_PORCH,
 				    SHENG_PANEL_HSYNC_WIDTH,
 				    SHENG_PANEL_VFRONT_PORCH, SHENG_PANEL_VBACK_PORCH,
-				    SHENG_PANEL_VSYNC_WIDTH);
+				    SHENG_PANEL_VSYNC_WIDTH,
+				    true);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DPU, ret);
 	if (ret)
 		return ret;

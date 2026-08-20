@@ -423,6 +423,19 @@ const AHB_CLK_DIV_REG_VAL: u32 = 1; // F(19200000, P_BI_TCXO, 1, 0, 0) -> 2*1-1
 const MDP_CLK_SRC_CMD_RCGR: usize = 0x80d8;
 const MDP_CLK_CBCR: usize = 0x800c;
 const MDP_CLK_SRC_SEL_PLL0: u32 = 1;
+// Back to the REAL rate (SPEC.md task #5 log): the SVS-tier experiment
+// (192.75MHz, avoiding any MMCX vote requirement) never got tested
+// together with the DSI pclk0/byte0/esc0 clock fix or the VID_CFG0/
+// lane/timing register fix -- both landed while this was still at the
+// lowered rate. Live clk_summary from a WORKING Linux boot (ground-
+// truth confirmed: login prompt visible with sheng_mdss_probe()
+// disabled entirely) shows disp_cc_mdss_mdp_clk_src genuinely running
+// at 514000000, not 192750000. A DPU core clocked at roughly 1/3 its
+// required rate could easily explain "INTF free-runs and counts frames
+// fine (driven by pclk0/vsync_clk, an independent clock domain from
+// MDP_CLK) but the pixel data itself is never processed correctly" --
+// matching our exact symptom. PLL0 (1542MHz) / 3 = 514MHz, N=3 ->
+// div_reg_val = 2*3-1 = 5.
 const MDP_CLK_DIV_REG_VAL: u32 = 5; // F(514000000, P_DISP_CC_PLL0_OUT_MAIN, 3, 0, 0) -> 2*3-1
 
 // disp_cc_mdss_mdp_lut_clk (halt_reg=enable_reg=0x8018, bit0,
@@ -453,6 +466,85 @@ const VSYNC_CLK_SRC_CMD_RCGR: usize = 0x80f0;
 const VSYNC_CLK_CBCR: usize = 0x8024;
 const VSYNC_CLK_SRC_SEL_XO: u32 = 0;
 const VSYNC_CLK_DIV_REG_VAL: u32 = 1; // F(19200000, P_BI_TCXO, 1, 0, 0) -> 2*1-1
+
+// REAL MISSING PIECE (SPEC.md task #5 log): live clk_summary from a
+// WORKING Linux boot (msm_dpu bound, fb0 registered) showed these 8
+// clocks -- byte0/1_clk, byte0/1_intf_clk, pclk0/1_clk, esc0/1_clk --
+// all genuinely enabled and feeding ae94000.dsi/ae96000.dsi. This
+// driver never touched any of them. pclk0/1 (~198MHz from the live
+// trace) is almost certainly what actually drives INTF_FRAME_COUNT/
+// LINE_COUNT, not MDP_CLK -- explaining why every MDP_CLK/MMCX/BCM
+// experiment left frame counters frozen at exactly 0 regardless of
+// clock rate or voltage: the wrong clock domain was under
+// investigation the whole time. Source select values from
+// disp_cc_parent_map_2 (dispcc-sm8550.c): DSI0_PHY_PLL_OUT_DSICLK=1,
+// DSI0_PHY_PLL_OUT_BYTECLK=2, DSI1_PHY_PLL_OUT_DSICLK=3,
+// DSI1_PHY_PLL_OUT_BYTECLK=4. Must run AFTER both DSI PHY PLLs are
+// locked (sheng_mdss_dsi_phy_init), unlike the PLL0-sourced clocks
+// above which don't depend on DSI PHY at all.
+const PCLK0_CLK_SRC_CMD_RCGR: usize = 0x80a8;
+const PCLK0_CLK_CBCR: usize = 0x8004;
+const PCLK0_SRC_SEL_DSI0_DSICLK: u32 = 1;
+const PCLK1_CLK_SRC_CMD_RCGR: usize = 0x80c0;
+const PCLK1_CLK_CBCR: usize = 0x8008;
+const PCLK1_SRC_SEL_DSI1_DSICLK: u32 = 3;
+const BYTE0_CLK_SRC_CMD_RCGR: usize = 0x8108;
+const BYTE0_CLK_CBCR: usize = 0x8028;
+const BYTE0_INTF_CLK_CBCR: usize = 0x802c;
+const BYTE0_SRC_SEL_DSI0_BYTECLK: u32 = 2;
+const BYTE1_CLK_SRC_CMD_RCGR: usize = 0x8124;
+const BYTE1_CLK_CBCR: usize = 0x8030;
+const BYTE1_INTF_CLK_CBCR: usize = 0x8034;
+const BYTE1_SRC_SEL_DSI1_BYTECLK: u32 = 4;
+const ESC0_CLK_SRC_CMD_RCGR: usize = 0x8140;
+const ESC0_CLK_CBCR: usize = 0x8038;
+const ESC1_CLK_SRC_CMD_RCGR: usize = 0x8158;
+const ESC1_CLK_CBCR: usize = 0x803c;
+const ESC_SRC_SEL_XO: u32 = 0;
+// byte0/1 and esc0/1 have mnd_width=0 in the real driver (plain HID
+// divider, matching rcg2ConfigureHidOnly() exactly) -- div=1 passthrough.
+// pclk0/1 have mnd_width=8 (fractional M/N/D capable, clk_pixel_ops) but
+// this only configures the CFG register's SRC_SEL+HID_DIV fields, same
+// as every other clock here; M/N/D registers are left at their hardware
+// reset default (MND divider bypassed), same integer-passthrough
+// behavior as byte0/1. Good enough to test whether real clocks start
+// flowing at all; not necessarily the exact panel-spec pixel rate.
+const DSI_CLK_DIV_REG_VAL_PASSTHROUGH: u32 = 1; // 2*1-1
+
+export fn sheng_mdss_dispcc_dsi_clks_init(dispcc_base: usize) callconv(.c) c_int {
+    var ret = rcg2ConfigureHidOnly(dispcc_base, PCLK0_CLK_SRC_CMD_RCGR, PCLK0_SRC_SEL_DSI0_DSICLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, PCLK0_CLK_CBCR);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, BYTE0_CLK_SRC_CMD_RCGR, BYTE0_SRC_SEL_DSI0_BYTECLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, BYTE0_CLK_CBCR);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, BYTE0_INTF_CLK_CBCR);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, ESC0_CLK_SRC_CMD_RCGR, ESC_SRC_SEL_XO, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, ESC0_CLK_CBCR);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, PCLK1_CLK_SRC_CMD_RCGR, PCLK1_SRC_SEL_DSI1_DSICLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, PCLK1_CLK_CBCR);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, BYTE1_CLK_SRC_CMD_RCGR, BYTE1_SRC_SEL_DSI1_BYTECLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, BYTE1_CLK_CBCR);
+    if (ret != 0) return ret;
+    ret = clkBranchEnable(dispcc_base, BYTE1_INTF_CLK_CBCR);
+    if (ret != 0) return ret;
+
+    ret = rcg2ConfigureHidOnly(dispcc_base, ESC1_CLK_SRC_CMD_RCGR, ESC_SRC_SEL_XO, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    if (ret != 0) return ret;
+    return clkBranchEnable(dispcc_base, ESC1_CLK_CBCR);
+}
 
 /// Bring up disp_cc_pll0, then the AHB (bus, 19.2MHz off XO) and MDP
 /// (DPU core, 514MHz off PLL0) clocks, plus the MDP LUT and VSYNC
@@ -936,12 +1028,40 @@ export fn sheng_mdss_dsi_phy_init(dsi_phy_base: usize, is_master: bool) callconv
 // source). All offsets relative to the qcom,sm8550-dsi-ctrl reg base.
 const DSI_CTRL: usize = 0x000;
 const DSI_STATUS0: usize = 0x004;
+const DSI_VID_CFG0: usize = 0x00c;
+const DSI_VID_CFG1: usize = 0x010;
 const DSI_DMA_BASE: usize = 0x044;
 const DSI_DMA_LEN: usize = 0x048;
 const DSI_TRIG_CTRL: usize = 0x080;
 const DSI_TRIG_DMA: usize = 0x08c;
+const DSI_LANE_CTRL: usize = 0x0a8;
+const DSI_LANE_SWAP_CTRL: usize = 0x0ac;
+const DSI_CLKOUT_TIMING_CTRL: usize = 0x0c0;
+const DSI_EOT_PACKET_CTRL: usize = 0x0c8;
 const DSI_CLK_CTRL: usize = 0x118;
 const DSI_RESET: usize = 0x114;
+
+// STOLEN OUTPUT, NOT RECOMPUTED (SPEC.md task #5 log): rather than port
+// dsi_host.c's dsi_ctrl_enable() field-by-field (several fields turned
+// out to have undocumented bits our generated-header source doesn't
+// cover -- e.g. LANE_SWAP_CTRL/EOT_PACKET_CTRL have real live bits far
+// beyond their one documented field each) or port dsi_phy.c's D-PHY
+// timing-calculation cascade (clk_pre/clk_post -- ~100 lines of
+// interdependent linear_inter() math), these are the EXACT live
+// register values read directly off this same hardware via devmem
+// while Linux's own real, working driver had it configured -- for
+// this exact panel, exact PLL lock, exact everything. Identical on
+// both DSI0 (0xae94000) and DSI1 (0xae96000), as expected for the
+// dual-link panel. Confirmed real DST_FORMAT is RGB666 (1), not
+// RGB888 (3) as originally assumed -- DSC changes the wire packing
+// format regardless of the source pixel depth.
+const VID_CFG0_VALUE: u32 = 0x00001210;
+const VID_CFG1_VALUE: u32 = 0x02009230;
+const LANE_CTRL_VALUE: u32 = 0x00001F00;
+const LANE_SWAP_CTRL_VALUE: u32 = 0x01000000;
+const CLKOUT_TIMING_CTRL_VALUE: u32 = 0x00000001;
+const EOT_PACKET_CTRL_VALUE: u32 = 0x010F0F08;
+const TRIG_CTRL_VALUE: u32 = 0x001C1A02;
 
 const CTRL_ENABLE: u32 = 1 << 0;
 const CTRL_VID_MODE_EN: u32 = 1 << 1;
@@ -962,7 +1082,11 @@ const CTRL_ALL_LANES: u32 = 0xf << 4;
 fn dsiHostBringUp(dsi_base: usize) void {
     mmioWrite32(dsi_base, DSI_CLK_CTRL, CLK_CTRL_ENABLE_CLKS);
     mmioWrite32(dsi_base, DSI_CTRL, CTRL_CLK_EN | CTRL_ALL_LANES | CTRL_CMD_MODE_EN | CTRL_ENABLE);
-    mmioWrite32(dsi_base, DSI_TRIG_CTRL, TRIG_CTRL_TE | TRIG_CTRL_DMA_TRIGGER_SW);
+    // Real live value (see VID_CFG0_VALUE's comment) -- our previous
+    // TRIG_CTRL_TE|TRIG_CTRL_DMA_TRIGGER_SW guess (0x80000004) was very
+    // different from what's actually programmed on working hardware
+    // (0x001C1A02).
+    mmioWrite32(dsi_base, DSI_TRIG_CTRL, TRIG_CTRL_VALUE);
 }
 
 /// Switch the DSI host from command mode (used for the panel init DCS
@@ -972,6 +1096,21 @@ fn dsiHostBringUp(dsi_base: usize) void {
 /// DPU drives a live video timing engine into this controller is a
 /// real hardware mode mismatch, not just "wrong colors".
 fn dsiHostSwitchToVideoMode(dsi_base: usize) void {
+    // Real gap closed (SPEC.md task #5 log): dsi_ctrl_enable() in the
+    // real driver writes DSI_VID_CFG0 (traffic mode / RGB format /
+    // virtual channel -- literally how to format the pixel stream on
+    // the wire) unconditionally for video mode, and this driver never
+    // did at all. Video was streaming internally (INTF_FRAME_COUNT
+    // incrementing) but the controller never knew how to actually
+    // transmit it -- explaining "frames counted, nothing visible"
+    // regardless of DSC on/off, since this gap exists either way.
+    mmioWrite32(dsi_base, DSI_VID_CFG0, VID_CFG0_VALUE);
+    mmioWrite32(dsi_base, DSI_VID_CFG1, VID_CFG1_VALUE);
+    mmioWrite32(dsi_base, DSI_LANE_SWAP_CTRL, LANE_SWAP_CTRL_VALUE);
+    mmioWrite32(dsi_base, DSI_EOT_PACKET_CTRL, EOT_PACKET_CTRL_VALUE);
+    mmioWrite32(dsi_base, DSI_LANE_CTRL, LANE_CTRL_VALUE);
+    mmioWrite32(dsi_base, DSI_CLKOUT_TIMING_CTRL, CLKOUT_TIMING_CTRL_VALUE);
+
     var ctrl = mmioRead32(dsi_base, DSI_CTRL);
     ctrl &= ~CTRL_CMD_MODE_EN;
     ctrl |= CTRL_VID_MODE_EN | CTRL_ENABLE;
@@ -1510,6 +1649,7 @@ export fn sheng_mdss_dpu_start(
     vfront_porch: u32,
     vback_porch: u32,
     vsync_width: u32,
+    enable_dsc: bool,
 ) callconv(.c) c_int {
     const half_w: u32 = hactive / 2; // 1524
     const stride: u32 = hactive * 4; // XRGB8888, full-scanline stride
@@ -1579,31 +1719,40 @@ export fn sheng_mdss_dpu_start(
 
     if (DPU_TEST_STOP_STAGE <= 2) return 0;
 
-    // -- PP: enable DSC routing + wrapper endian-flip quirk bit.
-    mmioSetBits32(pp0_base, PP_DCE_DATA_OUT_SWAP, 1 << 18);
-    mmioWrite32(pp0_base, PP_DSC_MODE, 1);
-    mmioSetBits32(pp1_base, PP_DCE_DATA_OUT_SWAP, 1 << 18);
-    mmioWrite32(pp1_base, PP_DSC_MODE, 1);
+    // -- PP: enable DSC routing + wrapper endian-flip quirk bit. Skipped
+    // entirely when enable_dsc=false -- untested whether the panel's
+    // own PPS (sent by sheng_mdss_dsi_panel_init()) actually matches
+    // this DPU-side DSC config, so this lets us isolate whether DSC is
+    // really what's blocking a visible image, at the cost of needing
+    // ~3x the bandwidth for the same resolution.
+    if (enable_dsc) {
+        mmioSetBits32(pp0_base, PP_DCE_DATA_OUT_SWAP, 1 << 18);
+        mmioWrite32(pp0_base, PP_DSC_MODE, 1);
+        mmioSetBits32(pp1_base, PP_DCE_DATA_OUT_SWAP, 1 << 18);
+        mmioWrite32(pp1_base, PP_DSC_MODE, 1);
 
-    // -- DSC: two hard-slice encoder instances sharing the DCE base,
-    // dce_0_0 sblk (enc+0x100/ctl+0xf00) for DSC_0, dce_0_1 sblk
-    // (enc+0x200/ctl+0xf80) for DSC_1.
-    dscConfigureInstance(dce_base, 0x100, 0xf00, 0); // -> PP_0
-    dscConfigureInstance(dce_base, 0x200, 0xf80, 1); // -> PP_1
+        // -- DSC: two hard-slice encoder instances sharing the DCE base,
+        // dce_0_0 sblk (enc+0x100/ctl+0xf00) for DSC_0, dce_0_1 sblk
+        // (enc+0x200/ctl+0xf80) for DSC_1.
+        dscConfigureInstance(dce_base, 0x100, 0xf00, 0); // -> PP_0
+        dscConfigureInstance(dce_base, 0x200, 0xf80, 1); // -> PP_1
+    }
 
     if (DPU_TEST_STOP_STAGE <= 3) return 0;
 
     // -- INTF: per-half timing, horizontal porches/sync halved (dual-
-    // link split), vertical unchanged, width further reduced by the
-    // DSC compression ratio (bpp=8 / (bpc=8 * 3 components) = 1/3) per
-    // drm_mode_to_intf_timing_params()'s non-DP DSC branch.
+    // link split), vertical unchanged. Width is further reduced by the
+    // DSC compression ratio (bpp=8 / (bpc=8 * 3 components) = 1/3, per
+    // drm_mode_to_intf_timing_params()'s non-DP DSC branch) only when
+    // DSC is actually active -- uncompressed mode uses the real
+    // per-half pixel width directly.
     const half_hfront = hfront_porch / 2;
     const half_hback = hback_porch / 2;
     const half_hsync = hsync_width / 2;
-    const compressed_w = half_w / 3; // bpp_int(8) / (bpc(8)*3) == 1/3 exactly for 8bpp/8bpc
+    const intf_w = if (enable_dsc) half_w / 3 else half_w;
 
-    setupIntfTiming(intf1_base, compressed_w, vactive, half_hfront, half_hback, half_hsync, vfront_porch, vback_porch, vsync_width);
-    setupIntfTiming(intf2_base, compressed_w, vactive, half_hfront, half_hback, half_hsync, vfront_porch, vback_porch, vsync_width);
+    setupIntfTiming(intf1_base, intf_w, vactive, half_hfront, half_hback, half_hsync, vfront_porch, vback_porch, vsync_width);
+    setupIntfTiming(intf2_base, intf_w, vactive, half_hfront, half_hback, half_hsync, vfront_porch, vback_porch, vsync_width);
 
     mmioWrite32(intf1_base, INTF_MUX, 0); // bind to PINGPONG_0
     mmioWrite32(intf2_base, INTF_MUX, 1); // bind to PINGPONG_1
@@ -1615,7 +1764,7 @@ export fn sheng_mdss_dpu_start(
     // bit), default (disabled) VM group id per core_major_ver>=7.
     mmioWrite32(ctl_base, CTL_TOP, CTL_DEFAULT_GROUP_ID_SHIFTED);
     mmioWrite32(ctl_base, CTL_INTF_ACTIVE, (@as(u32, 1) << 1) | (@as(u32, 1) << 2)); // INTF_1, INTF_2
-    mmioWrite32(ctl_base, CTL_DSC_ACTIVE, 0x3); // DSC_0, DSC_1
+    mmioWrite32(ctl_base, CTL_DSC_ACTIVE, if (enable_dsc) @as(u32, 0x3) else 0); // DSC_0, DSC_1
     mmioWrite32(ctl_base, CTL_INTF_MASTER, @as(u32, 1) << 1); // INTF_1 is master
 
     if (DPU_TEST_STOP_STAGE <= 5) return 0;
@@ -1640,12 +1789,15 @@ export fn sheng_mdss_dpu_start(
     // written to their own registers first, then the aggregate pending
     // mask to CTL_FLUSH, then CTL_START kicks the whole pipeline live.
     mmioWrite32(ctl_base, CTL_INTF_FLUSH, (@as(u32, 1) << 1) | (@as(u32, 1) << 2)); // INTF_1, INTF_2
-    mmioWrite32(ctl_base, CTL_DSC_FLUSH, 0x3); // DSC_0, DSC_1
+    if (enable_dsc) {
+        mmioWrite32(ctl_base, CTL_DSC_FLUSH, 0x3); // DSC_0, DSC_1
+    }
 
     if (DPU_TEST_STOP_STAGE <= 8) return 0;
 
     const pending_flush = CTL_FLUSH_SSPP_DMA0 | CTL_FLUSH_LM0 | CTL_FLUSH_LM1 |
-        CTL_FLUSH_MASK_CTL | CTL_FLUSH_DSC_IDX | CTL_FLUSH_INTF_IDX;
+        CTL_FLUSH_MASK_CTL | CTL_FLUSH_INTF_IDX |
+        (if (enable_dsc) CTL_FLUSH_DSC_IDX else 0);
     mmioWrite32(ctl_base, CTL_FLUSH, pending_flush);
 
     if (DPU_TEST_STOP_STAGE <= 9) return 0;
