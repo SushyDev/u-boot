@@ -565,6 +565,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	struct sheng_mdss_priv *priv = dev_get_priv(dev);
 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
 	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
+	int bias_ret;
 	int ret;
 
 	/* Sample ABL's handoff state before the cold start below destroys
@@ -784,7 +785,13 @@ static int sheng_mdss_probe(struct udevice *dev)
 	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVDD_GPIO, 0);
 	/* GPIOs gate the rails, they do not create them. LCD_BIAS_CFG1 is
 	 * latched over I2C -- clear it or the rails never collapse. */
-	BBS("bias OFF over i2c", sheng_ktz8866_set_bias(0));
+	/* LOAD-BEARING. Keep this call OUT of the macro: with debug off the
+	 * macro discards its arguments and the clear never runs. The rails
+	 * then stay up through the "power cycle", the DDIC never loses
+	 * power, and it eventually latches into a state no reset clears --
+	 * recoverable only by holding POWER to force the device off. */
+	bias_ret = sheng_ktz8866_set_bias(0);
+	BBS("bias OFF over i2c", bias_ret);
 
 
 	{

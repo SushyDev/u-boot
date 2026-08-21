@@ -15,10 +15,12 @@
  *             relayed the same way.
  *
  * With CONFIG_VIDEO_SHENG_MDSS_DEBUG=n every macro below expands to
- * nothing AND DISCARDS ITS ARGUMENTS. Arguments are evaluated only when
- * debug is on, so a diagnostic that reads MDSS registers costs nothing
- * on a normal boot. Never put a call with a required side effect inside
- * one of these.
+ * nothing AND DISCARDS ITS ARGUMENTS, so a diagnostic that reads MDSS
+ * registers costs nothing on a normal boot.
+ *
+ * NEVER put a call with a required side effect inside one of these --
+ * it will not run in a normal boot. Assign to a local, then log the
+ * local. This has already cost one latched panel.
  */
 
 #ifndef __SHENG_MDSS_DEBUG_H
@@ -110,17 +112,21 @@ void sheng_mdss_debug_post_panel_report(void);
 
 #else
 
-/* (void)0 so each use still needs a semicolon and still parses as a
- * statement in a braceless if. Arguments are not evaluated. */
-#define BBM(n)			((void)0)
-#define BBV(n, v)		((void)0)
-#define BBS(n, v)		((void)0)
-#define BBR(n, b, o)		((void)0)
-#define BBB(n, b, s, c)		((void)0)
-#define SHENG_DBG_ENV(n, v)	((void)0)
-#define SHENG_DBG_STAGE(s, r)	((void)0)
-#define SHENG_DBG_LOG(t, v)	((void)0)
-#define SHENG_DBG_PIN(n, g)	((void)0)
+/*
+ * Arguments are TYPE-CHECKED BUT NOT EVALUATED. sizeof does not evaluate
+ * its operand, so the MMIO reads feeding these still cost nothing --
+ * but a renamed symbol breaks THIS build instead of silently vanishing.
+ */
+#define BBM(n)			((void)sizeof(n))
+#define BBV(n, v)		((void)(sizeof(n) + sizeof(v)))
+#define BBS(n, v)		((void)(sizeof(n) + sizeof(v)))
+#define BBR(n, b, o)		((void)(sizeof(n) + sizeof(b) + sizeof(o)))
+#define BBB(n, b, s, c)		((void)(sizeof(n) + sizeof(b) + \
+					sizeof(s) + sizeof(c)))
+#define SHENG_DBG_ENV(n, v)	((void)(sizeof(n) + sizeof(v)))
+#define SHENG_DBG_STAGE(s, r)	((void)(sizeof(s) + sizeof(r)))
+#define SHENG_DBG_LOG(t, v)	((void)(sizeof(t) + sizeof(v)))
+#define SHENG_DBG_PIN(n, g)	((void)(sizeof(n) + sizeof(g)))
 #define SHENG_DBG_START()	((void)0)
 #define SHENG_DBG_FINISH()	((void)0)
 #define SHENG_DBG_FINAL_DUMP()	((void)0)
