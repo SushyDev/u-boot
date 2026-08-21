@@ -180,6 +180,25 @@ CONFIG_VIDEO_FONT_16X32=y
 # ended up black on black. White-on-black is both the conventional choice
 # and unambiguous to verify on a panel we cannot otherwise inspect.
 CONFIG_SYS_WHITE_ON_BLACK=y
+# Interactive boot menu on the panel. The board has no reachable UART, so
+# the only usable input is the physical buttons: BUTTON_KEYBOARD turns them
+# into a keyboard, BUTTON_QCOM_PMIC covers the PMIC pwrkey/resin, and
+# AUTOBOOT_MENU_SHOW replaces the plain countdown with the menu itself.
+CONFIG_DM_KEYBOARD=y
+CONFIG_BUTTON_KEYBOARD=y
+CONFIG_BUTTON_QCOM_PMIC=y
+CONFIG_CMD_BOOTMENU=y
+# CONFIG_VIDEO_ANSI: OFF for now, deliberately.
+#
+# The boot menu needs it -- it clears the screen, positions the cursor and
+# uses reverse video for the selected entry. With it enabled the escapes ARE
+# honoured (the startup log gets correctly cleared away), but the menu's own
+# text then renders invisibly and the panel stays black for the whole
+# timeout. That is a colour/attribute problem, not a menu problem, and it
+# costs the working startup log to chase. Leaving it off keeps the console
+# useful; re-enable together with a fix for the menu's colour handling.
+# CONFIG_VIDEO_ANSI is not set
+CONFIG_AUTOBOOT_MENU_SHOW=y
 # `version` is used by bootcmd to put real U-Boot build info on the panel.
 # U-Boot's own banner is printed before the video device probes and is then
 # wiped by video_clear(), so it never reaches the screen; re-emitting it from

@@ -111,7 +111,12 @@
 
 		key-volume-up {
 			label = "Volume Up";
-			linux,code = <KEY_VOLUMEUP>;
+			/* U-Boot only: KEY_DOWN so this navigates the boot menu.
+			 * button_kbd passes linux,code straight through to the
+			 * input layer, and KEY_VOLUMEUP maps to nothing usable
+			 * there. Linux is unaffected -- it loads its own DTB
+			 * from /boot rather than the one appended to U-Boot. */
+			linux,code = <KEY_DOWN>;
 			gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
 			debounce-interval = <15>;
 			linux,can-disable;
@@ -540,7 +545,8 @@
 };
 
 &pon_resin {
-	linux,code = <KEY_VOLUMEDOWN>;
+	/* U-Boot only: KEY_ENTER so Volume Down selects a menu entry. */
+	linux,code = <KEY_ENTER>;
 	status = "okay";
 };
 
