@@ -10,6 +10,11 @@ CONFIG_POSITION_INDEPENDENT=y
 CONFIG_SYS_INIT_SP_BSS_OFFSET=0x180000
 CONFIG_ARCH_SNAPDRAGON=y
 CONFIG_NR_DRAM_BANKS=24
+# Builds board/qualcomm/sheng/. Keeps the generic qcom config
+# header, which SYS_CONFIG_NAME would otherwise derive from
+# SYS_BOARD and look for as include/configs/sheng.h.
+CONFIG_SYS_BOARD="sheng"
+CONFIG_SYS_CONFIG_NAME="qcom"
 CONFIG_DEFAULT_DEVICE_TREE="qcom/sm8550-xiaomi-sheng"
 CONFIG_SYS_LOAD_ADDR=0xA0000000
 CONFIG_FIT=y
