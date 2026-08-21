@@ -1578,40 +1578,6 @@ const DSI_TEST_PATTERN_GEN_VIDEO_INIT_VAL: usize = 0x160;
 
 
 
-/// BISECT (SPEC.md task #5 log): stage NO pipe into either mixer, so
-/// the mixers emit border colour and the DPU produces a frame with ZERO
-/// memory fetch -- while DSC, INTF and DSI stay exactly as configured.
-///
-/// Live working Linux reads FIFO_STATUS = 0x00001210 (lanes FED). Our
-/// current build reads 0x11111210, differing only in the four
-/// DLN*_HS_FIFO_EMPTY bits: our lanes are STARVED. Everything between
-/// framebuffer and lane verifies bit-identical to live, so the open
-/// question is whether SSPP is actually fetching at all.
-///
-///   border-only FIFO_STATUS == 0x00001210 (lanes fed)
-///     -> the DPU->DSC->INTF->DSI path is healthy and the starvation
-///        comes from the SSPP fetch (memory/SMMU), not the pipeline.
-///   border-only still 0x1111xxxx (lanes starved)
-///     -> the starvation is downstream of the mixer and has nothing to
-///        do with the framebuffer or SMMU at all.
-///
-/// Needs no visible colour to be conclusive: FIFO_STATUS carries the
-/// answer either way.
-/// ENABLED b96. Everything above still stands, and the b95 PLL0 rate fix
-/// did NOT clear the starvation: with mdp_clk finally at its correct
-/// 514MHz (PLL0 L=0x50/alpha=0x5000 verified by readback, RCG CFG 0x105
-/// identical to live Linux, MDP_CLK_CBCR enabled), FIFO_STATUS on BOTH
-/// links still reads 0x11111210 against live Linux's 0x00001210. So the
-/// DPU is still not delivering pixels, and this bisect is the cheapest
-/// way to find out on which side of the mixer that starts.
-/// RESULT (b96): border-only made NO difference -- FIFO_STATUS identical to
-/// b95 on both links. That looked like "starvation is downstream of the
-/// mixer", but the premise was wrong: the 0x11111210 reading was sampled
-/// immediately after dpu_start, with INTF FRAME_COUNT still 0, i.e. before
-/// a single frame existed. In the LATE dump, after 500ms of streaming, both
-/// links read 0x00001210 -- byte-identical to live rendering Linux. There
-/// is no starvation and there never was. Reverted.
-const DPU_BORDER_ONLY_BISECT: bool = false;
 
 const DSI_VIDEO_COMPRESSION_MODE_CTRL: usize = 0x29c;
 const VIDEO_COMPRESSION_MODE_CTRL_VALUE: u32 = 0x05F40B01;
@@ -1687,60 +1653,6 @@ const EOT_PACKET_CTRL_VALUE: u32 = 0x00000001;
 // directly rather than a computed one that's demonstrably wrong.
 const CMD_DMA_CTRL_VALUE: u32 = 0x14000000; // re-stolen post-shift-fix, see VID_CFG0_VALUE's comment
 
-/// LP-vs-HS COMMAND TRANSMISSION TEST (SPEC.md task #5 log).
-///
-/// Traced through the real stack, this is what our CMD_DMA_CTRL value
-/// actually means -- and it is the one path in this driver that has never
-/// been proven to work.
-///
-///   dsi.xml:            CMD_DMA_CTRL bit26 = LOW_POWER, bit28 = FROM_FRAME_BUFFER
-///   dsi_ctrl_enable():  writes FROM_FRAME_BUFFER | LOW_POWER == 0x14000000
-///   xfer_prepare():     `if (!(msg->flags & MIPI_DSI_MSG_USE_LPM))
-///                          dsi_set_tx_power_mode(0)`  -- CLEARS LOW_POWER
-///   drm_mipi_dsi.c:     `if (dsi->mode_flags & MIPI_DSI_MODE_LPM)
-///                          msg->flags |= MIPI_DSI_MSG_USE_LPM`
-///   nt36532e:           .mode_flags = ... | MIPI_DSI_MODE_LPM
-///
-/// So this panel's every DCS command is sent in LOW POWER mode, and our
-/// 0x14000000 faithfully reproduces that. Faithful, and unfalsified: LP
-/// transmission uses the PHY's LPTX drivers, a completely separate analog
-/// path from the HS drivers that carry video.
-///
-/// Every failing measurement we have is on the LP path, and every passing
-/// one is on the HS path:
-///   HS works   -- video streams, FIFO_STATUS 0x00001210 matches live,
-///                 both video engines busy, INTF at 142Hz.
-///   LP unproven -- DCS writes need no ACK, so "success" only ever meant
-///                 our DMA engine shifted bytes out. The single LP
-///                 operation that requires the panel to answer, the BTA
-///                 read, has returned nothing on every boot -- including
-///                 now that it is correctly issued with CMD_MODE_EN set
-///                 (sheng.rd1 = 0x01F7_0000).
-///
-/// If LPTX is not reaching the panel, then NO command ever has: the panel
-/// never got its init sequence, never got DSC enable, never got the PPS.
-/// It would sit uninitialised while we stream perfectly-formed compressed
-/// video at a decoder that was never configured -- black screen, clean
-/// registers, no errors anywhere. That matches every observation.
-///
-/// This test clears LOW_POWER so the identical command sequence goes out
-/// over the HS path instead -- the path we have independently proven
-/// works.
-///
-///   Panel lights up / anything appears -> the LP path is the fault, and
-///     the entire investigation moves to the PHY's LPTX config.
-///   Still black -> commands are reaching the panel over a proven-good
-///     path and being acted on, so the fault is genuinely downstream and
-///     the LP path is exonerated.
-///
-/// Either outcome is decisive. Set false to restore the faithful value.
-/// RESULT: LP PATH EXONERATED (SPEC.md task #5 log). Ran with this true --
-/// sheng.verify came back 0x800020, bit5 confirming CMD_DMA_CTRL really
-/// did carry the HS value, so the test genuinely executed. Panel still
-/// black, sheng.rd1 still 0x01F7_0000, sheng.panel still 0. Commands sent
-/// over the independently-proven-good HS path behave identically to LP, so
-/// the transmission mode is not the fault. Back to the faithful value.
-const DSI_CMD_TX_IN_HS_TEST: bool = false;
 const CMD_DMA_CTRL_HS_VALUE: u32 = CMD_DMA_CTRL_VALUE & ~@as(u32, 1 << 26);
 
 // REAL GAP FOUND (SPEC.md task #5 log): LP_TIMER_CTRL's BTA_TO field
@@ -2033,10 +1945,7 @@ fn dsiHostBringUp(dsi_base: usize) void {
     // --- dsi_ctrl_enable(): config registers, then the controller.
     mmioWrite32(dsi_base, DSI_VID_CFG0, VID_CFG0_VALUE);
     mmioWrite32(dsi_base, DSI_VID_CFG1, VID_CFG1_VALUE);
-    mmioWrite32(dsi_base, DSI_CMD_DMA_CTRL, if (DSI_CMD_TX_IN_HS_TEST)
-        CMD_DMA_CTRL_HS_VALUE
-    else
-        CMD_DMA_CTRL_VALUE);
+    mmioWrite32(dsi_base, DSI_CMD_DMA_CTRL, CMD_DMA_CTRL_VALUE);
     mmioWrite32(dsi_base, DSI_TRIG_CTRL, TRIG_CTRL_VALUE);
     mmioWrite32(dsi_base, DSI_CLKOUT_TIMING_CTRL, CLKOUT_TIMING_CTRL_VALUE);
     mmioWrite32(dsi_base, DSI_EOT_PACKET_CTRL, EOT_PACKET_CTRL_VALUE);
@@ -3011,55 +2920,6 @@ fn dsiSendRawLong(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, data_i
     return rc_long;
 }
 
-/// Bring up the DSI host controllers and blast the panel's full init
-/// sequence: nt36532e_init_sequence, then the DSC-enable/PPS/
-/// framerate/exit-sleep/display-on tail sheng_tianma_init_sequence()
-/// does in the real kernel panel driver after the point where
-/// nt36532e_init_sequence's table (deliberately) stops. `dma_scratch`
-/// needs to hold the largest single packet we send -- the 128-byte
-/// PPS plus its 4-byte header, so >= 132 bytes.
-///
-/// NOT included here (real gap, needs separate follow-up): the
-/// panel's own reset-gpio pulse and vddio/avdd/avee regulator enable
-/// that nt36532e_prepare() does before sending any DCS command --
-/// U-Boot's devicetree has no panel node to read those from (unlike
-/// Linux's), so they'd need to be hardcoded from schematic/downstream
-/// knowledge rather than read from DT. Without them the panel may
-/// simply not be in a receptive state, independent of whether this
-/// DSI command engine itself works correctly.
-/// `enable_dsc`: the real panel bring-up needs DSC (video-mode pixel
-/// rate requires it -- see this file's own topology comment below), but
-/// the DPU write hang (SPEC.md task #5) meant the DSC-enabled panel was
-/// never actually fed compressed frames. sheng_mdss_dsi_test_patch()
-/// (below) is a DPU-bypass proof-of-concept that pushes a small
-/// *uncompressed* RGB888 patch directly over the command-mode DSI DMA
-/// engine -- if DSC were left enabled, the panel would try to DSC-decode
-/// that raw data as compressed and very likely show garbage or nothing.
-/// Pass false to leave DSC off (skips the 0x90/PPS/0x9d/framerate-branch
-/// block entirely) for that test; real use should pass true.
-/// INVERTED TEST (SPEC.md task #5 log): skip the panel reset and the
-/// entire DCS init sequence, leaving the panel in whatever state ABL
-/// left it, and just bring the DSI host up and stream video at it.
-///
-/// ABL initialises this panel (its splash is visible before U-Boot), and
-/// Linux re-initialises it successfully AFTER us on the same hardware --
-/// so the panel is demonstrably re-initialisable and the silicon is
-/// fine. Ours specifically does not take: a properly-formed single-host
-/// DCS read with BTA returns nothing (sheng.rd1 = 0), while every
-/// register in the DSI/DPU/PHY/MDSS spaces and all 128 PPS bytes are
-/// identical to the working kernel.
-///
-/// If the panel is still live from ABL, streaming at it without
-/// touching it at all should produce an image:
-///   image appears -> OUR init sequence is what breaks the panel, and
-///     the fault is in the command path, not the video path.
-///   still black -> ABL did not leave it in a usable state, or the
-///     video path itself cannot drive it, which points away from the
-///     command path entirely.
-///
-/// Host bring-up and the video-mode switch are KEPT -- those touch the
-/// SoC's DSI controller, not the panel.
-const SKIP_PANEL_INIT_TEST: bool = false;
 
 /// Host bring-up + video-mode switch, split out so it can run BEFORE
 /// the panel is powered and reset (SPEC.md task #5 log).
@@ -3083,72 +2943,10 @@ const SKIP_PANEL_INIT_TEST: bool = false;
 export fn sheng_mdss_dsi_host_video_prepare(dsi0_base: usize, dsi1_base: usize) callconv(.c) void {
     dsiHostBringUp(dsi0_base);
     dsiHostBringUp(dsi1_base);
-    if (MINIMAL_CMD_MODE_BTA_TEST) return;
     dsiHostSwitchToVideoMode(dsi0_base);
     dsiHostSwitchToVideoMode(dsi1_base);
 }
 
-/// MINIMAL-CONFIGURATION BTA TEST (SPEC.md task #5 log).
-///
-/// Everything software can check is now verified against live silicon:
-/// DSI0 39/39, DSI1 39/39, DPU 50/50, MDSS wrapper 3/3, PHY 53/53 on BOTH
-/// PHYs (CMN + PLL, including PHY_STATUS 0x1F and both PLLs locked), PPS
-/// 128/128, panel bias GPIOs driven and reading back high at the pad, the
-/// KTZ8866s' LCD_BIAS_EN set with FLAG=0 (no fault) on both chips, all
-/// three rails voted and now explicitly HPM, no SMMU faults, no DSI
-/// errors, no DMA timeouts, and LANE_STATUS showing the lanes genuinely
-/// driven with no contention.
-///
-/// And the panel has never once answered a bus turnaround.
-///
-/// The zero-byte BTA is upstream of DSC, the DPU, the framebuffer and the
-/// compressed stream -- a DCS read of 0x0A needs none of them. So strip
-/// the configuration down to the smallest thing that can still fail:
-///
-///   - hosts stay in COMMAND mode; the video-mode switch never runs
-///   - no DPU, no INTF timing, no DSC encoder, no pixel traffic
-///   - the read is issued on DSI0 alone, immediately after the panel's
-///     reset pulse, BEFORE any of the 87 init commands
-///
-/// That removes, in one step, every variable the report ranked: bonded
-/// slave-link interaction, DSC, video-mode-vs-command-mode, the init
-/// sequence itself, and the DPU entirely.
-///
-///   bytes come back -> the panel talks under simple conditions, and
-///     something in the fuller sequence is what silences it. That would
-///     be the first positive response in this project's history.
-///   still nothing -> the panel does not respond to us under the simplest
-///     possible configuration, on a link whose every register matches
-///     working silicon and whose lanes are confirmed driven. At that
-///     point the remaining discriminator is genuinely physical and a
-///     scope on data-lane-0 P/N is the honest next instrument.
-/// RE-PURPOSED: COMMAND-MODE INIT TEST (SPEC.md task #5 log).
-///
-/// Now established, via a kernel built to skip its own panel bring-up plus
-/// a U-Boot built to skip its teardown: Linux's KNOWN-GOOD video path
-/// renders nothing on a panel configured solely by our init. So our 87
-/// DCS commands + PPS do not configure the DDIC, and every video-path
-/// measurement this session was made against an unconfigured panel.
-///
-/// The command CONTENT is not the problem -- our table diffs byte-for-byte
-/// against sheng_tianma_init_sequence(), 87/87 -- and the packet bytes are
-/// confirmed present and correct in DRAM at fetch time (0x801526FF). So
-/// the question is delivery.
-///
-/// This flag keeps the DSI hosts in COMMAND mode for the whole init
-/// instead of switching them to VIDEO mode first. That switch was adopted
-/// to match the kernel's measured ordering (host_enable_video at 632.4ms,
-/// panel_reset at 633.7ms, init_seq at 668.9ms), but this driver's own
-/// history records an earlier attempt at that ordering wedging the command
-/// DMA at command #26 -- i.e. evidence that our video engine behaves
-/// differently from the kernel's while streaming with no DPU data behind
-/// it, for the ~200ms the init takes.
-///
-///   Linux renders -> running the init over a video-mode link is what
-///     breaks command delivery, and the fix is to init in command mode.
-///   Still black   -> delivery is broken independently of link mode, and
-///     the fault is in the physical LP path or the panel's receive state.
-const MINIMAL_CMD_MODE_BTA_TEST: bool = false; // both modes fail identically; back to the kernel-matching ordering
 
 export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, enable_dsc: bool) callconv(.c) c_int {
     // REAL GAP FOUND (SPEC.md task #5 log): smmuBypassMdssStream() was
@@ -3544,68 +3342,7 @@ const SSPP_CLK_CTRL: usize = 0x330;
 const SSPP_CLK_CTRL_VALUE: u32 = 0x5;
 const SSPP_UBWC_ERROR_VALUE: u32 = 0x80000000;
 
-/// DECISIVE BISECT (SPEC.md task #5 log): SSPP SOLID FILL.
-///
-/// dpu_hw_sspp.c: DPU_SSPP_SOLID_FILL sets BIT(22) in SSPP_SRC_FORMAT
-/// and the colour comes from SSPP_SRC_CONSTANT_COLOR (0x3c) / _REC1
-/// (0x180). The pipe then SYNTHESISES pixels internally -- no memory
-/// fetch, no SMMU, no framebuffer -- while everything downstream
-/// (LM -> DSC -> INTF -> DSI -> panel) runs exactly as configured,
-/// including real DSC compression. Unlike the DSI test pattern
-/// generator, which injects downstream of the DSC encoders and so can
-/// never produce a decodable stream on this DSC-mandatory panel, this
-/// test IS decodable.
-///
-/// It settles what every current measurement leaves open: the DSC
-/// encoder is verifiably running and emitting a valid compressed
-/// stream -- but a valid compressed stream of a BLACK frame is exactly
-/// what an SSPP delivering no pixels would produce, and every register,
-/// fault and FIFO reading would still look perfect. Which is precisely
-/// the state we are in.
-///
-///   RED appears -> mixer, DSC, INTF, DSI and panel all work; the fault
-///     is the SSPP memory fetch (framebuffer/SMMU/bandwidth), despite
-///     clean fault registers.
-///   Still black -> the fault is downstream of the pipe, and the
-///     framebuffer path is exonerated entirely.
-///
-/// Deliberately RED (0xFF0000FF in this panel's 0xAABBGGRR ordering) so
-/// it cannot be confused with the green framebuffer fill.
-// Back to the REAL framebuffer path (SPEC.md task #5 log). Solid fill
-// answered its question -- an in-pipe colour with zero memory fetch is
-// still black -- so leaving it on only masks the actual fetch path and
-// pins sheng.verify at 0x800000 (bit23, SSPP_SRC_FORMAT).
-const SSPP_SOLID_FILL_TEST: bool = false;
 
-/// FETCH PROBE (SPEC.md task #5 log).
-///
-/// Everything in the DPU, DSI, PHY, DISPCC, VBIF and MDSS now matches the
-/// working kernel write-for-write, and the panel is still black. One thing
-/// has never been established either way: whether the SSPP actually issues
-/// memory reads at all.
-///
-/// All the evidence so far is compatible with BOTH "it fetches and the
-/// data is fine" and "it never fetches": SMMU CB_FSR reports no
-/// translation fault (TF clear), which is what you get from a correct
-/// fetch AND from no fetch whatsoever. Until b25 the pixel-extension
-/// REQ_PIXELS registers were zero, so "no fetch" was entirely plausible.
-///
-/// This settles it. Point SSPP_SRC0/SRC1_ADDR at an address deliberately
-/// OUTSIDE the 1GB identity block our SMMU context bank maps
-/// (SMMU_FB_IDENTITY_BLOCK_BASE = 0x80000000, so 0x50000000 is unmapped),
-/// then read CB_FSR/CB_FAR after the DPU has been streaming.
-///
-///   FSR shows TF (bit1) and FAR lands near 0x50000000
-///     -> the SSPP IS fetching. The memory path works and the fault is in
-///        what happens to the pixels afterwards.
-///   FSR still clean, no fault at all
-///     -> the SSPP never issues a read. Every downstream block is then
-///        faithfully processing nothing, which is exactly a black screen
-///        with a perfect register set, and the whole investigation moves
-///        to why the fetch is not being issued.
-///
-/// Deliberately breaks the image -- diagnostic only, revert to false.
-const SSPP_FETCH_PROBE_TEST: bool = false; // ANSWERED: FSR=0x402 (TF set), FAR=0x500017c0 -- the SSPP genuinely fetches, and the real address translates cleanly.
 const SSPP_FETCH_PROBE_ADDR: u32 = 0x50000000;
 const SSPP_SRC_CONSTANT_COLOR: usize = 0x3c;
 const SSPP_SRC_CONSTANT_COLOR_REC1: usize = 0x180;
@@ -4300,9 +4037,6 @@ var g_smmu_cbx: i32 = -2; // -2 = function never ran; -1 = ran but found no free
 var g_smmu_s2cr_before: u32 = 0xFFFFFFFF;
 var g_smmu_s2cr_after: u32 = 0xFFFFFFFF;
 var g_smmu_sctlr: u32 = 0xFFFFFFFF;
-/// Leave the MDSS context bank's stage-1 MMU disabled so DSI DMA uses
-/// physical addresses directly. Set false to restore translation.
-const SMMU_STAGE1_PASSTHROUGH: bool = true;
 export fn sheng_mdss_smmu_sctlr() callconv(.c) u32 { return g_smmu_sctlr; }
 
 /// Exported so callers that issue a command DMA BEFORE
@@ -4440,10 +4174,10 @@ fn smmuBypassMdssStream() void {
     // pass through untranslated, physical addresses are used as-is, and the
     // entire page-table question disappears. S2CR still reads TYPE_TRANS,
     // so the hypervisor never sees a BYPASS write.
-    const sctlr: u32 = if (SMMU_STAGE1_PASSTHROUGH)
-        (SMMU_SCTLR_LIVE_LINUX_VALUE & ~@as(u32, 1)) // clear M: no translation
-    else
-        SMMU_SCTLR_LIVE_LINUX_VALUE;
+    // Stage-1 passthrough: clear SCTLR.M so the context bank does no
+    // translation at all. S2CR still reads TYPE_TRANS, so the hypervisor
+    // never sees a BYPASS write.
+    const sctlr: u32 = SMMU_SCTLR_LIVE_LINUX_VALUE & ~@as(u32, 1);
     mmioWrite32(cbx_base, 0x0, sctlr);
     g_smmu_sctlr = sctlr;
 
@@ -4646,10 +4380,7 @@ export fn sheng_mdss_dpu_start(
     mmioWrite32(sspp_base, SSPP_SRC_XY, 0);
     mmioWrite32(sspp_base, SSPP_OUT_SIZE, (vactive << 16) | half_w);
     mmioWrite32(sspp_base, SSPP_OUT_XY, 0);
-    mmioWrite32(sspp_base, SSPP_SRC0_ADDR, if (SSPP_FETCH_PROBE_TEST)
-        SSPP_FETCH_PROBE_ADDR
-    else
-        @truncate(fb_addr));
+    mmioWrite32(sspp_base, SSPP_SRC0_ADDR, @truncate(fb_addr));
     // YSTRIDE0 packs BOTH rects' plane-0 pitch: low16=rect0, high16=rect1
     // (dpu_hw_sspp_setup_sourceaddress's non-SOLO path) -- not two planes
     // of the same rect. Both rects read the same buffer/stride here.
@@ -4665,14 +4396,7 @@ export fn sheng_mdss_dpu_start(
     // interconnect/bandwidth votes Linux also makes, which this driver
     // does not. The register definitions are kept above for reference.
 
-    if (SSPP_SOLID_FILL_TEST) {
-        mmioWrite32(sspp_base, SSPP_SRC_CONSTANT_COLOR, SSPP_SOLID_FILL_COLOR);
-        mmioWrite32(sspp_base, SSPP_SRC_CONSTANT_COLOR_REC1, SSPP_SOLID_FILL_COLOR);
-    }
-    mmioWrite32(sspp_base, SSPP_SRC_FORMAT, if (SSPP_SOLID_FILL_TEST)
-        SSPP_XRGB8888_SRC_FORMAT | SSPP_SOLID_FILL_FORMAT_BIT
-    else
-        SSPP_XRGB8888_SRC_FORMAT);
+    mmioWrite32(sspp_base, SSPP_SRC_FORMAT, SSPP_XRGB8888_SRC_FORMAT);
     mmioWrite32(sspp_base, SSPP_SRC_UNPACK_PATTERN, SSPP_XRGB8888_UNPACK_PATTERN);
     mmioWrite32(sspp_base, SSPP_SRC_OP_MODE, SSPP_OP_MODE_LIVE);
 
@@ -4720,14 +4444,8 @@ export fn sheng_mdss_dpu_start(
     // rect1 fetches through SRC1_ADDR, not SRC0_ADDR -- same buffer base,
     // SRC_XY_REC1's x=half_w crops into the right half via YSTRIDE0's
     // high16 pitch.
-    mmioWrite32(sspp_base, SSPP_SRC1_ADDR, if (SSPP_FETCH_PROBE_TEST)
-        SSPP_FETCH_PROBE_ADDR
-    else
-        @truncate(fb_addr));
-    mmioWrite32(sspp_base, SSPP_SRC_FORMAT_REC1, if (SSPP_SOLID_FILL_TEST)
-        SSPP_XRGB8888_SRC_FORMAT | SSPP_SOLID_FILL_FORMAT_BIT
-    else
-        SSPP_XRGB8888_SRC_FORMAT);
+    mmioWrite32(sspp_base, SSPP_SRC1_ADDR, @truncate(fb_addr));
+    mmioWrite32(sspp_base, SSPP_SRC_FORMAT_REC1, SSPP_XRGB8888_SRC_FORMAT);
     mmioWrite32(sspp_base, SSPP_SRC_UNPACK_PATTERN_REC1, SSPP_XRGB8888_UNPACK_PATTERN);
     mmioWrite32(sspp_base, SSPP_SRC_OP_MODE_REC1, SSPP_OP_MODE_LIVE);
     // dpu_hw_sspp_setup_multirect() ORs DPU_SSPP_RECT_0(1) | DPU_SSPP_RECT_1(2)
