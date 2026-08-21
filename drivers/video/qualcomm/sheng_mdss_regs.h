@@ -57,6 +57,11 @@
 #define DPU_DCE0_OFF			0x80000
 #define DPU_DCE1_OFF			0x81000
 
+/* MDP clock RCG, dispcc-relative. CFG holds src_sel [10:8] and
+ * src_div [4:0]. */
+#define MDP_CLK_SRC_CMD_RCGR		0x80d8
+#define MDP_CLK_SRC_CFG_RCGR		(MDP_CLK_SRC_CMD_RCGR + 0x4)
+
 /* INTF timing counters, offsets from an intf block base. */
 #define INTF_FRAME_COUNT		0x0ac
 #define INTF_LINE_COUNT			0x0b0

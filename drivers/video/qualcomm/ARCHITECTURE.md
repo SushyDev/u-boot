@@ -147,8 +147,13 @@ Relevant config:
 
 `sheng_mdss.c` holds what has to be C: `U_BOOT_DRIVER`, `of_match` and
 the video-uclass plumbing are linker-section macros and driver-model
-structs that cannot reasonably be expressed in Zig. Sequencing that is
-mostly driver-model calls (`dm_i2c_*`, `env_*`) also stays.
+structs that cannot reasonably be expressed in Zig.
+
+Two four-line wrappers also stay C, around `cmd_db_read_addr()` — a
+U-Boot API that resolves an RPMh resource name to an address. Calling
+it from Zig would put a U-Boot dependency inside the Zig unit, which is
+what this split exists to avoid. The lookup is C; the register write
+that follows is Zig.
 
 `sheng_mdss_hw.zig` holds the register work: DISPCC and PLL
 programming, DSI PHY and host bring-up, the DCS command engine, DSC,
@@ -157,6 +162,23 @@ aarch64 object and linked in; it calls back into U-Boot only for
 `udelay`, `flush_dcache_range` and `timer_get_us`.
 
 Building it needs `zig` on PATH.
+
+## Edits to generic U-Boot
+
+Board code lives in `board/qualcomm/sheng/`, selected by
+`CONFIG_SYS_BOARD="sheng"`, and hooks in through `qcom_late_init()`,
+`board_preboot_os()` and `ft_board_setup()` — all pre-existing
+extension points. Three edits to shared files remain:
+
+| file | why it stays |
+|---|---|
+| `arch/arm/cpu/armv8/start.S` | Early stack moved below `_start`. There is no hook that runs before the stack exists. Image growth pushed the temp stack into ABL/TZ memory, which corrupts the running firmware before any board code gets control. |
+| `drivers/misc/qcom_geni.c` | Loads protocol firmware into `qcom,geni-se-i2c-master-hub` wrappers. The driver already does this for directly-matched wrappers and simply missed this compatible; the gap is generic, not sheng-specific. |
+| `drivers/power/domain/qcom-rpmhpd.c` | Adds the SM8550 power-domain descriptor. Ordinary new-SoC support that belongs in the driver. The display driver does not use it — it sends its own RPMh commands — but the descriptor is correct and other SM8550 consumers need it. |
+
+`cmd/sheng_trap.c` is gone. It was a bring-up reachability probe built
+unconditionally into every board's `cmd/`, and the display now answers
+the question it existed for.
 
 ## Debug channel
 
@@ -173,10 +195,13 @@ Two channels replace it:
   `/proc/device-tree/chosen/`. CBSIZE-capped, so large payloads belong
   in the blackbox.
 
-With the symbol off every macro in `sheng_mdss_debug.h` expands to
-`((void)0)` **and discards its arguments**, so the hardware reads that
-feed them cost nothing. Never put a call with a required side effect
-inside one.
+With the symbol off every macro in `sheng_mdss_debug.h` discards its
+arguments, so the hardware reads that feed them cost nothing.
+
+**Never put a call with a required side effect inside one** — it will
+not run in a normal boot. Assign to a local, then log the local. This
+has already cost one latched panel: the KTZ8866 bias clear was written
+as a macro argument and silently stopped running.
 
 To find how far a boot got with no channel at all: paint the
 framebuffer a flat colour from the point in question — a DRAM write

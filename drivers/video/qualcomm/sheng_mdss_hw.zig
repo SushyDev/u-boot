@@ -7860,3 +7860,204 @@ export fn sheng_mdss_verify_pipeline(dpu_base: usize, dsi0_base: usize) callconv
     g_verify_mask = mask;
     return @bitCast(mask);
 }
+
+// ---------------------------------------------------------------------
+// Platform glue: TLMM pin control, GCC branch enable, and RPMh voting
+// over the raw APPS_RSC registers.
+//
+// These were the last register programming left in the C file. The C
+// side keeps only what needs U-Boot's driver model.
+// ---------------------------------------------------------------------
+
+const TLMM_BASE: usize = 0x00f100000;
+const TLMM_PIN_STRIDE: usize = 0x1000;
+const TLMM_CFG: usize = 0x0;
+const TLMM_IN_OUT: usize = 0x4;
+const TLMM_MUX_FUNC_MASK: u32 = 0x7 << 2;
+const TLMM_OE: u32 = 1 << 9;
+const TLMM_OUT: u32 = 1 << 1;
+
+/// Drive a pin as a plain output. mux bits 0 select native GPIO, bit 9
+/// is output enable, IN_OUT bit 1 carries the value.
+///
+/// Raw MMIO rather than the gpio uclass: a .bind hook hangs this board.
+export fn sheng_gpio_set(gpio: u32, high: bool) callconv(.c) void {
+    const pin = TLMM_BASE + TLMM_PIN_STRIDE * gpio;
+
+    var v = mmioRead32(pin, TLMM_CFG);
+    v &= ~TLMM_MUX_FUNC_MASK;
+    v |= TLMM_OE;
+    mmioWrite32(pin, TLMM_CFG, v);
+
+    v = mmioRead32(pin, TLMM_IN_OUT);
+    if (high) v |= TLMM_OUT else v &= ~TLMM_OUT;
+    mmioWrite32(pin, TLMM_IN_OUT, v);
+}
+
+const GCC_BASE: usize = 0x00100000;
+const GCC_DISP_HF_AXI_CBCR: usize = 0x2700c;
+
+/// The AXI data path clock, as opposed to the AHB register path. The DSI
+/// command DMA fetches packets over it; gated, the engine latches
+/// CMD_MODE_DMA_BUSY forever having never fetched a byte and never
+/// errored. BRANCH_HALT_SKIP, so there is no ready bit to poll.
+export fn sheng_gcc_disp_hf_axi_enable() callconv(.c) u32 {
+    mmioSetBits32(GCC_BASE, GCC_DISP_HF_AXI_CBCR, 1);
+    // Readback proves both that the write landed and that GCC is
+    // reachable at all.
+    return mmioRead32(GCC_BASE, GCC_DISP_HF_AXI_CBCR);
+}
+
+// apps_rsc@17a00000: qcom,drv-id = <2>, tcs-offset 0xd00. ACTIVE_TCS is
+// first in qcom,tcs-config, so it takes indices 0..2.
+const APPS_RSC_DRV2_BASE: usize = 0x17a20000;
+const APPS_RSC_TCS_OFFSET: usize = 0xd00;
+
+// Slot 0 always. rpmh-rsc.c tracks free slots in a software bitmap, not
+// a register, and on a fresh boot that bitmap picks slot 0 too. Every
+// send here polls to completion before returning and nothing else
+// touches the RSC, so there is no contention to arbitrate.
+const APPS_RSC_ACTIVE_TCS_FIRST: u32 = 0;
+
+const TCS_AMC_MODE_ENABLE: u32 = 1 << 16;
+const TCS_AMC_MODE_TRIGGER: u32 = 1 << 24;
+const CMD_MSGID_BASE: u32 = 8;
+const CMD_MSGID_RESP_REQ: u32 = 1 << 8;
+const CMD_MSGID_WRITE: u32 = 1 << 16;
+const CMD_STATUS_COMPL: u32 = 1 << 16;
+const RSC_POLL_TIMEOUT_US: u32 = 200000;
+
+/// The two register layouts rpmh-rsc.c picks between on the major
+/// version in RSC_DRV_ID (offset 0).
+const RscRegs = struct {
+    tcs_stride: usize,
+    cmd_wait_for_cmpl: usize,
+    control: usize,
+    status: usize,
+    cmd_enable: usize,
+    cmd_msgid: usize,
+    cmd_addr: usize,
+    cmd_data: usize,
+    cmd_status: usize,
+};
+
+const rsc_regs_v2_7 = RscRegs{
+    .tcs_stride = 672,
+    .cmd_wait_for_cmpl = 0x10, .control = 0x14, .status = 0x18,
+    .cmd_enable = 0x1c, .cmd_msgid = 0x30, .cmd_addr = 0x34,
+    .cmd_data = 0x38, .cmd_status = 0x3c,
+};
+
+const rsc_regs_v3_0 = RscRegs{
+    .tcs_stride = 672,
+    .cmd_wait_for_cmpl = 0x20, .control = 0x24, .status = 0x28,
+    .cmd_enable = 0x2c, .cmd_msgid = 0x34, .cmd_addr = 0x38,
+    .cmd_data = 0x3c, .cmd_status = 0x40,
+};
+
+fn rscTcsReg(regs: *const RscRegs, off: usize, tcs_id: u32) usize {
+    return APPS_RSC_DRV2_BASE + APPS_RSC_TCS_OFFSET +
+        regs.tcs_stride * tcs_id + off;
+}
+
+/// Write and poll until the value reads back. -ETIMEDOUT on failure.
+fn rscWriteRegSync(regs: *const RscRegs, off: usize, tcs_id: u32, data: u32) c_int {
+    const addr = rscTcsReg(regs, off, tcs_id);
+
+    mmioWrite32(addr, 0, data);
+    var i: u32 = 0;
+    while (i < RSC_POLL_TIMEOUT_US) : (i += 1) {
+        if (mmioRead32(addr, 0) == data) return 0;
+        udelay(1);
+    }
+    return -110;
+}
+
+/// One ACTIVE_ONLY RPMh write, polled to hardware completion.
+///
+/// Mirrors rpmh_rsc_send_data() / __tcs_buffer_write() /
+/// __tcs_set_trigger(). Do NOT write CMD_WAIT_FOR_CMPL: the
+/// CMD_MSGID_RESP_REQ bit already asks for completion and the real
+/// driver never touches that register. This RSC sequences rails for the
+/// whole SoC, and a stray write here breaks AHB access chip-wide.
+export fn sheng_rsc_send_active_write(resource_addr: u32, data: u32) callconv(.c) c_int {
+    const rsc_id = mmioRead32(APPS_RSC_DRV2_BASE, 0);
+    const major = (rsc_id >> 16) & 0xff;
+    const regs: *const RscRegs = if (major == 3) &rsc_regs_v3_0 else &rsc_regs_v2_7;
+    const tcs_id = APPS_RSC_ACTIVE_TCS_FIRST;
+
+    mmioWrite32(rscTcsReg(regs, regs.cmd_msgid, tcs_id), 0,
+        CMD_MSGID_BASE | CMD_MSGID_RESP_REQ | CMD_MSGID_WRITE);
+    mmioWrite32(rscTcsReg(regs, regs.cmd_addr, tcs_id), 0, resource_addr);
+    mmioWrite32(rscTcsReg(regs, regs.cmd_data, tcs_id), 0, data);
+    mmioSetBits32(rscTcsReg(regs, regs.cmd_enable, tcs_id), 0, 1);
+
+    // __tcs_set_trigger(): clear trigger, clear enable, set enable, then
+    // set enable|trigger. Exact sequence, each step polled.
+    var enable = mmioRead32(rscTcsReg(regs, regs.control, tcs_id), 0);
+    var ret: c_int = undefined;
+
+    enable &= ~TCS_AMC_MODE_TRIGGER;
+    ret = rscWriteRegSync(regs, regs.control, tcs_id, enable);
+    if (ret != 0) return ret;
+
+    enable &= ~TCS_AMC_MODE_ENABLE;
+    ret = rscWriteRegSync(regs, regs.control, tcs_id, enable);
+    if (ret != 0) return ret;
+
+    enable = TCS_AMC_MODE_ENABLE;
+    ret = rscWriteRegSync(regs, regs.control, tcs_id, enable);
+    if (ret != 0) return ret;
+
+    enable |= TCS_AMC_MODE_TRIGGER;
+    mmioWrite32(rscTcsReg(regs, regs.control, tcs_id), 0, enable);
+
+    var i: u32 = 0;
+    while (i < RSC_POLL_TIMEOUT_US) : (i += 1) {
+        if ((mmioRead32(rscTcsReg(regs, regs.cmd_status, tcs_id), 0) &
+             CMD_STATUS_COMPL) != 0) return 0;
+        udelay(1);
+    }
+    return -110;
+}
+
+/// Interconnect bandwidth vote for one BCM.
+///
+/// Max in both 14-bit fields. A token vote_x/vote_y of 1 is what
+/// bcm_aggregate() forces onto keepalive BCMs when nobody has asked for
+/// anything: accepted, and no real bandwidth. Computing a realistic
+/// value needs unit/width from cmd-db aux data; max opens the gate.
+export fn sheng_bcm_vote(addr: u32) callconv(.c) c_int {
+    const commit: u32 = 1 << 30;
+    const valid: u32 = 1 << 29;
+    const vote_max: u32 = 0x3fff;
+
+    return sheng_rsc_send_active_write(addr,
+        commit | valid | (vote_max << 14) | vote_max);
+}
+
+/// RPMh VRM regulator vote: voltage, then mode, then enable -- the order
+/// the regulator core uses.
+///
+/// Mode must be HPM. An LDO in LPM regulates fine at static load, so a
+/// voltage readback looks nominal, but it current-limits under the
+/// transients a 4-lane D-PHY draws switching LP to HS: the PLL locks,
+/// engines report healthy, and the pads cannot swing. 7 covers both
+/// classes here -- PMIC5_LDO_MODE_HPM and PMIC5_SMPS_MODE_PWM are both
+/// 7.
+///
+/// RPMh aggregates across masters, so this is a no-op if something else
+/// already voted HPM. No change here does not exonerate a rail.
+export fn sheng_regulator_vote(addr: u32, millivolts: u32) callconv(.c) c_int {
+    const REG_VRM_VOLTAGE: u32 = 0x0;
+    const REG_ENABLE: u32 = 0x4;
+    const REG_VRM_MODE: u32 = 0x8;
+
+    var ret = sheng_rsc_send_active_write(addr + REG_VRM_VOLTAGE, millivolts);
+    if (ret != 0) return ret;
+
+    ret = sheng_rsc_send_active_write(addr + REG_VRM_MODE, 7);
+    if (ret != 0) return ret;
+
+    return sheng_rsc_send_active_write(addr + REG_ENABLE, 1);
+}

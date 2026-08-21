@@ -27,278 +27,14 @@
 
 DECLARE_GLOBAL_DATA_PTR;
 
-/*
- * Hand-rolled RPMh writes against the raw APPS_RSC registers.
- *
- * U-Boot's own power-domain/rpmh-rsc stack makes the vote succeed, but
- * probing it through the power-domain uclass breaks the unrelated DSI
- * command DMA afterwards. rpmh_rsc_send_data() always takes active TCS
- * slot 0 rather than picking a free one, which disturbs shared RSC/TCS
- * state. This mirrors rpmh_rsc_send_data() / __tcs_buffer_write() /
- * __tcs_set_trigger() but claims whichever slot the hardware reports
- * free, and touches nothing else.
- *
- * Reaching the DPU register block at all needs this: without the MMCX
- * vote its AHB slave never acks and the CPU hangs on the first write.
- */
-
-/* apps_rsc@17a00000: qcom,drv-id = <2>, tcs-offset 0xd00. ACTIVE_TCS
- * is listed first in qcom,tcs-config, so it takes indices 0..2. */
-#define APPS_RSC_DRV2_BASE	0x17a20000
-#define APPS_RSC_TCS_OFFSET	0xd00
-#define APPS_RSC_ACTIVE_TCS_COUNT	3
-#define APPS_RSC_ACTIVE_TCS_FIRST	0
-
-/* Same two register layouts rpmh-rsc.c selects between based on the
- * major version read back from RSC_DRV_ID (offset 0) -- see
- * rpmh_rsc_reg_offset_ver_{2_7,3_0} there. */
-struct rsc_drv_regs {
-	u32 tcs_stride;
-	u32 cmd_stride;
-	u32 cmd_wait_for_cmpl;
-	u32 control;
-	u32 status;
-	u32 cmd_enable;
-	u32 cmd_msgid;
-	u32 cmd_addr;
-	u32 cmd_data;
-	u32 cmd_status;
-};
-
-static const struct rsc_drv_regs rsc_regs_v2_7 = {
-	.tcs_stride = 672, .cmd_stride = 20,
-	.cmd_wait_for_cmpl = 0x10, .control = 0x14, .status = 0x18,
-	.cmd_enable = 0x1c, .cmd_msgid = 0x30, .cmd_addr = 0x34,
-	.cmd_data = 0x38, .cmd_status = 0x3c,
-};
-
-static const struct rsc_drv_regs rsc_regs_v3_0 = {
-	.tcs_stride = 672, .cmd_stride = 24,
-	.cmd_wait_for_cmpl = 0x20, .control = 0x24, .status = 0x28,
-	.cmd_enable = 0x2c, .cmd_msgid = 0x34, .cmd_addr = 0x38,
-	.cmd_data = 0x3c, .cmd_status = 0x40,
-};
-
-#define TCS_AMC_MODE_ENABLE	(1u << 16)
-#define TCS_AMC_MODE_TRIGGER	(1u << 24)
-#define CMD_MSGID_BASE		8u
-#define CMD_MSGID_RESP_REQ	(1u << 8)
-#define CMD_MSGID_WRITE		(1u << 16)
-#define CMD_STATUS_COMPL	(1u << 16)
-
-#define RSC_POLL_TIMEOUT_US	200000
-
-static void __iomem *rsc_tcs_reg(void __iomem *tcs_base,
-				  const struct rsc_drv_regs *regs,
-				  u32 reg_off, int tcs_id)
-{
-	return tcs_base + regs->tcs_stride * tcs_id + reg_off;
-}
-
-static void __iomem *rsc_cmd_reg(void __iomem *tcs_base,
-				  const struct rsc_drv_regs *regs,
-				  u32 reg_off, int tcs_id)
-{
-	/* Single command per transfer, always cmd_id 0. */
-	return rsc_tcs_reg(tcs_base, regs, reg_off, tcs_id);
-}
-
-static int rsc_write_reg_sync(void __iomem *tcs_base,
-			       const struct rsc_drv_regs *regs,
-			       u32 reg_off, int tcs_id, u32 data)
-{
-	void __iomem *addr = rsc_tcs_reg(tcs_base, regs, reg_off, tcs_id);
-	unsigned int i;
-
-	writel(data, addr);
-	for (i = 0; i < RSC_POLL_TIMEOUT_US; i++) {
-		if (readl(addr) == data)
-			return 0;
-		udelay(1);
-	}
-	return -ETIMEDOUT;
-}
-
-/*
- * Send one ACTIVE_ONLY RPMh write (addr/data) and wait for hardware
- * completion. Picks whichever active TCS slot is currently free
- * rather than assuming a fixed one.
- */
-static int rsc_send_active_write(u32 resource_addr, u32 data)
-{
-	void __iomem *rsc_base = (void __iomem *)(uintptr_t)APPS_RSC_DRV2_BASE;
-	void __iomem *tcs_base = rsc_base + APPS_RSC_TCS_OFFSET;
-	const struct rsc_drv_regs *regs;
-	u32 rsc_id, major;
-	int tcs_id = -1;
-	u32 cmd_msgid;
-	unsigned int i;
-
-	rsc_id = readl(rsc_base);
-	SHENG_DBG_LOG(SHENG_LOG_RSC_DRV_ID, rsc_id);
-	SHENG_DBG_ENV("sheng_rsc_id", (unsigned long)rsc_id);
-	major = (rsc_id >> 16) & 0xff;
-	regs = (major == 3) ? &rsc_regs_v3_0 : &rsc_regs_v2_7;
-
-	/* Slot 0 always. rpmh-rsc.c tracks free slots in a software bitmap,
-	 * not a hardware register, and on a fresh boot that bitmap picks
-	 * slot 0 too. This function polls CMD_STATUS_COMPL before returning
-	 * and nothing else here touches the RSC, so there is no contention
-	 * to arbitrate. */
-	tcs_id = APPS_RSC_ACTIVE_TCS_FIRST;
-	SHENG_DBG_LOG(SHENG_LOG_MMCX_TCS_ID, (u32)tcs_id);
-
-	cmd_msgid = CMD_MSGID_BASE | CMD_MSGID_RESP_REQ | CMD_MSGID_WRITE;
-	writel(cmd_msgid, rsc_cmd_reg(tcs_base, regs, regs->cmd_msgid, tcs_id));
-	writel(resource_addr, rsc_cmd_reg(tcs_base, regs, regs->cmd_addr, tcs_id));
-	writel(data, rsc_cmd_reg(tcs_base, regs, regs->cmd_data, tcs_id));
-
-	/* Do not write CMD_WAIT_FOR_CMPL. CMD_MSGID_RESP_REQ above already
-	 * asks for completion; __tcs_buffer_write() never touches that
-	 * register. This RSC sequences rails for the whole SoC and a stray
-	 * write here breaks AHB access chip-wide. */
-	writel(readl(rsc_tcs_reg(tcs_base, regs, regs->cmd_enable, tcs_id)) | 1u,
-	       rsc_tcs_reg(tcs_base, regs, regs->cmd_enable, tcs_id));
-
-	/* __tcs_set_trigger(): clear trigger, clear enable, set enable,
-	 * then set enable|trigger -- exact sequence rpmh-rsc.c uses. */
-	{
-		u32 enable = readl(rsc_tcs_reg(tcs_base, regs, regs->control, tcs_id));
-		int ret;
-
-		enable &= ~TCS_AMC_MODE_TRIGGER;
-		ret = rsc_write_reg_sync(tcs_base, regs, regs->control, tcs_id, enable);
-		if (ret)
-			return ret;
-
-		enable &= ~TCS_AMC_MODE_ENABLE;
-		ret = rsc_write_reg_sync(tcs_base, regs, regs->control, tcs_id, enable);
-		if (ret)
-			return ret;
-
-		enable = TCS_AMC_MODE_ENABLE;
-		ret = rsc_write_reg_sync(tcs_base, regs, regs->control, tcs_id, enable);
-		if (ret)
-			return ret;
-
-		enable |= TCS_AMC_MODE_TRIGGER;
-		writel(enable, rsc_tcs_reg(tcs_base, regs, regs->control, tcs_id));
-	}
-
-	for (i = 0; i < RSC_POLL_TIMEOUT_US; i++) {
-		u32 status = readl(rsc_cmd_reg(tcs_base, regs, regs->cmd_status, tcs_id));
-
-		if (status & CMD_STATUS_COMPL)
-			return 0;
-		udelay(1);
-	}
-
-	return -ETIMEDOUT;
-}
-
-/* The DPU's 514MHz OPP requires rpmhpd_opp_nom, which is opp-256. An
- * MMCX under-vote for the rate actually requested gives a bus that
- * clocks correctly and still hangs on first register access. */
-#define RPMH_REGULATOR_LEVEL_NOM 256
-
-static int __maybe_unused sheng_mdss_mmcx_power_on(void)
-{
-	u32 addr;
-	const u16 *levels;
-	size_t len, count, i;
-	u32 corner;
-
-	addr = cmd_db_read_addr("mmcx.lvl");
-	SHENG_DBG_LOG(SHENG_LOG_CMDDB_MMCX_ADDR, addr);
-	SHENG_DBG_ENV("sheng_mmcx_addr", (unsigned long)addr);
-	if (!addr)
-		return -ENODEV;
-
-	levels = cmd_db_read_aux_data("mmcx.lvl", &len);
-	if (IS_ERR(levels)) {
-		SHENG_DBG_ENV("sheng_mmcx_levels_err", (unsigned long)PTR_ERR(levels));
-		return PTR_ERR(levels);
-	}
-
-	count = len >> 1;
-	SHENG_DBG_ENV("sheng_mmcx_count", (unsigned long)count);
-
-	/* Take the MAX corner. Before genpd's sync_state -- which lands well
-	 * after driver probes -- rpmhpd_aggregate_corner() clamps every
-	 * request to level_count - 1, so that is what Linux votes at this
-	 * point in boot too.
-	 *
-	 * The count from cmd_db_read_aux_data() is a padded buffer size (16),
-	 * not the level count; only 0..5 are real. Scan for the last nonzero
-	 * entry rather than trusting the length. */
-	corner = 0;
-	for (i = 1; i < count; i++) {
-		if (levels[i] != 0)
-			corner = i;
-	}
-	SHENG_DBG_LOG(SHENG_LOG_MMCX_CORNER, corner);
-	SHENG_DBG_LOG(SHENG_LOG_MMCX_LEVEL_PICKED, corner < count ? levels[corner] : 0);
-	SHENG_DBG_ENV("sheng_mmcx_corner", (unsigned long)corner);
-	SHENG_DBG_ENV("sheng_mmcx_level", (unsigned long)(corner < count ? levels[corner] : 0));
-
-	return rsc_send_active_write(addr, corner);
-}
-
-/*
- * GCC_DISP_HF_AXI_CLK: the AXI data-path clock, as opposed to the AHB
- * register path. A normal gated consumer clock that nobody enables for
- * us -- GCC_DISP_AHB_CLK is force-on at GCC probe, which is why DISPCC
- * and DSI work without this. BRANCH_HALT_SKIP, so there is no ready
- * status to poll.
- */
-static void sheng_mdss_gcc_disp_hf_axi_clk_enable(void)
-{
-	volatile u32 *cbcr = (volatile u32 *)(uintptr_t)(SM8550_GCC_BASE + GCC_DISP_HF_AXI_CLK_CBCR_OFF);
-
-	*cbcr |= 1u;
-	/* Sanity readback: confirms both that this write landed AND that
-	 * the GCC block itself is reachable (if this read also hung, we'd
-	 * never reach the log call after it). */
-	SHENG_DBG_LOG(SHENG_LOG_GCC_HF_AXI_READBACK, *cbcr);
-}
-
-/*
- * Raw TLMM poke rather than the gpio uclass. A .bind hook hangs this
- * board (see sheng_mdss_probe()), and the driver-model GPIO path is
- * untested here.
- *
- * Per-pin 0x1000 stride from the tlmm block, ctl_reg at +0, io_reg at
- * +0x4. mux bits [4:2] select the function (0 = native GPIO), bit 9 is
- * output enable, and io_reg bit 1 drives the value once OE is set.
- */
-static void sheng_mdss_raw_gpio_set(unsigned int gpio, int high)
-{
-	volatile u32 *ctl = (volatile u32 *)(uintptr_t)
-		(SM8550_TLMM_BASE + TLMM_GPIO_REG_SIZE * gpio);
-	volatile u32 *io = (volatile u32 *)(uintptr_t)
-		(SM8550_TLMM_BASE + 0x4 + TLMM_GPIO_REG_SIZE * gpio);
-	u32 v;
-
-	v = *ctl;
-	v &= ~TLMM_MUX_FUNC_MASK; /* native GPIO function (msm_mux_gpio = 0) */
-	v |= TLMM_OE_BIT;
-	*ctl = v;
-
-	v = *io;
-	if (high)
-		v |= TLMM_OUT_BIT;
-	else
-		v &= ~TLMM_OUT_BIT;
-	*io = v;
-}
-
-/* Unreferenced: the KTZ8866 comes up over I2C and the DDIC gates its
- * output via DCS 0x51/0x53. Kept as a manual override -- the backlight
- * is a direct visible indicator of whether DCS traffic lands. */
-static void __maybe_unused sheng_mdss_backlight_gpio_enable(void)
-{
-	sheng_mdss_raw_gpio_set(TLMM_BACKLIGHT_GPIO, 1);
-}
+/* Register programming lives in sheng_mdss_hw.zig. This file keeps
+ * only what needs U-Boot's driver model: the uclass plumbing, the
+ * cmd-db lookups, and the sequencing between them. */
+extern void sheng_gpio_set(unsigned int gpio, bool high);
+extern unsigned int sheng_gcc_disp_hf_axi_enable(void);
+extern int sheng_rsc_send_active_write(u32 resource_addr, u32 data);
+extern int sheng_bcm_vote(u32 addr);
+extern int sheng_regulator_vote(u32 addr, u32 millivolts);
 
 /* Panel bias: KTZ8866 over I2C plus GPIOs 30/31. The DDIC needs it
  * before any DCS command. Without it commands go nowhere and the host
@@ -310,8 +46,8 @@ extern int sheng_ktz8866_set_bias(int enable);
 static void sheng_mdss_panel_power_and_reset(void)
 {
 	sheng_ktz8866_set_bias(1);
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVDD_GPIO, 1);
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVEE_GPIO, 1);
+	sheng_gpio_set(TLMM_PANEL_AVDD_GPIO, true);
+	sheng_gpio_set(TLMM_PANEL_AVEE_GPIO, true);
 	mdelay(1); /* regulator-enable-ramp-delay is 233us on both */
 
 	SHENG_DBG_PIN("avdd", TLMM_PANEL_AVDD_GPIO);
@@ -319,82 +55,46 @@ static void sheng_mdss_panel_power_and_reset(void)
 
 	/* nt36532e_reset(). The reset line is active-low, so a logical
 	 * assert is physical LOW. Delays are the panel driver's. */
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 0);
+	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, false);
 	SHENG_DBG_PIN("rst assert1", TLMM_PANEL_RESET_GPIO);
 	mdelay(11);
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 1);
+	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, true);
 	SHENG_DBG_PIN("rst deassert1", TLMM_PANEL_RESET_GPIO);
 	mdelay(4);
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 0);
+	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, false);
 	SHENG_DBG_PIN("rst assert2", TLMM_PANEL_RESET_GPIO);
 	mdelay(4);
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 1);
+	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, true);
 	SHENG_DBG_PIN("rst deassert2", TLMM_PANEL_RESET_GPIO);
 	mdelay(16);
 }
 
+/* cmd-db lookup, then the vote itself in Zig. cmd_db_read_addr() is a
+ * U-Boot API, which is the only reason these two wrappers are C. */
 static int sheng_mdss_bcm_vote(const char *bcm_name)
 {
-	u32 addr;
-	u32 data;
+	u32 addr = cmd_db_read_addr(bcm_name);
 
-	addr = cmd_db_read_addr(bcm_name);
 	SHENG_DBG_LOG(SHENG_LOG_CMDDB_MM0_ADDR, addr);
 	if (!addr)
 		return -ENODEV;
 
-	/* Vote the maximum in both 14-bit fields. A token vote_x/vote_y of 1
-	 * is what bcm_aggregate() forces onto keepalive BCMs when nobody has
-	 * asked for anything -- it is accepted and grants no real bandwidth.
-	 * Computing a realistic value needs unit/width from cmd-db aux data;
-	 * max is simpler and opens the NoC gate. */
-	data = (1u << 30) /* commit */ | (1u << 29) /* valid */ |
-	       ((0x3fffu) << 14) /* vote_x, max */ | (0x3fffu) /* vote_y, max */;
-
-	return rsc_send_active_write(addr, data);
+	return sheng_bcm_vote(addr);
 }
 
-/*
- * RPMh VRM regulator vote: voltage, then mode, then enable -- the order
- * the regulator core uses.
- *
- * These rails are the DSI PHY's analog supply (vdds) and the panel's
+/* These rails are the DSI PHY's analog supply (vdds) and the panel's
  * vddio. Nothing in the DTS marks them boot-on or always-on, so ABL is
  * not guaranteed to leave them up. A PHY running without its analog
  * supply still reports PLL lock and REFGEN ready while the HS pads
- * never swing to valid levels: frames stream, no pixels, no fault.
- */
+ * never swing to valid levels: frames stream, no pixels, no fault. */
 static int sheng_mdss_regulator_vote(const char *rsc_name, u32 millivolts)
 {
-	u32 addr;
-	int ret;
+	u32 addr = cmd_db_read_addr(rsc_name);
 
-	addr = cmd_db_read_addr(rsc_name);
 	if (!addr)
 		return -ENODEV;
 
-	ret = rsc_send_active_write(addr + 0x0 /* RPMH_REGULATOR_REG_VRM_VOLTAGE */,
-				     millivolts);
-	if (ret)
-		return ret;
-
-	/* Mode must be HPM. An LDO in LPM regulates fine at static load, so
-	 * a voltage readback looks nominal, but it current-limits under the
-	 * transients a 4-lane D-PHY draws switching LP to HS: PLL locks,
-	 * engines report healthy, pads cannot swing.
-	 *
-	 * 7 covers both classes here -- PMIC5_LDO_MODE_HPM and
-	 * PMIC5_SMPS_MODE_PWM are both 7. Sent before enable, matching the
-	 * core, which applies constraints at registration.
-	 *
-	 * RPMh aggregates across masters, so this is a no-op if something
-	 * else already voted HPM. No change here does not exonerate a rail. */
-	ret = rsc_send_active_write(addr + 0x8 /* RPMH_REGULATOR_REG_VRM_MODE */,
-				     7 /* PMIC5_{LDO_MODE_HPM,SMPS_MODE_PWM} */);
-	if (ret)
-		return ret;
-
-	return rsc_send_active_write(addr + 0x4 /* RPMH_REGULATOR_REG_ENABLE */, 1);
+	return sheng_regulator_vote(addr, millivolts);
 }
 
 
@@ -555,9 +255,9 @@ void sheng_mdss_teardown(void)
 	 * The inverse of sheng_mdss_panel_power_and_reset(), so Linux's
 	 * nt36532e_prepare() finds a genuinely unpowered panel and re-runs
 	 * its own init instead of assuming one already on. */
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 0); /* physical LOW = asserted */
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVEE_GPIO, 0);
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVDD_GPIO, 0);
+	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, false); /* physical LOW = asserted */
+	sheng_gpio_set(TLMM_PANEL_AVEE_GPIO, false);
+	sheng_gpio_set(TLMM_PANEL_AVDD_GPIO, false);
 }
 
 static int sheng_mdss_probe(struct udevice *dev)
@@ -565,6 +265,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	struct sheng_mdss_priv *priv = dev_get_priv(dev);
 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
 	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
+	unsigned int axi_cbcr;
 	int bias_ret;
 	int ret;
 
@@ -669,7 +370,10 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * latches CMD_MODE_DMA_BUSY forever, having never fetched a byte and
 	 * never errored. Linux enables it in the same clk_bulk as AHB and
 	 * MDP, before any child DSI device runs. */
-	sheng_mdss_gcc_disp_hf_axi_clk_enable();
+	/* Keep the call OUT of the macro: with debug off the macro discards
+	 * its arguments and the clock would never be enabled. */
+	axi_cbcr = sheng_gcc_disp_hf_axi_enable();
+	SHENG_DBG_LOG(SHENG_LOG_GCC_HF_AXI_READBACK, axi_cbcr);
 
 	ret = sheng_mdss_dispcc_init(SM8550_DISPCC_BASE);
 	BBS("dispcc_init_ret", ret);
@@ -687,11 +391,9 @@ static int sheng_mdss_probe(struct udevice *dev)
 	/* dispcc_init() only proves the CBCR halt-poll passed, not that the
 	 * RCG CFG landed. Expect src_sel=1 (PLL0_OUT_MAIN, bits [10:8]) and
 	 * src_div=5 (2*3-1 for /3, bits [4:0]) for 514MHz. */
-	{
-		volatile u32 *mdp_rcg_cfg =
-			(volatile u32 *)(uintptr_t)(SM8550_DISPCC_BASE + 0x80d8 + 0x4);
-		SHENG_DBG_LOG(SHENG_LOG_MDP_RCG_CFG_READBACK, *mdp_rcg_cfg);
-	}
+	SHENG_DBG_LOG(SHENG_LOG_MDP_RCG_CFG_READBACK,
+		      readl((void __iomem *)(uintptr_t)
+			    (SM8550_DISPCC_BASE + MDP_CLK_SRC_CFG_RCGR)));
 
 
 	/* Real analog supply rails for the DSI PHYs/hosts/panel logic --
@@ -780,40 +482,28 @@ static int sheng_mdss_probe(struct udevice *dev)
 				    SHENG_MDSS_DSI_DMA_SCRATCH);
 
 	/* Power-cycle in teardown order: reset, then avee, then avdd. */
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 0);
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVEE_GPIO, 0);
-	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVDD_GPIO, 0);
+	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, false);
+	sheng_gpio_set(TLMM_PANEL_AVEE_GPIO, false);
+	sheng_gpio_set(TLMM_PANEL_AVDD_GPIO, false);
 	/* GPIOs gate the rails, they do not create them. LCD_BIAS_CFG1 is
-	 * latched over I2C -- clear it or the rails never collapse. */
-	/* LOAD-BEARING. Keep this call OUT of the macro: with debug off the
-	 * macro discards its arguments and the clear never runs. The rails
-	 * then stay up through the "power cycle", the DDIC never loses
-	 * power, and it eventually latches into a state no reset clears --
-	 * recoverable only by holding POWER to force the device off. */
+	 * latched over I2C -- clear it or the rails never collapse.
+	 *
+	 * Load-bearing, so the call stays out of the macro: with debug off
+	 * the macro discards its arguments. */
 	bias_ret = sheng_ktz8866_set_bias(0);
 	BBS("bias OFF over i2c", bias_ret);
 
 
-	{
-		volatile u32 *p_io = (volatile u32 *)(uintptr_t)
-			(SM8550_TLMM_BASE + 0x4 +
-			 TLMM_GPIO_REG_SIZE * TLMM_PANEL_AVDD_GPIO);
-		volatile u32 *n_io = (volatile u32 *)(uintptr_t)
-			(SM8550_TLMM_BASE + 0x4 +
-			 TLMM_GPIO_REG_SIZE * TLMM_PANEL_AVEE_GPIO);
-
-		/* Rails need a long off window to discharge. Shorter than
-		 * ~1s and the DDIC keeps its state across the cycle. */
-		mdelay(20);
-		BBV("rails DURING off (expect 0, avdd<<16|avee)",
-		    (((unsigned long long)(*p_io & 0xffff)) << 16) |
-		    ((unsigned long long)(*n_io & 0xffff)));
-		mdelay(60);
-		BBV("rails LATE in off window",
-		    (((unsigned long long)(*p_io & 0xffff)) << 16) |
-		    ((unsigned long long)(*n_io & 0xffff)));
-		mdelay(1000);
-	}
+	/* The rails need a long off window to discharge. Shorter than ~1s
+	 * and the DDIC keeps its state across the power cycle. Sampled
+	 * twice on the way: both must read 0. */
+	mdelay(20);
+	SHENG_DBG_PIN("avdd during off", TLMM_PANEL_AVDD_GPIO);
+	SHENG_DBG_PIN("avee during off", TLMM_PANEL_AVEE_GPIO);
+	mdelay(60);
+	SHENG_DBG_PIN("avdd late in off", TLMM_PANEL_AVDD_GPIO);
+	SHENG_DBG_PIN("avee late in off", TLMM_PANEL_AVEE_GPIO);
+	mdelay(1000);
 	sheng_mdss_panel_power_and_reset();
 	BBM("panel powered + reset pulsed");
 	sheng_mdss_phy144_mark(6, SM8550_MDSS_DSI0_PHY_BASE);
