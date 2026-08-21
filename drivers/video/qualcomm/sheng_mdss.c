@@ -97,7 +97,6 @@ static int sheng_mdss_regulator_vote(const char *rsc_name, u32 millivolts)
 	return sheng_regulator_vote(addr, millivolts);
 }
 
-
 /* 144Hz mode, nt36532e. Matches the DPU crtc-0 modeline and the panel
  * driver's own mode table. */
 #define SHENG_PANEL_HFRONT_PORCH	142
@@ -117,8 +116,6 @@ extern int sheng_mdss_dispcc_init(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_dsi_clks_init(unsigned long dispcc_base);
 extern int sheng_mdss_dsi_phy_init(unsigned long dsi_phy_base, bool is_master);
 extern int sheng_mdss_dsi_phy_start_dual(unsigned long phy0_base, unsigned long phy1_base);
-extern int sheng_mdss_replay_bringup(unsigned long phy0, unsigned long phy1, unsigned long dsi0, unsigned long dsi1);
-extern int sheng_mdss_replay_bringup_phase(u32 phase, unsigned long phy0, unsigned long phy1, unsigned long dsi0, unsigned long dsi1);
 extern void sheng_mdss_dsi_reset_both_phys(unsigned long dsi0_base, unsigned long dsi1_base);
 extern void sheng_mdss_dsi_host_video_prepare(unsigned long dsi0_base,
 					     unsigned long dsi1_base);
@@ -128,11 +125,6 @@ extern int sheng_mdss_dsi_test_patch(unsigned long dsi0_base, unsigned long dsi1
 				      unsigned long dma_scratch);
 extern long long sheng_mdss_dsi_read_power_mode(unsigned long dsi0_base, unsigned long dsi1_base,
 						 unsigned long dma_scratch);
-extern long long sheng_mdss_dsi_read_error_status(unsigned long dsi0_base);
-extern long long sheng_mdss_dsi_read_ctrl_state(unsigned long dsi0_base);
-extern unsigned int sheng_mdss_dsi_ctrl_writeback_selfcheck(unsigned long dsi_base);
-extern long long sheng_mdss_dsi_block_writeback_selfcheck(unsigned long dsi_base);
-extern unsigned int sheng_mdss_dsi_earliest_ctrl_selfcheck(void);
 extern unsigned int sheng_mdss_dsi_status0_before_first_cmd(void);
 extern long long sheng_mdss_dsi_timeout_diag(void);
 extern long long sheng_mdss_dsi_snapshot_1(void);
@@ -395,7 +387,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 		      readl((void __iomem *)(uintptr_t)
 			    (SM8550_DISPCC_BASE + MDP_CLK_SRC_CFG_RCGR)));
 
-
 	/* Real analog supply rails for the DSI PHYs/hosts/panel logic --
 	 * see sheng_mdss_regulator_vote()'s comment. Both DSI PHYs share
 	 * vreg_l1e_0p88 (0.88V), both DSI hosts share vreg_l3e_1p2 (1.2V),
@@ -493,7 +484,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	bias_ret = sheng_ktz8866_set_bias(0);
 	BBS("bias OFF over i2c", bias_ret);
 
-
 	/* The rails need a long off window to discharge. Shorter than ~1s
 	 * and the DDIC keeps its state across the power cycle. Sampled
 	 * twice on the way: both must read 0. */
@@ -544,7 +534,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	SHENG_DBG_POST_PANEL_REPORT();
 	if (ret)
 		return ret;
-
 
 	/* Panel init is done; the DPU is about to start streaming frames,
 	 * so TRIG_CTRL's BLOCK_DMA_WITHIN_FRAME / TE interlock now has a

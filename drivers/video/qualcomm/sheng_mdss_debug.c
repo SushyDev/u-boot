@@ -197,7 +197,6 @@ unsigned int sheng_mdss_smmu_diag3(void);
 unsigned int sheng_mdss_smmu_sctlr(void);
 void sheng_mdss_gdsc_probe(unsigned long dispcc_base, unsigned int slot);
 long long sheng_mdss_gdsc_probe_result(void);
-void sheng_mdss_dsi_tpg_enable(unsigned long dsi0_base, unsigned long dsi1_base);
 
 /*
  * Sampled after dpu_start, with the pipeline streaming. The 500ms window
@@ -243,9 +242,6 @@ void sheng_mdss_debug_post_dpu_report(void)
 	BBV("smmu_sctlr", sheng_mdss_smmu_sctlr());
 	BBV("smmu_s2cr_after", sheng_mdss_smmu_diag3());
 
-	/* DSI host generates video internally, bypassing the DPU. Any
-	 * visible change means the link reaches the panel. */
-	sheng_mdss_dsi_tpg_enable(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE);
 
 	/* Audits return 0 when every programmed register matches the
 	 * live-hardware reference table; otherwise

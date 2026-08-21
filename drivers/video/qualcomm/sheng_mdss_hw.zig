@@ -1,32 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0+
 //
-// Bare-metal MDSS/DISPCC/DSI/DPU register sequencing for SM8550, called
-// from the C UCLASS_VIDEO shim in sheng_mdss.c. Freestanding, no libc,
-// no allocator -- every function operates on caller-supplied MMIO bases.
+// MDSS/DISPCC/DSI/DPU register sequencing for SM8550, called from the
+// UCLASS_VIDEO driver in sheng_mdss.c.
 //
-// Register offsets/values are filled in per-block as each phase of the
-// bring-up (GDSC/DISPCC -> DSI PHY/host -> DPU pipeline) is ported from
-// the mainline Linux drm/msm driver and verified against the live device
-// over the exec.sh serial bridge. Until then, each stage is a stub that
-// returns -ENOSYS (-38) so the C shim can report "not yet implemented"
-// instead of silently pretending to succeed.
+// Freestanding: no libc, no allocator. Every function takes its MMIO
+// base from the caller. The only calls back into U-Boot are udelay(),
+// flush_dcache_range() and timer_get_us().
+//
+// See ARCHITECTURE.md for the bring-up order and the clock tree.
 
 const ENOSYS: c_int = -38;
 
-// Transcribed verbatim from sheng_tianma_init_sequence() in
-// drivers/gpu/drm/panel/panel-novatek-nt36532e.c (mainline sm8550 kernel
-// checkout, xiaomi,sheng-nt36532e / novatek,nt36532e panel). Sent to the
-// DSI0 host only -- qcom,sync-dual-dsi mirrors each write to DSI1 in
-// hardware. Every entry here is a short DCS write (1-byte command + N
-// data bytes); the PPS long-write and the 120Hz/144Hz branch are handled
-// separately by the caller (sheng_mdss_dsi_panel_init in task #4), since
-// they aren't static byte sequences (PPS is packed from DscConfig at
-// runtime, and the b2/b3 framerate registers depend on the selected mode).
+// nt36532e init sequence, from the panel driver's own table. Sent to
+// DSI0 only -- qcom,sync-dual-dsi mirrors each write to DSI1 in
+// hardware. Every entry is a short DCS write.
 //
-// This table stops right before "Enable DSC" (0x90 0x03); everything
-// from there on (DSC enable, PPS, 0x9d, framerate ctrl, exit-sleep,
-// 120ms delay, display-on) is sequenced explicitly in
-// sheng_mdss_dsi_panel_init once the DSI host is real.
+// Stops before "Enable DSC" (0x90 0x03). From there on -- DSC enable,
+// PPS, 0x9d, framerate, exit-sleep, display-on -- the sequence is not
+// static bytes, so dsiPanelInit() issues it explicitly.
 pub const DcsCmd = struct {
     cmd: u8,
     args: []const u8,
@@ -156,30 +147,22 @@ pub const nt36532e_dsc_144hz = DscConfig{};
 /// Full 128-byte DSC 1.1 Picture Parameter Set for our exact panel
 /// mode (bpc=8, bpp=8.0, slice_width=762, slice_height=16,
 /// slice_count=2, pic 1524x2032 per DSI half), computed offline in
-/// Python replicating drm_dsc_pps_payload_pack() +
-/// drm_dsc_compute_rc_parameters() + the standard DSC 1.1
-/// rc_parameters_pre_scr[bpp=8,bpc=8] table exactly -- see SPEC.md
-/// for the full derivation and every intermediate value. Sent as a
-/// MIPI_DSI_PICTURE_PARAMETER_SET (type 0x0A) long packet, not a
-/// generic DCS long write.
+/// Packed the same way drm_dsc_pps_payload_pack() and
+/// drm_dsc_compute_rc_parameters() do, against the DSC 1.1
+/// rc_parameters_pre_scr table for bpp=8 bpc=8.
+///
+/// Sent as a MIPI_DSI_PICTURE_PARAMETER_SET (type 0x0A) long packet,
+/// not a generic DCS long write.
 pub const nt36532e_pps_144hz = [128]u8{
-    // PPS8-9 CORRECTED (SPEC.md task #5 log): was 0x05, 0xf4 = pic_width
-    // 1524. drm_dsc_pps_payload_pack() puts pic_height at PPS6-7 and
-    // pic_width at PPS8-9, so this told the panel's DSC decoder the
-    // picture is 1524 wide == 2 slices of 762, while the DPU encoder --
-    // now cross-verified against live silicon -- encodes a 3048-wide
-    // picture as 4 slices of 762 (num_active_slice_per_enc = 2 in
-    // CMN_MAIN_CNF, two encoders). The panel is ONE 3048-wide display
-    // driven across both links, so its decoder must be told 3048.
+    // pic_height is PPS6-7, pic_width is PPS8-9. pic_width must be 3048:
+    // the panel is ONE 3048-wide display driven across both links, so its
+    // decoder has to be told the full width even though each encoder
+    // handles 2 slices of 762.
     //
-    // This is the panel-side half of the "two independently transcribed
-    // DSC parameter sets, never cross-verified against each other" gap
-    // this file has flagged for a long time; sheng_mdss_verify_pipeline()
-    // cannot catch it because the PPS is a transmitted blob, not a
-    // register. Every other PPS field already agrees with the corrected
-    // encoder config: bpc 8, line_buf_depth 9, block_pred 1,
-    // convert_rgb 1, bpp 8.0, pic_height 2032, slice_height 16,
-    // slice_width 762, chunk_size 762.
+    // The PPS is a transmitted blob, not a register, so
+    // sheng_mdss_verify_pipeline() cannot check it against the DPU-side
+    // encoder config. If the two disagree the panel receives a stream it
+    // cannot decode and shows black with every register reading correct.
     0x11, 0x00, 0x00, 0x89, 0x30, 0x80, 0x07, 0xf0, 0x0b, 0xe8, 0x00, 0x10, 0x02, 0xfa, 0x02, 0xfa,
     0x02, 0x00, 0x02, 0x7d, 0x00, 0x20, 0x01, 0xc6, 0x00, 0x0a, 0x00, 0x0c, 0x06, 0x67, 0x04, 0x82,
     0x18, 0x00, 0x10, 0xf0, 0x03, 0x0c, 0x20, 0x00, 0x06, 0x0b, 0x0b, 0x33, 0x0e, 0x1c, 0x2a, 0x38,
@@ -210,35 +193,22 @@ fn mmioClearBits32(base: usize, offset: usize, mask: u32) void {
     mmioWrite32(base, offset, val & ~mask);
 }
 
-// U-Boot's global udelay(), from <time.h> -- linked in from the rest of
-// the U-Boot binary, not defined here.
+// Linked in from the rest of the U-Boot binary.
 extern fn udelay(usec: c_ulong) callconv(.c) void;
 extern fn flush_dcache_range(start: usize, stop: usize) callconv(.c) void;
-/// U-Boot microsecond timer (include/time.h). Used to measure how long a
-/// command DMA actually takes -- see bbCmdTrace().
+/// Microsecond timer, used to time command DMA in bbCmdTrace().
 extern fn timer_get_us() callconv(.c) c_ulong;
 
 // ===========================================================================
 // ULTRA-DEBUG BLACKBOX
 // ===========================================================================
 //
-// Every diagnostic in this project has had to be smuggled out as a sheng.*
-// entry on the kernel command line, which CONFIG_SYS_CBSIZE caps at 512
-// bytes. That budget has shaped -- and repeatedly distorted -- the whole
-// investigation: variables had to be swapped out to make room, whole
-// register blocks were reduced to "first mismatching offset + count" with
-// the actual values never seen, and each boot answered roughly one
-// question.
+// An ASCII log in a fixed DRAM window, read back from Linux through
+// /dev/mem. The other channel -- sheng.* on the kernel command line --
+// is capped at 512 bytes by CONFIG_SYS_CBSIZE; this one holds ~512KB.
 //
-// This writes an ASCII log to a fixed DRAM window instead. Linux reads it
-// back through /dev/mem (verified: CONFIG_STRICT_DEVMEM is not set on this
-// kernel and a read of 0xa5000000 succeeds), so the size limit becomes
-// ~512KB rather than ~512 bytes.
-//
-// ASCII rather than a packed binary format on purpose: `dd | strings` is
-// enough to read it, with no decoder to keep in sync with the emitter --
-// a decoder that silently drifts out of sync is exactly how the RDBK_DATA0
-// misreading survived for so long.
+// ASCII on purpose: `dd | strings` reads it with no decoder to keep in
+// sync with the emitter.
 //
 // Layout at BB_BASE:
 //   +0  u32 magic 'SHGB'  -- written LAST, so a torn/partial log is
@@ -248,12 +218,9 @@ extern fn timer_get_us() callconv(.c) c_ulong;
 //   +12 u32 reserved
 //   +16 payload, NUL-padded ASCII
 //
-// 0xa5000000 sits above SHENG_MDSS_FB_ADDR (0xa3200000 + 24.8MB, ending
-// ~0xa4b10000) and well inside the 0xa3080000-0xccd00000 free System RAM
-// span from a live /proc/iomem. Linux will happily allocate over it later,
-// so the kernel DT also reserves it -- see the reserved-memory node added
-// in nixos/kernel/default.nix. The magic check makes a clobbered read
-// obvious either way.
+// 0xa5000000 clears the framebuffer (ends ~0xa4b10000) and sits inside
+// free System RAM. Linux would allocate over it, so the kernel DT
+// reserves it too; the magic check catches a clobber either way.
 const BB_BASE: usize = 0xa5000000;
 const BB_MAGIC: u32 = 0x53484742; // 'SHGB'
 const BB_HDR: usize = 16;
@@ -512,27 +479,18 @@ const GDSC_RETAIN_FF_ENABLE: u32 = 1 << 11;
 const GDSC_POWER_UP_COMPLETE: u32 = 1 << 16;
 const GDSC_POLL_TIMEOUT_US: u32 = 2000;
 
-// DISP_CC_MDSS_CORE_BCR, from disp_cc_sm8550_resets[DISP_CC_MDSS_CORE_BCR]
-// = { 0x8000 } in dispcc-sm8550.c (qcom_reset_map: only .reg set, so
-// .bit defaults to 0 -> mask = BIT(0)). Confirmed present and
-// read/write-accessible in the live device's own regmap at
-// af00000.clock-controller's offset 08000 before ever writing to it.
+// DISP_CC_MDSS_CORE_BCR. Only .reg is set in the kernel's reset map, so
+// the mask is BIT(0).
 //
-// msm_mdss_reset() in msm_mdss.c calls this via the generic
-// reset-controller framework (reset_control_assert() / msleep(20) /
-// reset_control_deassert()) as the FIRST thing msm_mdss_init() does --
-// before GDSC, before any clock is parsed or enabled. It's a plain
-// regmap write into DISPCC, which is already reachable pre-GDSC (the
-// AHB config path to DISPCC is on the always-on GCC_DISP_AHB_CLK), so
-// nothing about clock/power sequencing blocks doing this first. Never
-// attempted before -- see SPEC.md's "Next leads, not yet tried".
+// msm_mdss_init() pulses this first, before GDSC and before any clock is
+// parsed. It is a plain write into DISPCC, which is reachable pre-GDSC
+// because the AHB config path rides the always-on GCC_DISP_AHB_CLK, so
+// nothing in the power sequence blocks doing it this early.
 const MDSS_CORE_BCR_OFFSET: usize = 0x8000;
 const MDSS_CORE_BCR_MASK: u32 = 1 << 0;
 
-/// Assert then deassert DISP_CC_MDSS_CORE_BCR, mirroring msm_mdss_reset().
-/// Source holds the reset for msleep(20) ("tests indicate reset has to
-/// be held for some period of time... one frame in a typical system");
-/// U-Boot's udelay() is the closest equivalent to that busy-ish wait.
+/// Assert then deassert DISP_CC_MDSS_CORE_BCR. Held ~20ms -- the reset
+/// needs roughly one frame to take.
 export fn sheng_mdss_core_reset(dispcc_base: usize) callconv(.c) void {
     mmioSetBits32(dispcc_base, MDSS_CORE_BCR_OFFSET, MDSS_CORE_BCR_MASK);
     _ = mmioRead32(dispcc_base, MDSS_CORE_BCR_OFFSET); // ensure write completion, like regmap_read() does
@@ -580,54 +538,37 @@ export fn sheng_mdss_gdsc_enable(dispcc_base: usize) callconv(.c) c_int {
     return 0;
 }
 
-/// Mirror of gdsc_disable()'s GDSC_OFF path in gdsc.c: hand control
-/// back from hardware-trigger mode, assert SW_COLLAPSE, and wait for
-/// the logic to actually power down (~poll timeout, best-effort --
-/// unlike gdsc_poll_status(GDSC_ON) we don't have a documented "OFF"
-/// status bit offset handy, so this uses a fixed settle delay instead
-/// of polling). Used for a genuine cold-start power cycle before this
-/// driver's own setup runs, so the GDSC's logic gates initialize from
-/// true power-on defaults rather than whatever latent state ABL/XBL's
-/// own splash bring-up may have left behind -- never attempted before
-/// this pass (see SPEC.md task #5 log).
-/// SAFE SUBSET OF THE CONTROLLER COLD-START (SPEC.md task #5 log).
+/// gdsc_disable()'s GDSC_OFF path: hand control back from hardware
+/// trigger mode, assert SW_COLLAPSE, settle. Fixed delay rather than a
+/// poll -- there is no documented OFF status bit.
 ///
-/// b66 tried to call sheng_mdss_full_teardown() at probe and hung the
-/// board outright -- no backlight, no boot. That function is TERMINAL by
-/// construction: it ends with sheng_mdss_dispcc_dsi_clks_stop() and
-/// sheng_mdss_core_reset(), gating the very branches the rest of probe
-/// still needs, and sheng_mdss_dpu_stop() writes/polls DPU registers that
-/// cannot complete with only AHB-from-XO running. Safe at handoff because
-/// nothing runs after it; fatal in the middle of probe.
+/// Used for a real cold-start power cycle so the logic gates start from
+/// power-on defaults rather than whatever ABL left behind.
+/// Power both DSI PHYs down. The safe part of a controller cold-start
+/// this early in probe.
 ///
-/// This is the part of it that is genuinely safe this early: power the two
-/// DSI PHYs down and nothing else. PHY register access is already proven
-/// safe at this point in probe -- sheng_mdss_abl_state3() reads both PHYs
-/// from exactly here every boot. No DPU writes, no clock gating, no core
-/// reset (the existing cold-start pulses that a few lines later anyway).
+/// Do NOT call sheng_mdss_full_teardown() here instead. That is terminal
+/// by construction -- it gates the DISPCC branches the rest of probe
+/// needs and writes DPU registers that cannot complete with only
+/// AHB-from-XO running. It hangs the board outright: no backlight, no
+/// boot. Safe at handoff because nothing runs after it.
 ///
-/// The motivation is unchanged and still the best-evidenced lead we have:
-/// Linux's FIRST bring-up on top of a live controller fails a DCS read
-/// (ret=-61) and its SECOND, after a full disable, succeeds (0x9e). ABL
-/// hands us a live controller the same way.
+/// Why bother: bringing this hardware up on top of a live controller
+/// does not work, and starting from a real power-down does. ABL hands
+/// over a live controller.
 export fn sheng_mdss_dsi_phys_off(dsi0_phy_base: usize, dsi1_phy_base: usize) callconv(.c) void {
     dsiPhyDisable(dsi0_phy_base);
     dsiPhyDisable(dsi1_phy_base);
 }
 
-/// Did MDSS_GDSC ACTUALLY collapse? (SPEC.md task #5 log)
+/// Did MDSS_GDSC actually collapse?
 ///
-/// sheng_mdss_gdsc_disable() sets SW_COLLAPSE and waits 200us but never
-/// checks the result. A GDSC held up by another subsystem's vote simply
-/// stays on, and the entire "cold-start reset pass" this driver performs
-/// -- collapse the power domain, pulse the core reset -- would be a no-op,
-/// leaving every scrap of ABL's controller state intact underneath our
-/// bring-up. That is exactly the failure mode the Linux blank/unblank
-/// experiment points at, and it has never been verified once.
+/// gdsc_disable() asserts SW_COLLAPSE and settles but never checks. A
+/// GDSC held up by another subsystem's vote just stays on, which makes
+/// the whole cold-start pass a no-op and leaves ABL's controller state
+/// intact underneath the bring-up.
 ///
-/// Bit 31 of the GDSCR is PWR_ON (qcom gdsc.c's own PWR_ON_MASK, read by
-/// gdsc_is_enabled()). Sampled at three points, low byte of the status
-/// nibble each:
+/// Bit 31 of GDSCR is PWR_ON. Sampled at three points:
 ///   47:32  GDSCR before the collapse
 ///   31:16  GDSCR after the collapse (PWR_ON here == it never collapsed)
 ///   15:0   GDSCR after the subsequent re-enable
@@ -680,41 +621,21 @@ const LUCID_EVO_PLL_CAL_L_VAL_SHIFT: u5 = 16;
 const LUCID_OLE_PLL_RINGOSC_CAL_L_VAL_SHIFT: u5 = 24;
 const PLL_LOCK_POLL_TIMEOUT_US: u32 = 1500;
 
-/// ROOT CAUSE, FOUND b95 -- this ran at the WRONG RATE for the entire
-/// life of this driver.
+/// Bring up disp_cc_pll0 at its OPERATING rate, L=0x50 alpha=0x5000:
 ///
-/// `disp_cc_pll0_config` in dispcc-sm8550.c (l=0xd, alpha=0x6492) is the
-/// kernel's INITIAL config, applied once by
-/// clk_lucid_evo_pll_configure() at probe. It is NOT the operating rate.
-/// The kernel then reprograms L/ALPHA via clk_alpha_pll_set_rate() when
-/// mdp_clk_src actually requests its frequency. We copied the initial
-/// config and stopped, so the PLL stayed parked at its boot rate.
+///     19.2MHz * (80 + 0x5000/0x10000) = 1542 MHz, /3 = 514 MHz mdp_clk
 ///
-/// The old comment here claimed those values gave "~1,000,000,000 Hz-ish".
-/// That arithmetic is simply wrong, and being wrong is what hid this:
-///     19.2MHz * (13 + 0x6492/0x10000) = 19.2 * 13.3929 = 257.1 MHz
-/// MDP_CLK_DIV_REG_VAL below is 5, i.e. hid_div 3, matching the kernel's
-/// F(514000000, P_DISP_CC_PLL0_OUT_MAIN, 3, 0, 0). A 257.1MHz parent
-/// through /3 gives an 85.7MHz mdp core clock instead of 514MHz --
-/// SIX TIMES too slow.
+/// Do NOT use disp_cc_pll0_config from dispcc-sm8550.c (l=0xd,
+/// alpha=0x6492). That is the kernel's INITIAL config, applied once at
+/// probe; it reprograms L/ALPHA later when mdp_clk_src requests its
+/// frequency. Those values give a 257MHz parent and an 85.7MHz mdp_clk,
+/// six times too slow.
 ///
-/// MEASURED on live rendering Linux (devmem, dispcc_base 0x0af00000):
-///     0x010 L_VAL     = 0x44440050   (ours was 0x4444000d)
-///     0x014 ALPHA_VAL = 0x00005000   (ours was 0x00006492)
-/// Every other PLL0 register -- CONFIG_CTL/U/U1, TEST_CTL/U/U1/U2,
-/// USER_CTL/U -- already matched byte-for-byte, and the 0x4444 in the
-/// upper half of L_VAL is TRION_PLL_CAL_VAL shifted, which Linux keeps
-/// identical. Only the rate differed.
-///
-///     L=0x50=80, alpha=0x5000 -> 0x5000/0x10000 = 0.3125
-///     19.2MHz * 80.3125 = 1542.0 MHz, and 1542/3 = 514 MHz exactly.
-///
-/// This is what starved the link. The DPU could not composite fast
-/// enough to feed the DSI, so the lane FIFOs ran dry -- the long-standing
-/// unexplained FIFO_STATUS 0x11111210 (all four DLN*_HS_FIFO_EMPTY set)
-/// against live Linux's 0x00001210 -- while every configuration register
-/// still read back correct and the INTF kept counting frames, because
-/// INTF timing comes off the DSI PHY PLL and is independent of mdp_clk.
+/// A slow mdp_clk starves the link: the DPU cannot composite fast enough
+/// to feed the DSI and the lane FIFOs run dry -- FIFO_STATUS 0x11111210
+/// instead of 0x00001210 -- while every configuration register still
+/// reads back correct and the INTF keeps counting frames, because INTF
+/// timing comes off the DSI PHY PLL and does not depend on mdp_clk.
 fn dispCcPll0Enable(dispcc_base: usize) c_int {
     mmioWrite32(dispcc_base, PLL_L_VAL_OFF, 0x50 |
         (TRION_PLL_CAL_VAL << LUCID_EVO_PLL_CAL_L_VAL_SHIFT) |
@@ -837,28 +758,15 @@ const MDP_CLK_SRC_SEL_PLL0: u32 = 1;
 // div_reg_val = 2*3-1 = 5.
 const MDP_CLK_DIV_REG_VAL: u32 = 5; // F(514000000, P_DISP_CC_PLL0_OUT_MAIN, 3, 0, 0) -> 2*3-1
 
-// disp_cc_mdss_mdp_lut_clk (halt_reg=enable_reg=0x8018, bit0,
-// BRANCH_HALT_VOTED): a plain branch off disp_cc_mdss_mdp_clk_src, the
-// SAME RCG we already configure for MDP_CLK above -- no separate RCG
-// programming needed, just another CBCR enable.
+// The DPU's own DT node lists six clocks: bus, nrt_bus, iface, lut,
+// core, vsync. dpu_runtime_resume() enables all of them before reading
+// the DPU HW_VERSION register. iface (AHB) and core (MDP) are not
+// enough for the DPU sub-block even though the wrapper works without
+// the rest.
 //
-// disp_cc_mdss_vsync_clk (halt_reg=enable_reg=0x8024, bit0,
-// BRANCH_HALT): sourced from its own disp_cc_mdss_vsync_clk_src RCG
-// (cmd_rcgr=0x80f0, parent_map_0: P_BI_TCXO=0, mnd_width=0 i.e.
-// HID-only like AHB), needs its own rcg2ConfigureHidOnly() call. Target
-// 19.2MHz (XO passthrough, div=1) confirmed against the live device's
-// own clk_summary -- see SPEC.md.
-//
-// mdss_mdp@ae01000's OWN devicetree node (distinct from the mdss
-// wrapper's) lists clock-names = "bus","nrt_bus","iface","lut","core",
-// "vsync" -- six clocks. dpu_runtime_resume() in dpu_kms.c does
-// clk_bulk_prepare_enable() over ALL of them before dpu_kms_hw_init()
-// ever reads the DPU HW_VERSION register. We had only ever enabled
-// "iface" (AHB) and "core" (MDP) -- "lut" and "vsync" were never
-// touched at all. The wrapper device doesn't need these (which is why
-// DISPCC/DSI worked fine without them), but the DPU sub-block, a
-// separate platform device with its own additional clock requirements,
-// might. Never attempted before this pass.
+// mdp_lut branches off the same RCG as MDP_CLK, so it needs only a CBCR
+// enable. vsync has its own HID-only RCG at 0x80f0 and runs at 19.2MHz,
+// XO passthrough.
 const MDP_LUT_CLK_CBCR: usize = 0x8018;
 
 const VSYNC_CLK_SRC_CMD_RCGR: usize = 0x80f0;
@@ -866,80 +774,45 @@ const VSYNC_CLK_CBCR: usize = 0x8024;
 const VSYNC_CLK_SRC_SEL_XO: u32 = 0;
 const VSYNC_CLK_DIV_REG_VAL: u32 = 1; // F(19200000, P_BI_TCXO, 1, 0, 0) -> 2*1-1
 
-// REAL MISSING PIECE (SPEC.md task #5 log): live clk_summary from a
-// WORKING Linux boot (msm_dpu bound, fb0 registered) showed these 8
-// clocks -- byte0/1_clk, byte0/1_intf_clk, pclk0/1_clk, esc0/1_clk --
-// all genuinely enabled and feeding ae94000.dsi/ae96000.dsi. This
-// driver never touched any of them. pclk0/1 (~198MHz from the live
-// trace) is almost certainly what actually drives INTF_FRAME_COUNT/
-// LINE_COUNT, not MDP_CLK -- explaining why every MDP_CLK/MMCX/BCM
-// experiment left frame counters frozen at exactly 0 regardless of
-// clock rate or voltage: the wrong clock domain was under
-// investigation the whole time. Source select values from
-// disp_cc_parent_map_2 (dispcc-sm8550.c): DSI0_PHY_PLL_OUT_DSICLK=1,
-// DSI0_PHY_PLL_OUT_BYTECLK=2, DSI1_PHY_PLL_OUT_DSICLK=3,
-// DSI1_PHY_PLL_OUT_BYTECLK=4. Must run AFTER both DSI PHY PLLs are
-// locked (sheng_mdss_dsi_phy_init), unlike the PLL0-sourced clocks
-// above which don't depend on DSI PHY at all.
+// The eight DSI link clocks: byte0/1, byte0/1_intf, pclk0/1, esc0/1.
+// pclk drives INTF_FRAME_COUNT and INTF_LINE_COUNT, not MDP_CLK -- with
+// these off the frame counters sit at 0 no matter what MDP_CLK does.
+//
+// Source selects from disp_cc_parent_map_2: DSI0 DSICLK=1, DSI0
+// BYTECLK=2, DSI1 DSICLK=3, DSI1 BYTECLK=4.
+//
+// Must run AFTER both PHY PLLs lock, unlike the PLL0-sourced clocks
+// above which do not depend on the DSI PHY at all.
 const PCLK0_CLK_SRC_CMD_RCGR: usize = 0x80a8;
 const PCLK0_CLK_CBCR: usize = 0x8004;
 const PCLK0_SRC_SEL_DSI0_DSICLK: u32 = 1;
 const PCLK1_CLK_SRC_CMD_RCGR: usize = 0x80c0;
 const PCLK1_CLK_CBCR: usize = 0x8008;
-/// REAL BUG FOUND, MEASURED OFF LIVE SILICON (SPEC.md task #5 log).
+/// DSI1's pixel and byte clocks parent to DSI **0**'s PHY PLL, not its
+/// own. Both halves of a stitched panel must be clocked from ONE source
+/// -- that is what qcom,sync-dual-dsi and BITCLK_SEL=1 on the slave PHY
+/// exist for.
 ///
-/// These were set to DSI1's OWN PHY PLL outputs (DSI1_PHY_PLL_OUT_DSICLK=3
-/// / _BYTECLK=4). That is wrong for a bonded link, and both the devicetree
-/// and the hardware say so.
+/// The two PHY PLLs are independent oscillators. Configured identically
+/// they run at the same nominal rate with arbitrary phase and their own
+/// drift, so feeding DSI1's packetiser from the second one breaks the
+/// lock-step the DDIC depends on.
 ///
-/// sm8550-xiaomi-sheng.dts, &mdss_dsi1:
-///     qcom,dual-dsi-mode;
-///     qcom,sync-dual-dsi;
-///     assigned-clock-parents = <&mdss_dsi0_phy 0>, <&mdss_dsi0_phy 1>;
-/// i.e. DSI1's byte and pixel clocks are parented to DSI **0**'s PHY.
-/// (`qcom,master-dsi` sits on &mdss_dsi0, confirming DSI0 is master.)
-///
-/// Read back off this device's DISPCC while Linux drove the panel:
-///     pclk0 CFG=0x00000101 src_sel=1      byte0 CFG=0x00000201 src_sel=2
-///     pclk1 CFG=0x00000101 src_sel=1      byte1 CFG=0x00000201 src_sel=2
-/// All four source from DSI0's PHY PLL. Ours used 3 and 4 for the DSI1
-/// pair.
-///
-/// Why this is a real fault and not cosmetic: the two PHY PLLs are
-/// independent oscillators. Configured identically they run at the same
-/// nominal rate, but with arbitrary phase and independent drift. A
-/// stitched dual-DSI panel requires both halves clocked from ONE source --
-/// that is the entire purpose of qcom,sync-dual-dsi and of BITCLK_SEL=1 on
-/// the slave PHY. Feeding DSI1's packetiser from a second, free-running
-/// PLL breaks the lock-step the DDIC depends on.
-///
-/// This escaped every audit because DISPCC has no verification table --
-/// the same self-selected-sample blind spot that previously hid
-/// CTL_FETCH_PIPE_ACTIVE, DSC_CLK_CTRL, the MDSS UBWC block and the
-/// unconfigured slave PLL. See sheng_mdss_dispcc_audit() below.
+/// Live reference, all four sourcing DSI0:
+///     pclk0/pclk1 CFG=0x00000101 src_sel=1
+///     byte0/byte1 CFG=0x00000201 src_sel=2
 const PCLK1_SRC_SEL_DSI1_DSICLK: u32 = 1; // DSI0_PHY_PLL_OUT_DSICLK -- master's PLL
 const BYTE0_CLK_SRC_CMD_RCGR: usize = 0x8108;
 const BYTE0_CLK_CBCR: usize = 0x8028;
 const BYTE0_INTF_CLK_CBCR: usize = 0x802c;
-// REAL GAP (SPEC.md task #5 log): the byte-interface DIVIDERS.
+// Byte-interface dividers, the parents of byte{0,1}_intf_clk. The
+// kernel runs byte_intf at byte_clk / 2. clk_regmap_div encodes
+// (divisor - 1), so /2 is 1.
 //
-// dispcc-sm8550.c declares disp_cc_mdss_byte0_div_clk_src at .reg = 0x8120
-// and byte1 at 0x813c -- clk_regmap_div, shift 0, width 4. These are the
-// PARENTS of disp_cc_mdss_byte{0,1}_intf_clk, the branches this driver
-// already enables at 0x802c / 0x8034.
-//
-// dsi_host.c sets `msm_host->byte_intf_clk_rate = msm_host->byte_clk_rate
-// / 2` and calls clk_set_rate() on byte_intf_clk, which lands on these
-// divider registers. clk_regmap_div encodes (divisor - 1), so /2 == 1.
-//
-// This driver enables the byte_intf BRANCHES but never programs their
-// DIVIDERS, so they keep whatever ABL left -- most likely 0, i.e. divide
-// by 1, running the DSI byte interface at twice its intended rate.
-//
-// It is invisible to every audit we have: DISPCC had no verify table until
-// today, and even that only covers the four RCG CFG registers, not these
-// standalone divider registers. Same shape as every other real find --
-// state that lives outside the offsets anyone thought to compare.
+// Enabling the branches without programming these leaves whatever ABL
+// left -- most likely 0, running the byte interface at twice its
+// intended rate. Standalone registers, so no RCG CFG audit covers
+// them.
 const BYTE0_DIV_CLK_SRC: usize = 0x8120;
 const BYTE1_DIV_CLK_SRC: usize = 0x813c;
 const BYTE_DIV_WIDTH_MASK: u32 = 0xf; // width 4, shift 0
@@ -1011,26 +884,14 @@ export fn sheng_mdss_dispcc_dsi_clks_init(dispcc_base: usize) callconv(.c) c_int
     return clkBranchEnable(dispcc_base, ESC1_CLK_CBCR);
 }
 
-// REAL GAP FOUND (SPEC.md task #5 log): sm8550.dtsi's mdss node
-// (display-subsystem@ae00000, the TOP-LEVEL MDSS wrapper block --
-// parent of both the DPU at ae01000 and the DSI hosts at ae94000/
-// ae96000, never touched anywhere in this driver before) declares
-// `resets = <&dispcc DISP_CC_MDSS_CORE_BCR>;`. msm_mdss_reset(),
-// called as the literal first thing in msm_mdss_init() -- before the
-// mdss mmio is even ioremapped, before any clock is enabled, before
-// DPU or DSI is touched at all -- asserts this reset, holds it 20ms
-// ("tests indicate reset has to be held for some period of time...
-// one frame in a typical system", its own comment), then deasserts.
-// DISP_CC_MDSS_CORE_BCR resolves (drivers/clk/qcom/dispcc-sm8550.c's
-// disp_cc_sm8550_resets table) to a single bit0 read-modify-write at
-// dispcc_base+0x8000 (Qualcomm's standard BCR/BLK_ARES convention,
-// confirmed via drivers/clk/qcom/reset.c's generic reset op). This
-// driver has never asserted/deasserted this line -- DSI_RESET
-// (offset 0x114) only resets each DSI host's OWN local state, not
-// the shared MDSS-wide block this reset line covers. Component
-// binding order in the real driver guarantees this runs before the
-// very first DSI command in every real boot; replicate that here,
-// first thing, before any DISPCC clock is even configured.
+// The MDSS wrapper node declares resets = <&dispcc
+// DISP_CC_MDSS_CORE_BCR>, a bit0 read-modify-write at dispcc+0x8000.
+// msm_mdss_init() asserts it first thing, holds ~20ms, deasserts --
+// before the mdss mmio is ioremapped, before any clock is enabled.
+//
+// This covers the shared MDSS-wide block. Each host's own DSI_RESET
+// (0x114) only resets that host's local state, so it is not a
+// substitute.
 const DISP_CC_MDSS_CORE_BCR: usize = 0x8000;
 
 fn mdssCoreBcrReset(dispcc_base: usize) void {
@@ -1043,47 +904,33 @@ fn mdssCoreBcrReset(dispcc_base: usize) void {
     mmioWrite32(dispcc_base, DISP_CC_MDSS_CORE_BCR, reg);
 }
 
-/// AHB BRANCH ONLY -- no PLL0, no MDP/LUT/VSYNC, and critically NO
-/// mdssCoreBcrReset() (SPEC.md task #5 log).
+/// AHB branch only: no PLL0, no MDP/LUT/VSYNC, and NO core reset.
 ///
-/// Exists solely so sheng_mdss_abl_state*() can read the MDSS register
-/// space safely before this driver tears ABL's configuration down. Those
-/// reads need MDSS_GDSC powered and the DISPCC AHB config clock running;
-/// at the top of probe() neither is guaranteed, the AHB slave never acks,
-/// and the CPU wedges with no backlight and no boot (measured -- this is
-/// exactly how the first attempt at the ABL probe killed the board).
+/// Exists so the abl_state*() reads can touch MDSS registers safely
+/// before this driver tears ABL's configuration down. Those reads need
+/// MDSS_GDSC powered and the AHB config clock running; without both the
+/// AHB slave never acks and the CPU wedges -- no backlight, no boot.
 ///
-/// AHB_CLK_SRC parents from XO, not PLL0, so this needs none of the PLL
-/// bring-up. Nothing here resets or reconfigures anything ABL left behind,
-/// so the state being sampled afterwards is genuinely ABL's.
+/// AHB_CLK_SRC parents from XO, so this needs no PLL bring-up, and it
+/// reconfigures nothing, so what gets sampled afterwards is genuinely
+/// ABL's state.
 export fn sheng_mdss_dispcc_ahb_only(dispcc_base: usize) callconv(.c) c_int {
     const ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
     if (ret != 0) return ret;
     return clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
 }
 
-/// ABL HANDOFF STATE (SPEC.md task #5 log).
+/// Sample ABL's handoff state.
 ///
-/// board/qualcomm/sheng.env's own notes refer to the `cont_splash` region,
-/// i.e. ABL uses CONTINUOUS SPLASH: it does not draw and stop, it hands
-/// over with DPU, DSI, PHY and panel all actively running. For the first
-/// few milliseconds of probe() this exact silicon is correctly driving this
-/// exact panel -- and our first action destroys it (reset asserted,
-/// avdd/avee dropped, GDSC collapsed, MDSS core BCR pulsed).
+/// ABL uses continuous splash: it hands over with DPU, DSI, PHY and
+/// panel all running. For the first few milliseconds of probe this
+/// silicon is correctly driving this panel, and the cold start destroys
+/// it. That state is a reference the Linux register dumps cannot give,
+/// because Linux's numbers come after its own teardown and re-init with
+/// its own clock tree, regulator votes and SMMU context.
 ///
-/// We have never looked at that state. It matters because every "matches
-/// live" result in this project is against LINUX's registers, captured
-/// after Linux's own full teardown and re-init with its own clock tree,
-/// regulator votes and SMMU context. ABL's state is the one that works
-/// WITHOUT any of that, at the exact point in boot where we run. With
-/// 180+ registers now matching Linux across DSI0/DSI1/DPU/MDSS/PHY-CMN/
-/// PHY-PLL and the panel still black, a different reference is worth more
-/// than another Linux diff.
-///
-/// DSI and PHY only -- deliberately no DPU access on this first pass, so
-/// the risk surface stays as small as possible while still answering the
-/// question. VIDEO_MODE_ENGINE_BUSY (STATUS0 bit3) plus a locked PLL is
-/// enough to say whether ABL is streaming.
+/// DSI and PHY only, no DPU access -- VIDEO_MODE_ENGINE_BUSY (STATUS0
+/// bit 3) plus a locked PLL is enough to say whether ABL is streaming.
 ///
 /// abl1 = DSI0 CTRL << 32 | DSI0 STATUS0
 export fn sheng_mdss_abl_state1(dsi0_base: usize) callconv(.c) i64 {
@@ -1135,23 +982,16 @@ export fn sheng_mdss_dispcc_init(dispcc_base: usize) callconv(.c) c_int {
     return 0;
 }
 
-// --- DSI PHY (dsi_phy_7nm.c, DSI_PHY_7NM_QUIRK_V5_2 path -- SM8550
-// uses the "7nm" driver code despite being DT-labelled "4nm", per
-// dsi_phy_4nm_8550_cfgs in that file). Register offsets from
-// drivers/gpu/drm/msm/registers/display/dsi_phy_7nm.xml (the
-// generated dsi_phy_7nm.xml.h wasn't present in this kernel checkout,
-// so offsets are taken directly from the rnndb source it's generated
-// from). All CMN_* offsets are relative to dsi_phy_base; PLL_* offsets
-// are relative to dsi_phy_base + PLL_BASE_OFFSET (the PLL sub-block
-// starts at CMN's end); LN_* are relative to dsi_phy_base +
-// LANE_BASE_OFFSET, array-strided per lane.
-// Real offsets from sm8550.dtsi's mdss_dsi0_phy node (three separate
-// `reg` entries: dsi_phy@+0x0/0x200, dsi_phy_lane@+0x200/0x280,
-// dsi_pll@+0x500/0x400) -- NOT contiguous sub-regions of one window
-// the way an earlier guess assumed. That earlier guess (PLL at +0x200,
-// lane at +0x400) put every PLL register write into what's actually
-// the lane sub-block, which is exactly why the PLL never locked on
-// hardware: none of its real registers were ever touched.
+// --- DSI PHY. SM8550 uses the "7nm" driver code despite the DT label
+// saying 4nm, on the V5_2 quirk path.
+//
+// The PHY is THREE separate reg entries, not sub-regions of one window:
+//     phy   +0x000 len 0x200   CMN_*
+//     lane  +0x200 len 0x280   LN_*, strided per lane
+//     pll   +0x500 len 0x400   PLL_*
+// Guessing contiguous sub-regions puts every PLL write into the lane
+// block, and the PLL never locks because none of its registers are ever
+// touched.
 const LANE_BASE_OFFSET: usize = 0x200;
 const PLL_BASE_OFFSET: usize = 0x500;
 const LANE_STRIDE: usize = 0x80;
@@ -1227,11 +1067,8 @@ const PLL_FREQ_DETECT_SETTINGS_ONE: usize = 0x078;
 const PLL_PFILT: usize = 0x090;
 const PLL_IFILT: usize = 0x094;
 const PLL_OUTDIV: usize = 0x0a8;
-/// FOUND BY PHY WRITE TRACE (SPEC.md task #5 log).
-///
-/// Distinct from PLL_OUTDIV (0x0a8) above, which this driver already
-/// writes. This is REG_DSI_7nm_PHY_PLL_PLL_OUTDIV_RATE -- the PLL's
-/// OUTPUT DIVIDER -- read-modify-written by dsi_7nm_pll_restore_state():
+/// The PLL's OUTPUT DIVIDER, distinct from PLL_OUTDIV (0x0a8) above.
+/// dsi_7nm_pll_restore_state() read-modify-writes it:
 ///
 ///     val = readl(pll_base + REG_DSI_7nm_PHY_PLL_PLL_OUTDIV_RATE);
 ///     val &= ~0x3;
@@ -1515,498 +1352,27 @@ export fn sheng_mdss_dsi_reset_both_phys(dsi0_base: usize, dsi1_base: usize) cal
     mmioWrite32(dsi1_base, DSI_PHY_RESET, 0);
 }
 
-/// VERBATIM KERNEL BRING-UP REPLAY (SPEC.md task #5 log).
-///
-/// The endpoint of the trace methodology. Every configurable register in
-/// the display path is now verified identical to working silicon by
-/// exhaustive sweep -- PHY CMN 124/124, PHY lane+PLL 412 (only dynamic
-/// calibration status differs), DSI host 176/176 (only read-only
-/// CLK_STATUS differs), plus full write-trace diffs of DPU, DISPCC, VBIF
-/// and MDSS. Every clock is confirmed active including AON_ESCCLK. Every
-/// command byte is confirmed correct in DRAM. And Linux renders on this
-/// same hardware moments later.
-///
-/// So the difference is not any register VALUE. This removes the last
-/// degree of freedom: instead of reproducing the kernel's end state, replay
-/// its exact WRITE SEQUENCE -- every (target, offset, value) it issues to
-/// both PHYs and both DSI hosts, in order, including transient values that
-/// are later overwritten and repeated writes we would otherwise normalise
-/// away. Captured from this device while it was rendering, truncated at
-/// the first DCS command.
-///
-/// Waits are re-inserted where the kernel blocks: REFGEN ready after
-/// GLBL_DIGTOP_SPARE10, PLL lock after CMN_PLL_CNTRL=1, and the 20ms
-/// DSI_RESET hold. A blind replay without those would race the hardware.
-///
-/// t: 0=PHY0, 1=PHY1, 2=DSI0 host, 3=DSI1 host.
-const ReplayEntry = struct { t: u8, off: usize, val: u32 };
-const kernel_bringup_replay = [_]ReplayEntry{
-    .{ .t = 0, .off = 0x024, .val = 0x00000020 },
-    .{ .t = 0, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x528, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x024, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x024, .val = 0x00000020 },
-    .{ .t = 0, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x528, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x024, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x024, .val = 0x00000020 },
-    .{ .t = 0, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x528, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x024, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x024, .val = 0x00000020 },
-    .{ .t = 1, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 1, .off = 0x528, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x024, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x024, .val = 0x00000020 },
-    .{ .t = 1, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 1, .off = 0x528, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x024, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x024, .val = 0x00000020 },
-    .{ .t = 1, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 1, .off = 0x528, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x024, .val = 0x00000000 },
-    .{ .t = 2, .off = 0x128, .val = 0x00000001 },
-    .{ .t = 2, .off = 0x128, .val = 0x00000000 },
-    .{ .t = 3, .off = 0x128, .val = 0x00000001 },
-    .{ .t = 3, .off = 0x128, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x1ac, .val = 0x00000001 },
-    .{ .t = 0, .off = 0x024, .val = 0x00000060 },
-    .{ .t = 0, .off = 0x03c, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x01c, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x114, .val = 0x00000004 },
-    .{ .t = 0, .off = 0x034, .val = 0x00000021 },
-    .{ .t = 0, .off = 0x038, .val = 0x00000084 },
-    .{ .t = 0, .off = 0x020, .val = 0x00000044 },
-    .{ .t = 0, .off = 0x110, .val = 0x00000019 },
-    .{ .t = 0, .off = 0x030, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x10c, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x0ec, .val = 0x00000088 },
-    .{ .t = 0, .off = 0x104, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x0f4, .val = 0x0000003c },
-    .{ .t = 0, .off = 0x0f8, .val = 0x00000038 },
-    .{ .t = 0, .off = 0x100, .val = 0x00000055 },
-    .{ .t = 0, .off = 0x024, .val = 0x0000007f },
-    .{ .t = 0, .off = 0x0a0, .val = 0x0000001f },
-    .{ .t = 0, .off = 0x02c, .val = 0x00000040 },
-    .{ .t = 0, .off = 0x014, .val = 0x00000010 },
-    .{ .t = 0, .off = 0x0b4, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x0b8, .val = 0x00000027 },
-    .{ .t = 0, .off = 0x0bc, .val = 0x0000000a },
-    .{ .t = 0, .off = 0x0c0, .val = 0x0000000c },
-    .{ .t = 0, .off = 0x0c4, .val = 0x00000027 },
-    .{ .t = 0, .off = 0x0c8, .val = 0x00000025 },
-    .{ .t = 0, .off = 0x0cc, .val = 0x0000000a },
-    .{ .t = 0, .off = 0x0d0, .val = 0x0000000b },
-    .{ .t = 0, .off = 0x0d4, .val = 0x00000007 },
-    .{ .t = 0, .off = 0x0d8, .val = 0x00000002 },
-    .{ .t = 0, .off = 0x0dc, .val = 0x00000004 },
-    .{ .t = 0, .off = 0x0e0, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x0e4, .val = 0x00000023 },
-    .{ .t = 0, .off = 0x0e8, .val = 0x0000001a },
-    .{ .t = 0, .off = 0x214, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x210, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x294, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x290, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x314, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x310, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x394, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x390, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x414, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x410, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x214, .val = 0x00000003 },
-    .{ .t = 0, .off = 0x200, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x204, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x208, .val = 0x0000000a },
-    .{ .t = 0, .off = 0x218, .val = 0x00000040 },
-    .{ .t = 0, .off = 0x280, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x284, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x288, .val = 0x0000000a },
-    .{ .t = 0, .off = 0x298, .val = 0x00000040 },
-    .{ .t = 0, .off = 0x300, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x304, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x308, .val = 0x0000000a },
-    .{ .t = 0, .off = 0x318, .val = 0x00000040 },
-    .{ .t = 0, .off = 0x380, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x384, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x388, .val = 0x0000000a },
-    .{ .t = 0, .off = 0x398, .val = 0x00000046 },
-    .{ .t = 0, .off = 0x400, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x404, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x408, .val = 0x0000008a },
-    .{ .t = 0, .off = 0x418, .val = 0x00000041 },
-    .{ .t = 0, .off = 0x654, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x010, .val = 0x000000f1 },
-    .{ .t = 0, .off = 0x014, .val = 0x00000010 },
-    .{ .t = 0, .off = 0x024, .val = 0x0000007f },
-    .{ .t = 0, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x5bc, .val = 0x00000012 },
-    .{ .t = 0, .off = 0x5e0, .val = 0x0000000f },
-    .{ .t = 0, .off = 0x5e4, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x5e8, .val = 0x00000080 },
-    .{ .t = 0, .off = 0x5ec, .val = 0x00000002 },
-    .{ .t = 0, .off = 0x658, .val = 0x00000040 },
-    .{ .t = 0, .off = 0x694, .val = 0x00000006 },
-    .{ .t = 0, .off = 0x750, .val = 0x00000010 },
-    .{ .t = 0, .off = 0x748, .val = 0x000000a0 },
-    .{ .t = 0, .off = 0x758, .val = 0x00000001 },
-    .{ .t = 0, .off = 0x740, .val = 0x00000008 },
-    .{ .t = 0, .off = 0x518, .val = 0x00000001 },
-    .{ .t = 0, .off = 0x504, .val = 0x00000003 },
-    .{ .t = 0, .off = 0x510, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x520, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x524, .val = 0x0000004e },
-    .{ .t = 0, .off = 0x544, .val = 0x00000040 },
-    .{ .t = 0, .off = 0x568, .val = 0x000000ba },
-    .{ .t = 0, .off = 0x578, .val = 0x0000000c },
-    .{ .t = 0, .off = 0x5a8, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x5b8, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x5c8, .val = 0x00000008 },
-    .{ .t = 0, .off = 0x660, .val = 0x0000000a },
-    .{ .t = 0, .off = 0x668, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x670, .val = 0x00000084 },
-    .{ .t = 0, .off = 0x670, .val = 0x00000082 },
-    .{ .t = 0, .off = 0x678, .val = 0x0000004c },
-    .{ .t = 0, .off = 0x690, .val = 0x00000080 },
-    .{ .t = 0, .off = 0x590, .val = 0x00000029 },
-    .{ .t = 0, .off = 0x590, .val = 0x0000002f },
-    .{ .t = 0, .off = 0x594, .val = 0x0000002a },
-    .{ .t = 0, .off = 0x594, .val = 0x0000003f },
-    .{ .t = 0, .off = 0x760, .val = 0x00000022 },
-    .{ .t = 1, .off = 0x760, .val = 0x00000022 },
-    .{ .t = 0, .off = 0x528, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x024, .val = 0x0000005f },
-    .{ .t = 1, .off = 0x1ac, .val = 0x00000001 },
-    .{ .t = 1, .off = 0x024, .val = 0x00000060 },
-    .{ .t = 1, .off = 0x03c, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x01c, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x114, .val = 0x00000004 },
-    .{ .t = 1, .off = 0x034, .val = 0x00000021 },
-    .{ .t = 1, .off = 0x038, .val = 0x00000084 },
-    .{ .t = 1, .off = 0x020, .val = 0x00000044 },
-    .{ .t = 1, .off = 0x110, .val = 0x00000019 },
-    .{ .t = 1, .off = 0x030, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x10c, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x0ec, .val = 0x00000088 },
-    .{ .t = 1, .off = 0x104, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x0f4, .val = 0x0000003c },
-    .{ .t = 1, .off = 0x0f8, .val = 0x00000038 },
-    .{ .t = 1, .off = 0x100, .val = 0x00000055 },
-    .{ .t = 1, .off = 0x024, .val = 0x0000007f },
-    .{ .t = 1, .off = 0x0a0, .val = 0x0000001f },
-    .{ .t = 1, .off = 0x02c, .val = 0x00000040 },
-    .{ .t = 1, .off = 0x014, .val = 0x00000014 },
-    .{ .t = 1, .off = 0x0b4, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x0b8, .val = 0x00000027 },
-    .{ .t = 1, .off = 0x0bc, .val = 0x0000000a },
-    .{ .t = 1, .off = 0x0c0, .val = 0x0000000c },
-    .{ .t = 1, .off = 0x0c4, .val = 0x00000027 },
-    .{ .t = 1, .off = 0x0c8, .val = 0x00000025 },
-    .{ .t = 1, .off = 0x0cc, .val = 0x0000000a },
-    .{ .t = 1, .off = 0x0d0, .val = 0x0000000b },
-    .{ .t = 1, .off = 0x0d4, .val = 0x00000007 },
-    .{ .t = 1, .off = 0x0d8, .val = 0x00000002 },
-    .{ .t = 1, .off = 0x0dc, .val = 0x00000004 },
-    .{ .t = 1, .off = 0x0e0, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x0e4, .val = 0x00000023 },
-    .{ .t = 1, .off = 0x0e8, .val = 0x0000001a },
-    .{ .t = 1, .off = 0x214, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x210, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x294, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x290, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x314, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x310, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x394, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x390, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x414, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x410, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x214, .val = 0x00000003 },
-    .{ .t = 1, .off = 0x200, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x204, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x208, .val = 0x0000000a },
-    .{ .t = 1, .off = 0x218, .val = 0x00000040 },
-    .{ .t = 1, .off = 0x280, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x284, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x288, .val = 0x0000000a },
-    .{ .t = 1, .off = 0x298, .val = 0x00000040 },
-    .{ .t = 1, .off = 0x300, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x304, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x308, .val = 0x0000000a },
-    .{ .t = 1, .off = 0x318, .val = 0x00000040 },
-    .{ .t = 1, .off = 0x380, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x384, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x388, .val = 0x0000000a },
-    .{ .t = 1, .off = 0x398, .val = 0x00000046 },
-    .{ .t = 1, .off = 0x400, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x404, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x408, .val = 0x0000008a },
-    .{ .t = 1, .off = 0x418, .val = 0x00000041 },
-    .{ .t = 0, .off = 0x024, .val = 0x0000007f },
-    .{ .t = 0, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x5bc, .val = 0x00000012 },
-    .{ .t = 0, .off = 0x5e0, .val = 0x0000001f },
-    .{ .t = 0, .off = 0x5e4, .val = 0x00000078 },
-    .{ .t = 0, .off = 0x5e8, .val = 0x00000008 },
-    .{ .t = 0, .off = 0x5ec, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x658, .val = 0x00000040 },
-    .{ .t = 0, .off = 0x694, .val = 0x00000006 },
-    .{ .t = 0, .off = 0x750, .val = 0x00000010 },
-    .{ .t = 0, .off = 0x748, .val = 0x000000a0 },
-    .{ .t = 0, .off = 0x758, .val = 0x00000001 },
-    .{ .t = 0, .off = 0x740, .val = 0x00000008 },
-    .{ .t = 0, .off = 0x518, .val = 0x00000001 },
-    .{ .t = 0, .off = 0x504, .val = 0x00000003 },
-    .{ .t = 0, .off = 0x510, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x520, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x524, .val = 0x0000004e },
-    .{ .t = 0, .off = 0x544, .val = 0x00000040 },
-    .{ .t = 0, .off = 0x568, .val = 0x000000ba },
-    .{ .t = 0, .off = 0x578, .val = 0x0000000c },
-    .{ .t = 0, .off = 0x5a8, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x5b8, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x5c8, .val = 0x00000008 },
-    .{ .t = 0, .off = 0x660, .val = 0x0000000a },
-    .{ .t = 0, .off = 0x668, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x670, .val = 0x00000084 },
-    .{ .t = 0, .off = 0x670, .val = 0x00000082 },
-    .{ .t = 0, .off = 0x678, .val = 0x0000004c },
-    .{ .t = 0, .off = 0x690, .val = 0x00000080 },
-    .{ .t = 0, .off = 0x590, .val = 0x00000029 },
-    .{ .t = 0, .off = 0x590, .val = 0x0000002f },
-    .{ .t = 0, .off = 0x594, .val = 0x0000002a },
-    .{ .t = 0, .off = 0x594, .val = 0x0000003f },
-    .{ .t = 0, .off = 0x760, .val = 0x00000022 },
-    .{ .t = 1, .off = 0x760, .val = 0x00000022 },
-    .{ .t = 0, .off = 0x528, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x024, .val = 0x0000005f },
-    .{ .t = 0, .off = 0x024, .val = 0x0000007f },
-    .{ .t = 0, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x528, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x024, .val = 0x0000005f },
-    .{ .t = 0, .off = 0x024, .val = 0x0000007f },
-    .{ .t = 0, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 1, .off = 0x024, .val = 0x0000007f },
-    .{ .t = 1, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x03c, .val = 0x00000001 },
-    .{ .t = 0, .off = 0x128, .val = 0x00000001 },
-    .{ .t = 0, .off = 0x128, .val = 0x00000000 },
-    .{ .t = 1, .off = 0x128, .val = 0x00000001 },
-    .{ .t = 1, .off = 0x128, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x030, .val = 0x00000004 },
-    .{ .t = 0, .off = 0x014, .val = 0x00000030 },
-    .{ .t = 1, .off = 0x030, .val = 0x00000004 },
-    .{ .t = 1, .off = 0x014, .val = 0x00000034 },
-    .{ .t = 0, .off = 0x01c, .val = 0x00000001 },
-    .{ .t = 1, .off = 0x01c, .val = 0x00000001 },
-    .{ .t = 2, .off = 0x29c, .val = 0x05f40b01 },
-    .{ .t = 2, .off = 0x020, .val = 0x022c0030 },
-    .{ .t = 2, .off = 0x024, .val = 0x087c008c },
-    .{ .t = 2, .off = 0x028, .val = 0x08950272 },
-    .{ .t = 2, .off = 0x02c, .val = 0x00020000 },
-    .{ .t = 2, .off = 0x030, .val = 0x00000000 },
-    .{ .t = 2, .off = 0x034, .val = 0x00020000 },
-    .{ .t = 2, .off = 0x118, .val = 0x0000023f },
-    .{ .t = 2, .off = 0x114, .val = 0x00000001 },
-    .{ .t = 2, .off = 0x114, .val = 0x00000000 },
-    .{ .t = 2, .off = 0x00c, .val = 0x02009230 },
-    .{ .t = 2, .off = 0x01c, .val = 0x00000000 },
-    .{ .t = 2, .off = 0x038, .val = 0x14000000 },
-    .{ .t = 2, .off = 0x080, .val = 0x80001004 },
-    .{ .t = 2, .off = 0x0c0, .val = 0x00001a23 },
-    .{ .t = 2, .off = 0x0c8, .val = 0x00000001 },
-    .{ .t = 2, .off = 0x108, .val = 0x13ff3fe0 },
-    .{ .t = 2, .off = 0x10c, .val = 0xaa20aa02 },
-    .{ .t = 2, .off = 0x118, .val = 0x0000023f },
-    .{ .t = 2, .off = 0x0ac, .val = 0x00000000 },
-    .{ .t = 2, .off = 0x000, .val = 0x000001f1 },
-    .{ .t = 0, .off = 0x024, .val = 0x0000007f },
-    .{ .t = 0, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x5bc, .val = 0x00000012 },
-    .{ .t = 0, .off = 0x5e0, .val = 0x0000001f },
-    .{ .t = 0, .off = 0x5e4, .val = 0x00000078 },
-    .{ .t = 0, .off = 0x5e8, .val = 0x00000008 },
-    .{ .t = 0, .off = 0x5ec, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x658, .val = 0x00000040 },
-    .{ .t = 0, .off = 0x694, .val = 0x00000006 },
-    .{ .t = 0, .off = 0x750, .val = 0x00000010 },
-    .{ .t = 0, .off = 0x748, .val = 0x000000a0 },
-    .{ .t = 0, .off = 0x758, .val = 0x00000001 },
-    .{ .t = 0, .off = 0x740, .val = 0x00000008 },
-    .{ .t = 0, .off = 0x518, .val = 0x00000001 },
-    .{ .t = 0, .off = 0x504, .val = 0x00000003 },
-    .{ .t = 0, .off = 0x510, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x520, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x524, .val = 0x0000004e },
-    .{ .t = 0, .off = 0x544, .val = 0x00000040 },
-    .{ .t = 0, .off = 0x568, .val = 0x000000ba },
-    .{ .t = 0, .off = 0x578, .val = 0x0000000c },
-    .{ .t = 0, .off = 0x5a8, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x5b8, .val = 0x00000000 },
-    .{ .t = 0, .off = 0x5c8, .val = 0x00000008 },
-    .{ .t = 0, .off = 0x660, .val = 0x0000000a },
-    .{ .t = 0, .off = 0x668, .val = 0x000000c0 },
-    .{ .t = 0, .off = 0x670, .val = 0x00000084 },
-    .{ .t = 0, .off = 0x670, .val = 0x00000082 },
-    .{ .t = 0, .off = 0x678, .val = 0x0000004c },
-    .{ .t = 0, .off = 0x690, .val = 0x00000080 },
-    .{ .t = 0, .off = 0x590, .val = 0x00000029 },
-    .{ .t = 0, .off = 0x590, .val = 0x0000002f },
-    .{ .t = 0, .off = 0x594, .val = 0x0000002a },
-    .{ .t = 0, .off = 0x594, .val = 0x0000003f },
-    .{ .t = 0, .off = 0x760, .val = 0x00000022 },
-    .{ .t = 1, .off = 0x760, .val = 0x00000022 },
-    .{ .t = 0, .off = 0x024, .val = 0x0000007f },
-    .{ .t = 0, .off = 0x528, .val = 0x000000c0 },
-    .{ .t = 3, .off = 0x29c, .val = 0x05f40b01 },
-    .{ .t = 3, .off = 0x020, .val = 0x022c0030 },
-    .{ .t = 3, .off = 0x024, .val = 0x087c008c },
-    .{ .t = 3, .off = 0x028, .val = 0x08950272 },
-    .{ .t = 3, .off = 0x02c, .val = 0x00020000 },
-    .{ .t = 3, .off = 0x030, .val = 0x00000000 },
-    .{ .t = 3, .off = 0x034, .val = 0x00020000 },
-    .{ .t = 3, .off = 0x118, .val = 0x0000023f },
-    .{ .t = 3, .off = 0x114, .val = 0x00000001 },
-    .{ .t = 3, .off = 0x114, .val = 0x00000000 },
-    .{ .t = 3, .off = 0x00c, .val = 0x02009230 },
-    .{ .t = 3, .off = 0x01c, .val = 0x00000000 },
-    .{ .t = 3, .off = 0x038, .val = 0x14000000 },
-    .{ .t = 3, .off = 0x080, .val = 0x80001004 },
-    .{ .t = 3, .off = 0x0c0, .val = 0x00001a23 },
-    .{ .t = 3, .off = 0x0c8, .val = 0x00000001 },
-    .{ .t = 3, .off = 0x108, .val = 0x13ff3fe0 },
-    .{ .t = 3, .off = 0x10c, .val = 0xaa20aa02 },
-    .{ .t = 3, .off = 0x118, .val = 0x0000023f },
-    .{ .t = 3, .off = 0x0ac, .val = 0x00000000 },
-    .{ .t = 3, .off = 0x000, .val = 0x000001f1 },
-    .{ .t = 2, .off = 0x000, .val = 0x000001f3 },
-    .{ .t = 3, .off = 0x000, .val = 0x000001f3 },
-    .{ .t = 3, .off = 0x000, .val = 0x000001f7 },
-    .{ .t = 3, .off = 0x10c, .val = 0xaa20aa02 },
-    .{ .t = 2, .off = 0x000, .val = 0x000001f7 },
-    .{ .t = 2, .off = 0x10c, .val = 0xaa20aa02 },
-    .{ .t = 3, .off = 0x044, .val = 0x00001000 },
-    .{ .t = 3, .off = 0x048, .val = 0x00000004 },
-    .{ .t = 3, .off = 0x08c, .val = 0x00000001 },
-    .{ .t = 2, .off = 0x044, .val = 0x00001000 },
-    .{ .t = 2, .off = 0x048, .val = 0x00000004 },
-};
 
-/// Phase-split replay (SPEC.md task #5 log).
-///
-/// A single monolithic replay WEDGED THE BOARD: it issues DSI host writes,
-/// but this driver enables the DSI link clocks (byte/pclk/esc) only after
-/// bring-up, whereas Linux has them running before its host writes because
-/// the clock framework brings them up as part of the PHY PLL enable.
-/// Writing host registers into dead clock domains stalls the AHB -- the
-/// backlight lit, then the CPU wedged and the watchdog looped.
-///
-/// So replay in two phases with the link-clock enable in between:
-///   phase 0 -> PHY writes only (t == 0 or 1)
-///   phase 1 -> DSI host writes only (t == 2 or 3)
-/// Order within each phase is preserved exactly as captured.
-export fn sheng_mdss_replay_bringup_phase(phase: u32, phy0: usize, phy1: usize, dsi0: usize, dsi1: usize) callconv(.c) c_int {
-    for (kernel_bringup_replay) |e| {
-        const is_phy = (e.t <= 1);
-        if (phase == 0 and !is_phy) continue;
-        if (phase == 1 and is_phy) continue;
-        const base = switch (e.t) {
-            0 => phy0,
-            1 => phy1,
-            2 => dsi0,
-            else => dsi1,
-        };
-        mmioWrite32(base, e.off, e.val);
-        if (is_phy) {
-            if (e.off == CMN_GLBL_DIGTOP_SPARE10 and e.val == 0x1) {
-                udelay(500);
-                var w: u32 = 0;
-                while (w < REFGEN_READY_TIMEOUT_US) : (w += 5) {
-                    if ((mmioRead32(base, CMN_PHY_STATUS) & 0x1) != 0) break;
-                    udelay(5);
-                }
-            } else if (e.off == CMN_PLL_CNTRL and e.val == 0x1) {
-                var w: u32 = 0;
-                while (w < PLL_LOCK_POLL2_TIMEOUT_US) : (w += 100) {
-                    const st = mmioRead32(base + PLL_BASE_OFFSET, PLL_COMMON_STATUS_ONE);
-                    if ((st & PLL_LOCK_STATUS_BIT) != 0) break;
-                    udelay(100);
-                }
-            }
-        } else if (e.off == DSI_RESET and e.val == 1) {
-            udelay(20000);
-        }
-    }
-    return 0;
-}
 
-export fn sheng_mdss_replay_bringup(phy0: usize, phy1: usize, dsi0: usize, dsi1: usize) callconv(.c) c_int {
-    for (kernel_bringup_replay) |e| {
-        const base = switch (e.t) {
-            0 => phy0,
-            1 => phy1,
-            2 => dsi0,
-            else => dsi1,
-        };
-        mmioWrite32(base, e.off, e.val);
-
-        // Re-insert the blocking points the kernel has.
-        if (e.t <= 1) {
-            if (e.off == CMN_GLBL_DIGTOP_SPARE10 and e.val == 0x1) {
-                udelay(500);
-                var w: u32 = 0;
-                while (w < REFGEN_READY_TIMEOUT_US) : (w += 5) {
-                    if ((mmioRead32(base, CMN_PHY_STATUS) & 0x1) != 0) break;
-                    udelay(5);
-                }
-            } else if (e.off == CMN_PLL_CNTRL and e.val == 0x1) {
-                var w: u32 = 0;
-                while (w < PLL_LOCK_POLL2_TIMEOUT_US) : (w += 100) {
-                    const st = mmioRead32(base + PLL_BASE_OFFSET, PLL_COMMON_STATUS_ONE);
-                    if ((st & PLL_LOCK_STATUS_BIT) != 0) break;
-                    udelay(100);
-                }
-            }
-        } else if (e.off == DSI_RESET and e.val == 1) {
-            udelay(20000);
-        }
-    }
-    return 0;
-}
 
 /// PHY bases, remembered so the per-command PLL re-commit below can reach
 /// them without threading them through every DCS call site.
 var g_phy0_base: usize = 0;
 var g_phy1_base: usize = 0;
 
-/// PER-COMMAND PLL RE-COMMIT (SPEC.md task #5 log).
+/// Re-commit the PLL configuration before each DCS command.
 ///
-/// The last uncharacterised behavioural difference, and the only one left
-/// after exhaustive register sweeps came back clean.
+/// msm_dsi_host_xfer_prepare() calls link_clk_set_rate() before EVERY
+/// command, which lands in dsi_pll_7nm_vco_set_rate() and reruns the
+/// whole rate configuration. Doing it once at bring-up is not the same
+/// thing.
 ///
-/// Tracing every PHY write the working kernel makes shows a FULL PLL rate
-/// reconfiguration between every single DCS command:
+/// The values written match what is already in the registers, so no
+/// register comparison can show the difference -- what it buys is
+/// re-latching the configuration into the analog block.
 ///
-///   P0cmn 024=7f  P0pll 528=c0            enable_pll_bias()
-///   P0pll 5bc/5e0/5e4/5e8/5ec/658/694/
-///         750/748                          dsi_pll_commit()
-///   P0pll 758/740/518/504/510/520/524/
-///         544/568/578/5a8/5b8/5c8/660/
-///         668/670/678/690/590/594/760      dsi_pll_config_hzindep_reg()
-///   P1pll 760=22                           slave PERF_OPTIMIZE
-///
-/// That is msm_dsi_host_xfer_prepare() calling link_clk_set_rate(), which
-/// propagates to dsi_pll_7nm_vco_set_rate(). This driver runs that
-/// sequence ONCE at bring-up; the kernel runs it before EVERY command.
-///
-/// The values written are identical to what is already in the registers,
-/// which is precisely why 536 PHY registers and 176 DSI registers all diff
-/// clean while the panel still receives nothing. If committing the PLL
-/// configuration re-latches it into the analog block -- the same shape as
-/// the DSI_CTRL enable-edge idea, but on the PLL -- then a register
-/// comparison can never see it, and our commands would go out with the
-/// analog path in a state the values do not describe.
-///
-/// Mirrors the traced order exactly: bias, commit rate, hz-independent
-/// config, then the slave's PERF_OPTIMIZE.
+/// Order: bias, commit rate, hz-independent config, slave
+/// PERF_OPTIMIZE.
 fn dsiPhyPllRecommit() void {
     if (g_phy0_base == 0) return;
     mmioSetBits32(g_phy0_base, CMN_CTRL_0, CTRL_0_PLL_SHUTDOWNB);
@@ -2131,61 +1497,20 @@ export fn sheng_mdss_dsi_phy_init(dsi_phy_base: usize, is_master: bool) callconv
 
     dsiPhyLaneSettings(dsi_phy_base);
 
-    // WITHDRAWN -- THE LIVE READ WAS CONTAMINATED (SPEC.md task #5 log).
-    //
-    // An earlier pass removed the `if (is_master)` gate here, on the
-    // strength of reading DSI1's PLL registers off the device and finding
-    // them fully configured and locked (PLL_CNTRL=0x01, status=0x51,
-    // dec=0x1F, frac=0x78). That reasoning was wrong: hooking writel() in
-    // dsi_phy_7nm.c shows the working kernel writes only TWO PLL registers
-    // on PHY1 (SYSTEM_MUXES, PERF_OPTIMIZE) and writes CMN_PLL_CNTRL=0x00
-    // on it and never 0x01 -- the slave PLL is never started. Those "live"
-    // values were OUR OWN U-Boot writes read back, which Linux never
-    // overwrites precisely because it does not touch them.
-    //
-    // Lesson worth keeping: a live register read is only a valid reference
-    // for registers Linux actually writes. For anything it leaves alone,
-    // the read reflects whatever ran before it -- including us.
-    //
-    // Original (now withdrawn) reasoning follows.
-    //
-    // This used to run the PLL configure+start under `if (is_master)`, on
-    // the reasoning that the slave (DSI1) receives its bit clock over the
-    // sync-dual-dsi link and so has no PLL of its own to start. Reading
-    // dsi_phy_7nm.c supports that reading -- dsi_pll_7nm_vco_prepare()
-    // writes CMN_PLL_CNTRL only for `pll_7nm->phy`, and the `slave`
-    // branches beside it only do bias / dig-reset / global-clk / RBUF.
-    //
-    // The hardware disagrees. Read off this device while Linux was driving
-    // the panel, DSI1's PHY (0x0ae97000) is not a dormant PLL at all:
-    //
-    //   CMN_PLL_CNTRL      (+0x03c) = 0x01   <- PLL STARTED
-    //   PLL_COMMON_STATUS_1(+0x6b0) = 0x51   <- and LOCKED
-    //   PLL_DECIMAL_DIV_START_1     = 0x1F   } fully configured,
-    //   PLL_FRAC_DIV_START_LOW_1    = 0x78   } byte-for-byte
-    //   PLL_FRAC_DIV_START_MID_1    = 0x08   } identical to DSI0
-    //   PLL_CMODE_1                 = 0x10   }
-    //   PLL_SYSTEM_MUXES            = 0xC0   }
-    //
-    // Both PLLs are configured and running. The explanation consistent
-    // with the source is that the clock framework prepares BOTH vco clocks
-    // (each DSI host parents its byte/pixel clocks to its own PHY PLL), so
-    // dsi_pll_7nm_vco_prepare() runs once per PHY and each writes its own
-    // CMN_PLL_CNTRL; the `slave` pointer is only non-NULL on the master,
-    // which is why the source reads as master-only.
-    //
-    // Under the old gate, DSI1's entire PLL sub-block (phy+0x500) was
-    // never written at all -- and that sub-block was never audited either,
-    // since the PHY has no verify table and the manual "31/31 CMN match"
-    // covered only the CMN block below +0x200. A slave PHY whose PLL is
-    // unconfigured and unlocked is a plausible reason for half a bonded
-    // link to never drive its lanes, which on a stitched DDIC means no
-    // usable picture at all.
     // Rate configuration only. The PLL START and the digital-reset /
-    // global-clock / RBUF tail are NOT done here any more -- they have to
-    // be interleaved across both PHYs, so they live in
-    // sheng_mdss_dsi_phy_start_dual(), which the caller runs once after
-    // BOTH phys have been through this function.
+    // global-clock / RBUF tail are interleaved across both PHYs, so they
+    // live in sheng_mdss_dsi_phy_start_dual(), which the caller runs once
+    // after BOTH phys have been through this function.
+    //
+    // Master only. The slave's PLL is never started -- the kernel writes
+    // exactly two PLL registers on PHY1 (SYSTEM_MUXES, PERF_OPTIMIZE) and
+    // sets its CMN_PLL_CNTRL to 0, never 1.
+    //
+    // Reading DSI1's PLL registers off a live device suggests otherwise:
+    // they come back fully configured and locked. Those are OUR OWN
+    // writes read back, which Linux never overwrites precisely because it
+    // does not touch them. A live register read is only a valid reference
+    // for registers Linux actually writes.
     if (is_master) {
         dsiPhyPllConfigure(dsi_phy_base);
     } else {
@@ -2213,138 +1538,45 @@ const DSI_TOTAL: usize = 0x028;
 const DSI_ACTIVE_HSYNC: usize = 0x02c;
 const DSI_ACTIVE_VSYNC_HPOS: usize = 0x030;
 const DSI_ACTIVE_VSYNC_VPOS: usize = 0x034;
-/// WRONG OFFSET, FOUND BY WRITE TRACE (SPEC.md task #5 log).
+/// VID_CFG1 is 0x01c, NOT 0x010. The map jumps from VID_CFG0 (0x00c)
+/// straight to 0x01c; 0x010 is not modelled at all.
 ///
-/// This was 0x010. dsi.xml puts VID_CFG1 at **0x01c** -- the register map
-/// jumps straight from VID_CFG0 (0x00c) to VID_CFG1 (0x01c), and 0x010 is
-/// not modelled at all. So this driver has been writing 0x31211101 into an
-/// UNDOCUMENTED register believing it was VID_CFG1, and never writing the
-/// real VID_CFG1 at all.
-///
-/// Caught by tracing every dsi_write() the working kernel makes: Linux's
-/// DSI0 bring-up touches 23 offsets, and comparing that set against ours,
-/// 0x01c is the ONE register Linux writes that we never did. It is
-/// invisible to our audits twice over -- not written by us, and not in the
-/// audit table either.
-///
-/// VID_CFG1 holds R_SEL(0) / G_SEL(4) / B_SEL(8) / RGB_SWAP(12:14). Note
-/// 0x31211101 sets bits far outside those fields, which is independent
-/// confirmation it was never a VID_CFG1 value.
-///
-/// Live, read off this device on both hosts: 0x01c = 0x00000000 (Linux
-/// writes 0 explicitly in dsi_ctrl_enable), 0x010 = 0x31211101 on both --
-/// so 0x31211101 is simply 0x010's power-on value, which is why writing it
-/// looked harmless and why our audit of 0x010 always passed.
-///
-/// Why this can matter on a DSC panel: with compression on, the "pixel
-/// stream" is compressed bytes. Channel-select/swap applied to that byte
-/// stream scrambles it, the panel's DSC decoder fails to decode, and it
-/// blanks -- with no error anywhere on the transmit side. It does NOT
-/// explain the unanswered BTA (command mode does not use VID_CFG1), so
-/// this is a real divergence, not necessarily the whole story.
+/// Holds R_SEL(0) / G_SEL(4) / B_SEL(8) / RGB_SWAP(12:14). Linux writes
+/// 0 here explicitly. Writing a channel-swap value into a DSC stream
+/// scrambles the compressed bytes, the panel's decoder fails, and it
+/// blanks with no error on the transmit side.
 const DSI_VID_CFG1: usize = 0x01c;
-/// REAL GAP FOUND (SPEC.md task #5 log): the DSI host's own compression
-/// descriptor, offset 0x29c. This driver never referenced it AT ALL --
-/// grep for "COMPRESSION" found zero hits -- so the host was never told
-/// it was carrying a DSC-compressed stream, and expected uncompressed
-/// RGB at the programmed timing.
+/// The host's compression descriptor. Without it the host expects
+/// uncompressed RGB at the programmed timing and real DSC data arriving
+/// drives FIFO_STATUS to 0xdddd1219 -- VIDEO_MDP_FIFO overflow AND
+/// underflow with all four lanes thrashing.
 ///
-/// That stayed invisible for as long as no pixels were actually being
-/// fetched: with CTL_FETCH_PIPE_ACTIVE unset, FIFO_STATUS read a clean
-/// 0x00001210 because nothing was flowing. The moment the fetch gate
-/// was opened, DSI0 FIFO_STATUS went to 0xdddd1219 -- VIDEO_MDP_FIFO
-/// OVERFLOW *and* UNDERFLOW plus all four lanes thrashing -- i.e. real
-/// compressed data arriving at a host configured to expect something
-/// else entirely.
+/// Harmless-looking while nothing is fetched: with CTL_FETCH_PIPE_ACTIVE
+/// unset FIFO_STATUS reads a clean 0x00001210 because no data flows.
 ///
-/// Live value, identical on DSI0 and DSI1 (dsi.xml bitfields):
+/// Live value, identical on both hosts:
 ///   WC(31:16)          = 0x05F4 = 1524 compressed bytes per line
 ///   DATATYPE(13:8)     = 0x0B   = MIPI compressed pixel stream
 ///   PKT_PER_LINE(7:6)  = 0
 ///   EOL_BYTE_NUM(5:4)  = 0
 ///   EN(0)              = 1
-/// DSI host built-in TEST PATTERN GENERATOR (SPEC.md task #5 log).
-/// msm_dsi_host_test_pattern_en() / msm_dsi_host_video_test_pattern_setup().
+/// The host's built-in test pattern generator: video is generated
+/// internally and driven down the lanes with the entire DPU bypassed --
+/// no framebuffer, SMMU, SSPP, mixer, DSC encoder or INTF.
 ///
-/// This is the decisive bisect for "is the panel receiving anything at
-/// all". The DSI host generates the video stream INTERNALLY and drives
-/// it down the lanes: no framebuffer, no SMMU, no SSPP, no layer mixer,
-/// no DSC encoder, no INTF -- the entire DPU is bypassed. It works on
-/// video-mode panels, unlike the earlier DCS ALL_PIXELS_ON attempt whose
-/// behaviour is implementation-defined on a RAM-less panel.
+/// Splits "does anything reach the panel" cleanly. Any visible change
+/// means the link is good and the fault is upstream in the DPU path;
+/// pure black means nothing transmitted reaches the display.
 ///
-///   ANY visible change (checkerboard, noise, garbage, flicker)
-///     -> the DSI link physically reaches the panel and the panel
-///        reacts. The fault is then in the DPU -> DSI data path, and
-///        every register we verified identical to live silicon is
-///        genuinely fine.
-///   Still pure black
-///     -> nothing this SoC transmits reaches the panel's display,
-///        despite PHY/host registers matching working Linux exactly.
-///        That points at the panel's own power/enable state rather
-///        than anything in the display pipeline.
-///
-/// NOTE: the panel is currently in DSC mode, so TPG's uncompressed RGB
-/// will not decode into a clean checkerboard -- garbage or noise is the
-/// EXPECTED positive result here. Only pure black is the negative.
-const DSI_TEST_PATTERN_GEN_CTRL: usize = 0x158;
+/// With the panel in DSC mode the TPG's uncompressed RGB will not
+/// decode cleanly -- noise or garbage IS the positive result. Only pure
+/// black is negative.
 const DSI_TEST_PATTERN_GEN_VIDEO_INIT_VAL: usize = 0x160;
-const DSI_TPG_MAIN_CONTROL: usize = 0x198;
-const DSI_TPG_VIDEO_CONFIG: usize = 0x1a0;
 /// CHECKERED_RECTANGLE_PATTERN (bit8)
-const TPG_MAIN_CONTROL_CHECKERED: u32 = 1 << 8;
 /// BPP = VIDEO_CONFIG_24BPP (1) | RGB (bit2)
-const TPG_VIDEO_CONFIG_VALUE: u32 = 1 | (1 << 2);
 /// VIDEO_PATTERN_SEL = VID_MDSS_GENERAL_PATTERN (3) at bits[5:4], EN bit0
-const TPG_GEN_CTRL_VALUE: u32 = (3 << 4) | 1;
 
-fn dsiTpgEnableOne(dsi_base: usize) void {
-    mmioWrite32(dsi_base, DSI_TEST_PATTERN_GEN_VIDEO_INIT_VAL, 0xff);
-    mmioWrite32(dsi_base, DSI_TPG_MAIN_CONTROL, TPG_MAIN_CONTROL_CHECKERED);
-    mmioWrite32(dsi_base, DSI_TPG_VIDEO_CONFIG, TPG_VIDEO_CONFIG_VALUE);
-    mmioWrite32(dsi_base, DSI_TEST_PATTERN_GEN_CTRL, TPG_GEN_CTRL_VALUE);
-}
 
-/// Master first, then slave -- matching msm_dsi_manager_tpg_enable()'s
-/// own explicit "if dual dsi, trigger tpg on master first then slave".
-export fn sheng_mdss_dsi_tpg_enable(dsi0_base: usize, dsi1_base: usize) callconv(.c) void {
-    // RE-ENABLED (b93). The previous "it answered its question -- pure
-    // black with the whole DPU bypassed" result is INVALID and must not
-    // be trusted: it was measured while the `0x51 0x00 0x00` write was
-    // still in the init table, i.e. through a DDIC that had been
-    // explicitly commanded to output black with BCTRL armed. See the
-    // REMOVED-0x51 comment in dsiPanelInit() -- it names this exact test
-    // ("solid fill, border-only, DSI TPG") as one of the bisects it
-    // invalidated, which is why mutually exclusive hypotheses all came
-    // back identically black.
-    //
-    // b92 established a clean panel state for the first time: with
-    // SHENG_SKIP_PANEL_TOUCH the DDIC is inherited straight from ABL,
-    // fully initialised and actively displaying, and we send it no DCS
-    // at all -- so no 0x51 can be in effect. Re-running TPG on top of
-    // that is the real bisect, and it splits the remaining search space
-    // exactly in half:
-    //
-    //   TPG visible -> DSI host/PHY/link/panel are all fine, and the
-    //     black screen is upstream in DPU/SSPP/SMMU pixel fetch.
-    //   TPG black   -> nothing we transmit reaches the panel at all,
-    //     and the entire DPU-side investigation is moot.
-    //
-    // Yes, this perturbs FIFO_STATUS (drives it to 0x55551210). That is
-    // acceptable here: FIFO_STATUS is a proxy, a photograph of the
-    // panel is not.
-    //
-    // b93 RESULT: registers verified programmed (0x158=0x31, 0x160=0xff,
-    // 0x198=0x100, 0x1a0=0x05) and the panel stayed black -- but that run
-    // is NOT clean either, because the link is in DSC compressed mode
-    // (VIDEO_COMPRESSION_MODE_CTRL) and TPG emits UNCOMPRESSED pixels,
-    // which the DDIC's DSC decoder cannot make sense of. Re-disabled: the
-    // real fault turned out to be dispCcPll0Enable()'s rate, and we want
-    // the genuine DPU framebuffer path visible, not a TPG overlay.
-    if (true) return;
-    dsiTpgEnableOne(dsi0_base);
-    dsiTpgEnableOne(dsi1_base);
-}
 
 /// BISECT (SPEC.md task #5 log): stage NO pipe into either mixer, so
 /// the mixers emit border colour and the DPU produces a frame with ZERO
@@ -3647,63 +2879,9 @@ export fn sheng_mdss_dsi_read_power_mode(dsi0_base: usize, dsi1_base: usize, dma
     return (@as(i64, resp) << 32) | @as(i64, (resp >> 16) & 0xff);
 }
 
-/// Reads ACK_ERR_STATUS and TIMEOUT_STATUS on DSI0 -- U-Boot polls a
-/// single busy bit and never looks at these, so a BTA timeout or LP-RX
-/// timeout during a transaction has never been visible: DSI_TRIG_DMA's
-/// busy bit clearing only means the host's OWN DMA engine finished,
-/// not that the transaction completed error-free. Packed as
-/// (ack_err_status << 32) | timeout_status.
-export fn sheng_mdss_dsi_read_error_status(dsi0_base: usize) callconv(.c) i64 {
-    const ack_err = mmioRead32(dsi0_base, DSI_ACK_ERR_STATUS);
-    const timeout = mmioRead32(dsi0_base, DSI_TIMEOUT_STATUS);
-    return (@as(i64, @intCast(ack_err)) << 32) | @as(i64, @intCast(timeout));
-}
 
-/// Reads DSI_CTRL and DSI_LANE_CTRL on DSI0 as OUR driver's own
-/// execution actually left them at the moment of the BTA attempt --
-/// not Linux's later, differently-reprogrammed post-teardown value
-/// (which decodes against no documented bitfield at all: 0x20070000
-/// live-read has bits 16/17/18/29 set, none of which match ENABLE/
-/// CLK_EN/LANE0-3/VID_MODE_EN/CMD_MODE_EN/ECC_CHECK/CRC_CHECK per
-/// dsi.xml -- either genuinely undocumented bits this header doesn't
-/// cover, or not directly comparable to our own driver's state at
-/// all). Packed as (DSI_CTRL << 32) | DSI_LANE_CTRL.
-export fn sheng_mdss_dsi_read_ctrl_state(dsi0_base: usize) callconv(.c) i64 {
-    const ctrl = mmioRead32(dsi0_base, DSI_CTRL);
-    const lane_ctrl = mmioRead32(dsi0_base, DSI_LANE_CTRL);
-    return (@as(i64, @intCast(ctrl)) << 32) | @as(i64, @intCast(lane_ctrl));
-}
 
-/// Self-check: write a known test pattern to DSI_CTRL, read back
-/// immediately (nothing else touches the register in between), restore
-/// the real value. Returns the immediate readback. If this comes back
-/// as 0x20070000 (or anything other than the pattern just written),
-/// the write is not landing at all -- not a later overwrite, not a
-/// different execution path, the bus transaction itself is being
-/// dropped or aliased.
-export fn sheng_mdss_dsi_ctrl_writeback_selfcheck(dsi_base: usize) callconv(.c) u32 {
-    const test_pattern: u32 = 0xA5A5A5A5;
-    mmioWrite32(dsi_base, DSI_CTRL, test_pattern);
-    const readback = mmioRead32(dsi_base, DSI_CTRL);
-    mmioWrite32(dsi_base, DSI_CTRL, CTRL_CLK_EN | CTRL_ALL_LANES | CTRL_CMD_MODE_EN | CTRL_ENABLE);
-    return readback;
-}
 
-/// Isolates whether the write-drop is specific to DSI_CTRL or affects
-/// the whole DSI host block (which would point at DSI_CLK_CTRL -- the
-/// block's own internal AHB clock gate -- not actually landing either,
-/// leaving every sub-register in this block unable to accept writes at
-/// all). Tests CLK_CTRL, LANE_SWAP_CTRL (a register already confirmed
-/// correct via live steal, so its pre-test value is known), and CTRL,
-/// each with an immediate write-then-read, restoring real values after.
-/// Packed as (clk_ctrl_readback << 32) | (lane_swap_readback << 16) |
-/// low 16 bits unused (ctrl selfcheck already covered separately).
-/// Result of the write-immediately-after-reset probe done inside
-/// dsiHostBringUp(), before anything else touches the controller.
-/// 0xFFFFFFFF sentinel means it never ran (dsi_base mismatch).
-export fn sheng_mdss_dsi_earliest_ctrl_selfcheck() callconv(.c) u32 {
-    return g_earliest_ctrl_selfcheck;
-}
 
 export fn sheng_mdss_dsi_status0_before_first_cmd() callconv(.c) u32 {
     return g_status0_before_first_cmd;
@@ -3739,21 +2917,6 @@ export fn sheng_mdss_dsi_timeout_diag() callconv(.c) i64 {
         @as(i64, @intCast(g_dln0_phy_err_on_timeout));
 }
 
-export fn sheng_mdss_dsi_block_writeback_selfcheck(dsi_base: usize) callconv(.c) i64 {
-    const test_pattern: u32 = 0x5A5A5A5A;
-
-    const saved_clk_ctrl = mmioRead32(dsi_base, DSI_CLK_CTRL);
-    mmioWrite32(dsi_base, DSI_CLK_CTRL, test_pattern);
-    const clk_ctrl_readback = mmioRead32(dsi_base, DSI_CLK_CTRL);
-    mmioWrite32(dsi_base, DSI_CLK_CTRL, saved_clk_ctrl);
-
-    const saved_lane_swap = mmioRead32(dsi_base, DSI_LANE_SWAP_CTRL);
-    mmioWrite32(dsi_base, DSI_LANE_SWAP_CTRL, test_pattern);
-    const lane_swap_readback = mmioRead32(dsi_base, DSI_LANE_SWAP_CTRL);
-    mmioWrite32(dsi_base, DSI_LANE_SWAP_CTRL, saved_lane_swap);
-
-    return (@as(i64, @intCast(clk_ctrl_readback)) << 32) | @as(i64, @intCast(lane_swap_readback));
-}
 
 /// Sends one DCS command to both DSI0 and DSI1 from the SAME DMA
 /// buffer -- qcom,sync-dual-dsi mirrors every command to both
@@ -4829,7 +3992,6 @@ const CTL_DEFAULT_GROUP_ID_SHIFTED: u32 = 0xf << 28;
 // normally to Linux and the (already working) sheng,mdss-status relay
 // confirms whether we got that far without the CPU/bus wedging. Bump
 // this and reflash to bisect; set to 99 for the real full sequence.
-const DPU_TEST_STOP_STAGE: u32 = 99;
 
 fn dpuHwWrite(dpu_base: usize, block_off: usize, reg_off: usize, value: u32) void {
     mmioWrite32(dpu_base, block_off + reg_off, value);
@@ -5575,7 +4737,6 @@ export fn sheng_mdss_dpu_start(
 
     _ = half_stride;
 
-    if (DPU_TEST_STOP_STAGE <= 1) return 0;
 
     // -- LM: single opaque blendstage each, output = per-half size.
     mmioWrite32(lm0_base, LM_OUT_SIZE, (vactive << 16) | half_w);
@@ -5603,23 +4764,11 @@ export fn sheng_mdss_dpu_start(
     // Note LM1 needs the pipe staged too -- it was previously left with
     // BORDER_OUT only, i.e. the right half of the panel was explicitly
     // configured to show nothing but border colour.
-    if (DPU_BORDER_ONLY_BISECT) {
-        // See DPU_BORDER_ONLY_BISECT's comment: no pipe staged, mixers
-        // emit border, zero memory fetch.
-        mmioWrite32(ctl_base, CTL_LAYER0, CTL_MIXER_BORDER_OUT);
-        mmioWrite32(ctl_base, CTL_LAYER1, CTL_MIXER_BORDER_OUT);
-        mmioWrite32(ctl_base, CTL_LAYER_EXT2_0, 0);
-        mmioWrite32(ctl_base, CTL_LAYER_EXT2_1, 0);
-        mmioWrite32(lm0_base, LM_OP_MODE, 0);
-        mmioWrite32(lm1_base, LM_OP_MODE, LM_OP_MODE_LM1_EXTRA);
-    } else {
-        mmioWrite32(ctl_base, CTL_LAYER0, CTL_MIXER_BORDER_OUT | (@as(u32, 2) << 18));
-        mmioWrite32(ctl_base, CTL_LAYER1, CTL_MIXER_BORDER_OUT | (@as(u32, 2) << 18));
-        mmioWrite32(ctl_base, CTL_LAYER_EXT2_0, @as(u32, 2) << 8);
-        mmioWrite32(ctl_base, CTL_LAYER_EXT2_1, @as(u32, 2) << 8);
-    }
+    mmioWrite32(ctl_base, CTL_LAYER0, CTL_MIXER_BORDER_OUT | (@as(u32, 2) << 18));
+    mmioWrite32(ctl_base, CTL_LAYER1, CTL_MIXER_BORDER_OUT | (@as(u32, 2) << 18));
+    mmioWrite32(ctl_base, CTL_LAYER_EXT2_0, @as(u32, 2) << 8);
+    mmioWrite32(ctl_base, CTL_LAYER_EXT2_1, @as(u32, 2) << 8);
 
-    if (DPU_TEST_STOP_STAGE <= 2) return 0;
 
     // -- PP: enable DSC routing + wrapper endian-flip quirk bit. Skipped
     // entirely when enable_dsc=false -- untested whether the panel's
@@ -5652,7 +4801,6 @@ export fn sheng_mdss_dpu_start(
         dscConfigureInstance(dce_base, 0x200, 0xf80, 1); // -> PP_1
     }
 
-    if (DPU_TEST_STOP_STAGE <= 3) return 0;
 
     // -- INTF: per-half timing, horizontal porches/sync halved (dual-
     // link split), vertical unchanged. Width is further reduced by the
@@ -5671,7 +4819,6 @@ export fn sheng_mdss_dpu_start(
     mmioWrite32(intf1_base, INTF_MUX, INTF_MUX_LIVE_BASE | 0); // bind to PINGPONG_0
     mmioWrite32(intf2_base, INTF_MUX, INTF_MUX_LIVE_BASE | 1); // bind to PINGPONG_1
 
-    if (DPU_TEST_STOP_STAGE <= 4) return 0;
 
     // -- CTL top-level routing: both INTFs + both DSC engines active,
     // INTF_1 (DSI0) is the split-link master, video mode (no cmd-mode
@@ -5728,7 +4875,6 @@ export fn sheng_mdss_dpu_start(
     mmioWrite32(dpu_base + MERGE_3D_0_BASE, MERGE_3D_MODE, 0x0);
     // ===================================================================
 
-    if (DPU_TEST_STOP_STAGE <= 5) return 0;
 
     // -- Switch both DSI hosts from command mode to video mode before
     // the timing engines start pushing pixel data. Moving this earlier
@@ -5737,7 +4883,6 @@ export fn sheng_mdss_dpu_start(
     dsiHostSwitchToVideoMode(dsi0_base);
     dsiHostSwitchToVideoMode(dsi1_base);
 
-    if (DPU_TEST_STOP_STAGE <= 6) return 0;
 
     // TIMING ENGINE MOVED BELOW THE FLUSH (SPEC.md task #5 log).
     //
@@ -5760,7 +4905,6 @@ export fn sheng_mdss_dpu_start(
     // device, where intf_timing_engine enable=1 lands 2.2ms AFTER the
     // panel init sequence completes, as the last step.
 
-    if (DPU_TEST_STOP_STAGE <= 7) return 0;
 
     // -- CTL flush (v1 path, core_major_ver>=5): per-block flush masks
     // written to their own registers first, then the aggregate pending
@@ -5770,14 +4914,12 @@ export fn sheng_mdss_dpu_start(
         mmioWrite32(ctl_base, CTL_DSC_FLUSH, 0x3); // DSC_0, DSC_1
     }
 
-    if (DPU_TEST_STOP_STAGE <= 8) return 0;
 
     const pending_flush = CTL_FLUSH_SSPP_DMA0 | CTL_FLUSH_LM0 | CTL_FLUSH_LM1 |
         CTL_FLUSH_MASK_CTL | CTL_FLUSH_INTF_IDX |
         (if (enable_dsc) CTL_FLUSH_DSC_IDX else 0);
     mmioWrite32(ctl_base, CTL_FLUSH, pending_flush);
 
-    if (DPU_TEST_STOP_STAGE <= 9) return 0;
 
     // CTL_START REMOVED (SPEC.md task #5 log).
     //
