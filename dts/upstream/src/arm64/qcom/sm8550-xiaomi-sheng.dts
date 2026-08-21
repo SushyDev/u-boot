@@ -111,12 +111,18 @@
 
 		key-volume-up {
 			label = "Volume Up";
-			/* U-Boot only: KEY_DOWN so this navigates the boot menu.
-			 * button_kbd passes linux,code straight through to the
-			 * input layer, and KEY_VOLUMEUP maps to nothing usable
-			 * there. Linux is unaffected -- it loads its own DTB
-			 * from /boot rather than the one appended to U-Boot. */
-			linux,code = <KEY_DOWN>;
+			/* U-Boot only: KEY_UP so this moves the boot menu
+			 * highlight up. button_kbd passes linux,code straight
+			 * through to the input layer, and KEY_VOLUMEUP maps to
+			 * nothing a menu can consume; KEY_UP becomes the ANSI
+			 * sequence "\e[A" (input.c's ansi_kbd table), which
+			 * cli_ch_esc() converts to CTL_CH('p') and
+			 * bootmenu_conv_key() turns into BKEY_UP.
+			 *
+			 * Linux is unaffected -- it loads its own DTB from
+			 * /boot rather than the one appended to U-Boot, so this
+			 * is still an ordinary volume-up key there. */
+			linux,code = <KEY_UP>;
 			gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
 			debounce-interval = <15>;
 			linux,can-disable;
@@ -540,18 +546,38 @@
 	status = "okay";
 };
 
+/*
+ * Boot menu navigation, U-Boot only. Linux loads its own DTB from /boot, so
+ * these three stay ordinary volume/power keys there.
+ *
+ *   Volume Up   -> KEY_UP     (see gpio-keys above)
+ *   Volume Down -> KEY_DOWN   this node; resin IS the volume-down line
+ *   Power       -> KEY_ENTER  select
+ *
+ * button_kbd passes linux,code straight through to the input layer, so the
+ * code has to be one U-Boot's menu can consume: KEY_UP/KEY_DOWN become the
+ * ANSI sequences "\e[A"/"\e[B", which cli_ch_esc() converts to CTL_CH('p')
+ * and CTL_CH('n'); KEY_ENTER becomes '\r', which cli_ch_process() normalises
+ * to '\n'. bootmenu_conv_key() maps those to BKEY_UP/BKEY_DOWN/BKEY_SELECT.
+ * The volume codes map to nothing usable, which is why they are not used.
+ *
+ * An earlier comment here worried that button-qcom-pmic only advertises
+ * pm8916/pm8941/pm8998 while this board has a pm8550, so the read might be
+ * meaningless. It is not: the PON block is on pmk8550, not pm8550, and
+ * pmk8550.dtsi declares qcom,pmk8350-pon / -pwrkey / -resin -- all three are
+ * in the driver's table, with the GEN3 status bits (7 = pwrkey, 6 = resin).
+ */
 &pon_pwrkey {
+	/* Overrides pmk8550.dtsi's KEY_POWER. A stuck/held power key is the
+	 * benign failure here: it selects the highlighted entry, which starts
+	 * at entry 0, which is "Boot Linux" -- the same thing the countdown
+	 * would have done. */
+	linux,code = <KEY_ENTER>;
 	status = "okay";
 };
 
 &pon_resin {
-	/* Deliberately NOT KEY_ENTER for now. The menu exits well before its
-	 * timeout, which is what a stuck ENTER looks like: draw once, receive
-	 * a keypress, select entry 0, boot. Mapping this to an inert code
-	 * isolates "menu cannot draw" from "menu is being auto-selected".
-	 * button-qcom-pmic advertises pm8916/pm8941/pm8998 and this is a
-	 * pm8550, so its read may not be meaningful at all. */
-	linux,code = <KEY_VOLUMEDOWN>;
+	linux,code = <KEY_DOWN>;
 	status = "okay";
 };
 
