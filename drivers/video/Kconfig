@@ -1037,6 +1037,20 @@ config VIDEO_SHENG_MDSS
 	  (drivers/video/qualcomm/sheng_mdss_hw.zig) and requires the
 	  `zig` compiler on PATH to build.
 
+config VIDEO_SHENG_MDSS_DEBUG
+	bool "Instrument the sheng MDSS bring-up"
+	depends on VIDEO_SHENG_MDSS
+	help
+	  Record bring-up progress and hardware state for post-mortem
+	  inspection. The board has no reachable UART, so the driver
+	  reports through two side channels instead: a DRAM blackbox
+	  read back after boot, and sheng_* environment variables
+	  relayed into /chosen by ft_board_setup().
+
+	  This costs a full register dump, roughly a second of extra
+	  delay, and many MMIO reads of live display blocks on every
+	  boot. Say N unless you are debugging bring-up.
+
 config OSD
 	bool "Enable OSD support"
 	depends on DM

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0+
 
 obj-$(CONFIG_VIDEO_SHENG_MDSS) += sheng_mdss.o sheng_mdss_hw.o
+obj-$(CONFIG_VIDEO_SHENG_MDSS_DEBUG) += sheng_mdss_debug.o
 
 ZIG ?= zig
 ZIG_TARGET := aarch64-freestanding-none

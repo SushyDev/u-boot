@@ -26,6 +26,9 @@
 #include <linux/errno.h>
 #include <linux/kconfig.h>
 
+#include "sheng_mdss_debug.h"
+#include "sheng_mdss_regs.h"
+
 DECLARE_GLOBAL_DATA_PTR;
 
 /*
@@ -73,91 +76,6 @@ DECLARE_GLOBAL_DATA_PTR;
  * <0xd00>. qcom,tcs-config = <ACTIVE_TCS 3>, <SLEEP_TCS 2>,
  * <WAKE_TCS 2>, <CONTROL_TCS 0> -- ACTIVE_TCS is listed first so it
  * occupies global TCS indices 0..2. */
-/*
- * Log buffer: same idea as the status relay further down, but for
- * arbitrary (tag, value) pairs instead of one fixed slot per stage --
- * lets us record actual register readback values (cmd-db lookups,
- * RSC_DRV_ID, a raw pre-write DPU register read, etc.) and inspect
- * them after boot via /proc/device-tree/chosen/sheng,mdss-log, same
- * relay mechanism via ft_board_setup() in board.c. Layout: a u32
- * entry count at offset 0, followed by up to SHENG_MDSS_LOG_MAX
- * (tag:u32, value:u32) pairs. Placed well clear of the status slots
- * (which end at +0x3020+4=0x3024) and the uclass-get-device-ret slot.
- */
-#define SHENG_MDSS_LOG_ADDR		(CONFIG_PRE_CON_BUF_ADDR + 0x3100)
-#define SHENG_MDSS_LOG_MAX		64
-
-enum {
-	SHENG_LOG_RSC_DRV_ID,
-	SHENG_LOG_CMDDB_MMCX_ADDR,
-	SHENG_LOG_CMDDB_MM0_ADDR,
-	SHENG_LOG_MMCX_TCS_ID,
-	SHENG_LOG_MMCX_CORNER,
-	SHENG_LOG_BCM_TCS_ID,
-	SHENG_LOG_GCC_HF_AXI_READBACK,
-	SHENG_LOG_DPU_PRE_WRITE_READ,
-	SHENG_LOG_DPU_PRE_WRITE_READ_RET,
-	SHENG_LOG_MDP_RCG_CFG_READBACK,
-	SHENG_LOG_MMCX_LEVEL_PICKED,
-	SHENG_LOG_WRAPPER_READ,
-	SHENG_LOG_WRAPPER_READ_RET,
-	SHENG_LOG_DPU_SINGLE_WRITE_RET,
-	SHENG_LOG_DPU_SINGLE_WRITE_READBACK,
-	SHENG_LOG_PLAT_BASE,
-	SHENG_LOG_GD_VIDEO_TOP,
-	SHENG_LOG_GD_VIDEO_BOTTOM,
-	SHENG_LOG_WRAPPER_WRITE_RET,
-	SHENG_LOG_WRAPPER_WRITE_READBACK,
-};
-
-/*
- * D-cache is on for this board (CONFIG_SYS_DCACHE_OFF is not set), so a
- * plain `volatile u32 *` store into this DRAM-backed breadcrumb region
- * is just a normal cacheable write -- it can sit dirty in a cache line
- * indefinitely. If the CPU hard-hangs on the very next instruction (the
- * DPU AHB bus lockup this whole log/status mechanism exists to survive),
- * that dirty line never reaches physical DRAM and a subsequent warm-
- * reboot memory scrape reads back zeros/stale data instead of whatever
- * was actually written -- confirmed empirically: a scrape after exactly
- * this scenario read back all zeros. Every breadcrumb write must be
- * immediately pushed to the point of coherency (flush_dcache_range(),
- * arch/arm/lib/cache-pl310.c's DSB-backed implementation) and followed
- * by an explicit `dsb sy` so the write is guaranteed physically complete
- * in DRAM before control ever returns to code that might touch the DPU.
- */
-static void sheng_mdss_breadcrumb_flush(uintptr_t addr, size_t len)
-{
-	flush_dcache_range(addr, addr + len);
-	dsb();
-}
-
-static void sheng_mdss_log_reset(void)
-{
-	volatile u32 *count = (volatile u32 *)(uintptr_t)SHENG_MDSS_LOG_ADDR;
-
-	if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
-		*count = 0;
-		sheng_mdss_breadcrumb_flush(SHENG_MDSS_LOG_ADDR, sizeof(*count));
-	}
-}
-
-static void sheng_mdss_log(u32 tag, u32 value)
-{
-	volatile u32 *count = (volatile u32 *)(uintptr_t)SHENG_MDSS_LOG_ADDR;
-	volatile u32 *entries = (volatile u32 *)(uintptr_t)(SHENG_MDSS_LOG_ADDR + 4);
-
-	if (!IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
-		return;
-	if (*count >= SHENG_MDSS_LOG_MAX)
-		return;
-
-	entries[*count * 2] = tag;
-	entries[*count * 2 + 1] = value;
-	(*count)++;
-	sheng_mdss_breadcrumb_flush(SHENG_MDSS_LOG_ADDR,
-				     4 + (*count) * 8);
-}
-
 #define APPS_RSC_DRV2_BASE	0x17a20000
 #define APPS_RSC_TCS_OFFSET	0xd00
 #define APPS_RSC_ACTIVE_TCS_COUNT	3
@@ -249,8 +167,8 @@ static int rsc_send_active_write(u32 resource_addr, u32 data)
 	unsigned int i;
 
 	rsc_id = readl(rsc_base);
-	sheng_mdss_log(SHENG_LOG_RSC_DRV_ID, rsc_id);
-	env_set_hex("sheng_rsc_id", (unsigned long)rsc_id);
+	SHENG_DBG_LOG(SHENG_LOG_RSC_DRV_ID, rsc_id);
+	SHENG_DBG_ENV("sheng_rsc_id", (unsigned long)rsc_id);
 	major = (rsc_id >> 16) & 0xff;
 	regs = (major == 3) ? &rsc_regs_v3_0 : &rsc_regs_v2_7;
 
@@ -270,7 +188,7 @@ static int rsc_send_active_write(u32 resource_addr, u32 data)
 	 * anyway (all-zero bitmap -> find_next_zero_bit returns the first
 	 * one). */
 	tcs_id = APPS_RSC_ACTIVE_TCS_FIRST;
-	sheng_mdss_log(SHENG_LOG_MMCX_TCS_ID, (u32)tcs_id);
+	SHENG_DBG_LOG(SHENG_LOG_MMCX_TCS_ID, (u32)tcs_id);
 
 	cmd_msgid = CMD_MSGID_BASE | CMD_MSGID_RESP_REQ | CMD_MSGID_WRITE;
 	writel(cmd_msgid, rsc_cmd_reg(tcs_base, regs, regs->cmd_msgid, tcs_id));
@@ -347,19 +265,19 @@ static int __maybe_unused sheng_mdss_mmcx_power_on(void)
 	u32 corner;
 
 	addr = cmd_db_read_addr("mmcx.lvl");
-	sheng_mdss_log(SHENG_LOG_CMDDB_MMCX_ADDR, addr);
-	env_set_hex("sheng_mmcx_addr", (unsigned long)addr);
+	SHENG_DBG_LOG(SHENG_LOG_CMDDB_MMCX_ADDR, addr);
+	SHENG_DBG_ENV("sheng_mmcx_addr", (unsigned long)addr);
 	if (!addr)
 		return -ENODEV;
 
 	levels = cmd_db_read_aux_data("mmcx.lvl", &len);
 	if (IS_ERR(levels)) {
-		env_set_hex("sheng_mmcx_levels_err", (unsigned long)PTR_ERR(levels));
+		SHENG_DBG_ENV("sheng_mmcx_levels_err", (unsigned long)PTR_ERR(levels));
 		return PTR_ERR(levels);
 	}
 
 	count = len >> 1;
-	env_set_hex("sheng_mmcx_count", (unsigned long)count);
+	SHENG_DBG_ENV("sheng_mmcx_count", (unsigned long)count);
 
 	/* Live dmesg capture (rpmhpd.dyndbg=+p) showed the real
 	 * rpmhpd_aggregate_corner() logic: `if (pd->state_synced) { use the
@@ -381,10 +299,10 @@ static int __maybe_unused sheng_mdss_mmcx_power_on(void)
 		if (levels[i] != 0)
 			corner = i;
 	}
-	sheng_mdss_log(SHENG_LOG_MMCX_CORNER, corner);
-	sheng_mdss_log(SHENG_LOG_MMCX_LEVEL_PICKED, corner < count ? levels[corner] : 0);
-	env_set_hex("sheng_mmcx_corner", (unsigned long)corner);
-	env_set_hex("sheng_mmcx_level", (unsigned long)(corner < count ? levels[corner] : 0));
+	SHENG_DBG_LOG(SHENG_LOG_MMCX_CORNER, corner);
+	SHENG_DBG_LOG(SHENG_LOG_MMCX_LEVEL_PICKED, corner < count ? levels[corner] : 0);
+	SHENG_DBG_ENV("sheng_mmcx_corner", (unsigned long)corner);
+	SHENG_DBG_ENV("sheng_mmcx_level", (unsigned long)(corner < count ? levels[corner] : 0));
 
 	return rsc_send_active_write(addr, corner);
 }
@@ -438,8 +356,6 @@ static int __maybe_unused sheng_mdss_mmcx_power_on(void)
  * gated consumer clock nobody else enables for us. Cheap, simple,
  * un-polled register set -- try this before any more RPMh/BCM work.
  */
-#define SM8550_GCC_BASE			0x00100000
-#define GCC_DISP_HF_AXI_CLK_CBCR_OFF		0x2700c
 
 static void sheng_mdss_gcc_disp_hf_axi_clk_enable(void)
 {
@@ -449,7 +365,7 @@ static void sheng_mdss_gcc_disp_hf_axi_clk_enable(void)
 	/* Sanity readback: confirms both that this write landed AND that
 	 * the GCC block itself is reachable (if this read also hung, we'd
 	 * never reach the log call after it). */
-	sheng_mdss_log(SHENG_LOG_GCC_HF_AXI_READBACK, *cbcr);
+	SHENG_DBG_LOG(SHENG_LOG_GCC_HF_AXI_READBACK, *cbcr);
 }
 
 /* Backlight enable, GPIO 128 (TLMM), active-high -- matches the
@@ -477,12 +393,6 @@ static void sheng_mdss_gcc_disp_hf_axi_clk_enable(void)
  * GPIO function), oe_bit=9 (output enable), out_bit=1 (in io_reg,
  * drive value once OE=1).
  */
-#define SM8550_TLMM_BASE		0x00f100000
-#define TLMM_GPIO_REG_SIZE		0x1000
-#define TLMM_BACKLIGHT_GPIO		128
-#define TLMM_MUX_FUNC_MASK		(0x7u << 2)
-#define TLMM_OE_BIT			(1u << 9)
-#define TLMM_OUT_BIT			(1u << 1)
 
 static void sheng_mdss_raw_gpio_set(unsigned int gpio, int high)
 {
@@ -528,25 +438,6 @@ static void __maybe_unused sheng_mdss_backlight_gpio_enable(void)
  * sending them -- no BTA/ACK is required for a plain DCS write, so a
  * completely unresponsive panel looks identical to a working one from
  * the DSI host's point of view. */
-#define TLMM_PANEL_AVDD_GPIO		30
-#define TLMM_PANEL_AVEE_GPIO		31
-#define TLMM_PANEL_RESET_GPIO		133
-
-extern void sheng_bb_init(void);
-extern void sheng_bb_mark(const char *name);
-extern void sheng_bb_val(const char *name, unsigned long long v);
-extern void sheng_bb_sval(const char *name, long long v);
-extern void sheng_bb_reg(const char *name, unsigned long base, unsigned long off);
-extern void sheng_bb_block(const char *name, unsigned long base,
-			    unsigned long start, unsigned long count);
-extern void sheng_bb_finish(void);
-
-#define BBM(n)			sheng_bb_mark(n)
-#define BBV(n, v)		sheng_bb_val((n), (unsigned long long)(v))
-#define BBS(n, v)		sheng_bb_sval((n), (long long)(v))
-#define BBR(n, b, o)		sheng_bb_reg((n), (unsigned long)(b), (unsigned long)(o))
-#define BBB(n, b, s, c)		sheng_bb_block((n), (unsigned long)(b), \
-					       (unsigned long)(s), (unsigned long)(c))
 
 extern int sheng_ktz8866_set_bias(int enable);
 
@@ -601,7 +492,7 @@ static void sheng_mdss_panel_power_and_reset(void)
 		    (((unsigned long long)(*avdd_io & 0xffff)) << 32) |
 		    (((unsigned long long)(*avee_ctl & 0xffff)) << 16) |
 		    ((unsigned long long)(*avee_io & 0xffff)));
-		env_set_hex("sheng_mdss_biasgpio",
+		SHENG_DBG_ENV("sheng_mdss_biasgpio",
 			    (((unsigned long)(*avdd_ctl & 0xffff)) << 48) |
 			    (((unsigned long)(*avdd_io & 0xffff)) << 32) |
 			    (((unsigned long)(*avee_ctl & 0xffff)) << 16) |
@@ -665,7 +556,7 @@ static void sheng_mdss_panel_power_and_reset(void)
 		 * and the panel is NEVER physically reset -- which would
 		 * explain the SHENG_NOINIT result (ret=-61) exactly. */
 		BBV("rstpulse(a1,d1,a2,d2 expect 0303)", pulse);
-		env_set_hex("sheng_mdss_rstpulse", pulse);
+		SHENG_DBG_ENV("sheng_mdss_rstpulse", pulse);
 	}
 
 	/* Read the reset/bias pins back (SPEC.md task #5 log). Every
@@ -691,7 +582,7 @@ static void sheng_mdss_panel_power_and_reset(void)
 			(SM8550_TLMM_BASE + 0x4 + TLMM_GPIO_REG_SIZE * TLMM_PANEL_RESET_GPIO);
 		BBV("rstgpio(CFG<<32|IN_OUT)", (((unsigned long long)*rst_ctl) << 32) |
 		     (unsigned long long)*rst_io);
-		env_set_hex("sheng_mdss_rstgpio",
+		SHENG_DBG_ENV("sheng_mdss_rstgpio",
 			    (((unsigned long)*rst_ctl) << 32) | (unsigned long)*rst_io);
 	}
 }
@@ -702,7 +593,7 @@ static int sheng_mdss_bcm_vote(const char *bcm_name)
 	u32 data;
 
 	addr = cmd_db_read_addr(bcm_name);
-	sheng_mdss_log(SHENG_LOG_CMDDB_MM0_ADDR, addr);
+	SHENG_DBG_LOG(SHENG_LOG_CMDDB_MM0_ADDR, addr);
 	if (!addr)
 		return -ENODEV;
 
@@ -814,51 +705,6 @@ static int sheng_mdss_regulator_vote(const char *rsc_name, u32 millivolts)
 	return rsc_send_active_write(addr + 0x4 /* RPMH_REGULATOR_REG_ENABLE */, 1);
 }
 
-/*
- * Status relay: this board has no working UART/console access during
- * U-Boot's own boot stage, so there's no way to see log_debug() output
- * from a probe failure. Instead, each stage's return code is written
- * to a fixed physical address (inside the same CONFIG_PRE_CON_BUF_ADDR
- * region already used/verified safe by the platform's own pre-console
- * buffering) that arch/arm/mach-snapdragon/board.c's ft_board_setup()
- * relays into a /chosen property on whichever boot actually reaches
- * Linux -- readable via /proc/device-tree/chosen/sheng,mdss-status
- * with no /dev/mem restrictions. 5 slots, one per stage below;
- * SHENG_MDSS_STATUS_NOT_REACHED marks a stage that never ran.
- */
-#define SHENG_MDSS_STATUS_ADDR		(CONFIG_PRE_CON_BUF_ADDR + 0x3000)
-#define SHENG_MDSS_STATUS_NOT_REACHED	0x7fffffff
-
-enum {
-	SHENG_MDSS_STATUS_MDSS_RESET,
-	SHENG_MDSS_STATUS_BCM_MM0,
-	SHENG_MDSS_STATUS_MMCX,
-	SHENG_MDSS_STATUS_GDSC,
-	SHENG_MDSS_STATUS_DISPCC,
-	SHENG_MDSS_STATUS_DSI0_PHY,
-	SHENG_MDSS_STATUS_DSI1_PHY,
-	SHENG_MDSS_STATUS_DSI_PANEL,
-	SHENG_MDSS_STATUS_DPU,
-	SHENG_MDSS_STATUS_COUNT,
-};
-
-static void sheng_mdss_status_set(unsigned int stage, int ret)
-{
-	volatile int *slots = (volatile int *)(uintptr_t)SHENG_MDSS_STATUS_ADDR;
-
-	if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
-		slots[stage] = ret;
-		sheng_mdss_breadcrumb_flush(SHENG_MDSS_STATUS_ADDR + stage * sizeof(*slots),
-					     sizeof(*slots));
-	}
-}
-
-#define SM8550_MDSS_WRAPPER_BASE	0x0ae00000
-/* Scratch DRAM for sheng_mdss_capture_state(), clear of the pre-console
- * buffer regions already in use at CONFIG_PRE_CON_BUF_ADDR + 0x3000.. */
-#define SHENG_MDSS_CAPTURE_ADDR		0x82000000
-#define SM8550_MDSS_BASE		0x0ae00000
-#define SM8550_MDSS_DPU_BASE		0x0ae01000
 
 /* ROOT CAUSE FOUND (SPEC.md task #5 log): dsi_host.c's dsi_get_version()
  * comment, verbatim: "From DSI6G(v3), addition of a 6G_HW_VERSION
@@ -894,12 +740,6 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
  * silence all session; the DPU/PHY/DISPCC/GDSC/regulator paths are
  * unaffected (different register blocks, no such HW_VERSION insertion
  * documented for those). */
-#define DSI_6G_REG_SHIFT		4
-#define SM8550_MDSS_DSI0_BASE		(0x0ae94000 + DSI_6G_REG_SHIFT)
-#define SM8550_MDSS_DSI0_PHY_BASE	0x0ae95000
-#define SM8550_MDSS_DSI1_PHY_BASE	0x0ae97000
-#define SM8550_MDSS_DSI1_BASE		(0x0ae96000 + DSI_6G_REG_SHIFT)
-#define SM8550_DISPCC_BASE		0x0af00000
 
 /* ROOT CAUSE FOUND (SPEC.md task #5 log): 0xa0100000/0xa0200000 (the
  * old addresses here) sit squarely inside adspslpi_mem, the Audio DSP
@@ -975,17 +815,7 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
  *     packet content or framing, not in addressing.
  * Revert to 0x8bb500000 if this shows nothing; see the note above for why
  * that address mirrors Linux. */
-#define SHENG_MDSS_DSI_DMA_SCRATCH	0xa3100000
 
-/* 24.8MB (3048*2032*4 XRGB8888), starting 1MB above
- * SHENG_MDSS_DSI_DMA_SCRATCH, ending ~0xa4b10000 -- comfortably within
- * the same free System RAM span, well clear of the next reserved
- * region (0xccd00000, rmtfs_mem). See SHENG_MDSS_DSI_DMA_SCRATCH's
- * comment for why this moved from its old 0xa0200000. */
-/* ALIGN(3048, 32) * 4 bytes -- the stride sheng_mdss_dpu_start()
- * programs into SSPP_SRC_YSTRIDE0. */
-#define SHENG_MDSS_FB_STRIDE		12288
-#define SHENG_MDSS_FB_ADDR		0xa3200000
 
 /* 144Hz mode, xiaomi,sheng-nt36532e panel. Confirmed against the live
  * DPU crtc-0 modeline AND panel-novatek-nt36532e.c's sheng_tianma_modes[]
@@ -1065,7 +895,6 @@ extern void sheng_mdss_smmu_setup(void);
 /* Blackbox decls/macros MOVED UP -- see above the panel power/reset
  * helper, which now logs GPIO readbacks and needs them in scope. */
 
-static void sheng_mdss_final_dump(void);
 extern long long sheng_mdss_dispcc_audit(unsigned long dispcc_base);
 extern long long sheng_mdss_phy_state(unsigned long phy0_base, unsigned long phy1_base);
 extern long long sheng_mdss_phy_cmn_sweep(unsigned long phy_base);
@@ -1194,18 +1023,18 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 */
 	ret = sheng_mdss_gdsc_enable(SM8550_DISPCC_BASE);
 	BBS("abl_gdsc_enable_ret", ret);
-	env_set_hex("sheng_mdss_abl_gdsc", (unsigned long)ret);
+	SHENG_DBG_ENV("sheng_mdss_abl_gdsc", (unsigned long)ret);
 	if (!ret) {
 		ret = sheng_mdss_dispcc_ahb_only(SM8550_DISPCC_BASE);
 		if (!ret) {
-			env_set_hex("sheng_mdss_abl1",
+			SHENG_DBG_ENV("sheng_mdss_abl1",
 				    (unsigned long)sheng_mdss_abl_state1(
 					    SM8550_MDSS_DSI0_BASE));
-			env_set_hex("sheng_mdss_abl2",
+			SHENG_DBG_ENV("sheng_mdss_abl2",
 				    (unsigned long)sheng_mdss_abl_state2(
 					    SM8550_MDSS_DSI0_BASE,
 					    SM8550_MDSS_DSI1_BASE));
-			env_set_hex("sheng_mdss_abl3",
+			SHENG_DBG_ENV("sheng_mdss_abl3",
 				    (unsigned long)sheng_mdss_abl_state3(
 					    SM8550_MDSS_DSI0_PHY_BASE,
 					    SM8550_MDSS_DSI1_PHY_BASE));
@@ -1298,7 +1127,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 		volatile u32 *n_io = (volatile u32 *)(uintptr_t)
 			(SM8550_TLMM_BASE + 0x4 + TLMM_GPIO_REG_SIZE * TLMM_PANEL_AVEE_GPIO);
 
-		env_set_hex("sheng_mdss_ablgpio",
+		SHENG_DBG_ENV("sheng_mdss_ablgpio",
 			    (((unsigned long)(*r_ctl & 0xffff)) << 48) |
 			    (((unsigned long)(*r_io & 0xffff)) << 32) |
 			    (((unsigned long)(*p_io & 0xffff)) << 16) |
@@ -1306,7 +1135,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	}
 
 	priv->mdss_base = dev_read_addr(dev);
-	sheng_bb_init();
+	SHENG_DBG_START();
 	BBM("probe entry");
 	BBV("mdss_base", priv->mdss_base);
 	if (priv->mdss_base == FDT_ADDR_T_NONE)
@@ -1352,9 +1181,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * because we half-configured the hardware. Touch nothing and Linux
 	 * gets the pristine ABL state that debian-sheng's drm/msm booted from
 	 * successfully before sheng_mdss.c existed at all. */
-	for (unsigned int i = 0; i < SHENG_MDSS_STATUS_COUNT; i++)
-		sheng_mdss_status_set(i, SHENG_MDSS_STATUS_NOT_REACHED);
-
 	/* COLD-START RESET PASS (SPEC.md task #5 log): never attempted
 	 * before this pass -- every prior version of this driver assumed a
 	 * clean power-on-reset state and built additively on top of
@@ -1404,7 +1230,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 */
 	sheng_mdss_core_reset(SM8550_DISPCC_BASE);
 	BBM("mdss core reset pulsed");
-	sheng_mdss_status_set(SHENG_MDSS_STATUS_MDSS_RESET, 0);
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_MDSS_RESET, 0);
 
 	/* BISECTION: reset-toggle + GDSC confirmed reaching Linux. Next:
 	 * add DISPCC (PLL0 + AHB/MDP clocks) back and stop right after it,
@@ -1412,7 +1238,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 */
 	ret = sheng_mdss_gdsc_enable(SM8550_DISPCC_BASE);
 	sheng_mdss_phy144_mark(0, SM8550_MDSS_DSI0_PHY_BASE);
-	sheng_mdss_status_set(SHENG_MDSS_STATUS_GDSC, ret);
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_GDSC, ret);
 	if (ret) {
 		log_debug("sheng_mdss: GDSC bring-up failed (%d)\n", ret);
 		return ret;
@@ -1441,7 +1267,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * real, previously-untested gap in the actual DMA bandwidth path,
 	 * not another register-content check. */
 	ret = sheng_mdss_bcm_vote("MM0");
-	env_set_hex("sheng_mdss_bcm_mm0", (unsigned long)ret);
+	SHENG_DBG_ENV("sheng_mdss_bcm_mm0", (unsigned long)ret);
 
 	/* MMCX voting dead end (see git history/SPEC.md task #5): tried
 	 * both the computed NOM corner and the sync_state-clamped MAX
@@ -1498,12 +1324,12 @@ static int sheng_mdss_probe(struct udevice *dev)
 	BBS("dispcc_init_ret", ret);
 	BBB("DISPCC after init", SM8550_DISPCC_BASE, 0x000, 64);
 	sheng_mdss_phy144_mark(1, SM8550_MDSS_DSI0_PHY_BASE);
-	sheng_mdss_status_set(SHENG_MDSS_STATUS_DISPCC, ret);
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DISPCC, ret);
 	/* UBWC block config, immediately after the MDSS core reset inside
 	 * dispcc_init() wipes it -- see sheng_mdss_ubwc_init()'s comment.
 	 * Must precede any DSI/DPU programming, matching msm_mdss_enable(). */
 	sheng_mdss_ubwc_init(SM8550_MDSS_BASE);
-	env_set_hex("sheng_mdss_dispcc", (unsigned long)ret);
+	SHENG_DBG_ENV("sheng_mdss_dispcc", (unsigned long)ret);
 	if (ret)
 		return ret;
 
@@ -1515,11 +1341,10 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * (P_DISP_CC_PLL0_OUT_MAIN, bits [10:8]) and src_div=5 (2*3-1 for
 	 * /3, bits [4:0]) if our 514MHz MDP-clock programming actually took.
 	 */
-	sheng_mdss_log_reset();
 	{
 		volatile u32 *mdp_rcg_cfg =
 			(volatile u32 *)(uintptr_t)(SM8550_DISPCC_BASE + 0x80d8 + 0x4);
-		sheng_mdss_log(SHENG_LOG_MDP_RCG_CFG_READBACK, *mdp_rcg_cfg);
+		SHENG_DBG_LOG(SHENG_LOG_MDP_RCG_CFG_READBACK, *mdp_rcg_cfg);
 	}
 
 	/* Bisection resolved: MDP_CLK_CBCR's branch enable was the sole
@@ -1545,13 +1370,13 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * LDO1 on PMIC E = "ldoe1"; vreg_l3e_1p2 = LDO3 on PMIC E =
 	 * "ldoe3"; vreg_s3g_0p7 = SMPS3 on PMIC G = "smpg3". */
 	ret = sheng_mdss_regulator_vote("ldoe1", 880);
-	env_set_hex("sheng_mdss_vreg_l1e", (unsigned long)ret);
+	SHENG_DBG_ENV("sheng_mdss_vreg_l1e", (unsigned long)ret);
 	ret = sheng_mdss_regulator_vote("ldoe3", 1200);
-	env_set_hex("sheng_mdss_vreg_l3e", (unsigned long)ret);
+	SHENG_DBG_ENV("sheng_mdss_vreg_l3e", (unsigned long)ret);
 	ret = sheng_mdss_regulator_vote("smpg3", 600);
 	BBS("regulator_votes_ret", ret);
 	sheng_mdss_phy144_mark(2, SM8550_MDSS_DSI0_PHY_BASE);
-	env_set_hex("sheng_mdss_vreg_s3g", (unsigned long)ret);
+	SHENG_DBG_ENV("sheng_mdss_vreg_s3g", (unsigned long)ret);
 
 	/* Dual-DSI split-link panel: DSI0 is master (drives its own PLL),
 	 * DSI1 is slave (sources its bit clock from DSI0 over
@@ -1560,16 +1385,16 @@ static int sheng_mdss_probe(struct udevice *dev)
 	sheng_mdss_dsi_reset_both_phys(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE);
 	ret = sheng_mdss_dsi_phy_init(SM8550_MDSS_DSI0_PHY_BASE, true);
 	BBS("phy0_init_ret", ret);
-	sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI0_PHY, ret);
-	env_set_hex("sheng_mdss_dsi0_phy", (unsigned long)ret);
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI0_PHY, ret);
+	SHENG_DBG_ENV("sheng_mdss_dsi0_phy", (unsigned long)ret);
 	if (ret)
 		return ret;
 
 	ret = sheng_mdss_dsi_phy_init(SM8550_MDSS_DSI1_PHY_BASE, false);
 	BBS("phy1_init_ret", ret);
 	sheng_mdss_phy144_mark(3, SM8550_MDSS_DSI0_PHY_BASE);
-	sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI1_PHY, ret);
-	env_set_hex("sheng_mdss_dsi1_phy", (unsigned long)ret);
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI1_PHY, ret);
+	SHENG_DBG_ENV("sheng_mdss_dsi1_phy", (unsigned long)ret);
 	if (ret)
 		return ret;
 
@@ -1581,7 +1406,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * writel() hook in dsi_phy_7nm.c. */
 	ret = sheng_mdss_dsi_phy_start_dual(SM8550_MDSS_DSI0_PHY_BASE,
 					     SM8550_MDSS_DSI1_PHY_BASE);
-	env_set_hex("sheng_mdss_phy_start", (unsigned long)ret);
+	SHENG_DBG_ENV("sheng_mdss_phy_start", (unsigned long)ret);
 	BBS("phy_start_dual_ret", ret);
 	BBR("PHY0 STATUS", SM8550_MDSS_DSI0_PHY_BASE, 0x140);
 	BBR("PHY1 STATUS", SM8550_MDSS_DSI1_PHY_BASE, 0x140);
@@ -1601,7 +1426,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * own PLL output, not DISPCC's internal PLL0. */
 	ret = sheng_mdss_dispcc_dsi_clks_init(SM8550_DISPCC_BASE);
 	sheng_mdss_phy144_mark(5, SM8550_MDSS_DSI0_PHY_BASE);
-	env_set_hex("sheng_mdss_dsi_clks", (unsigned long)ret);
+	SHENG_DBG_ENV("sheng_mdss_dsi_clks", (unsigned long)ret);
 	if (ret)
 		return ret;
 
@@ -1823,7 +1648,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 		 * bytes. Computed on every boot since it was added and never
 		 * once looked at. */
 		BBS("dmabuf readback @scratch", sheng_mdss_dmabuf_diag());
-		env_set_hex("sheng_mdss_preread", pre);
+		SHENG_DBG_ENV("sheng_mdss_preread", pre);
 	}
 
 	/* Backlight now confirmed working in U-Boot itself (order flip +
@@ -1920,12 +1745,12 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * at the end of probe, so a clock that starts late is distinguishable
 	 * from one that never runs.
 	 * high32 = pre-command, low32 = end of probe. */
-	env_set_hex("sheng_mdss_clkstat_pre",
+	SHENG_DBG_ENV("sheng_mdss_clkstat_pre",
 		    (unsigned long)*(volatile u32 *)(uintptr_t)(SM8550_MDSS_DSI0_BASE + 0x11c));
 
-	env_set_hex("sheng_mdss_preaud",
+	SHENG_DBG_ENV("sheng_mdss_preaud",
 		    (unsigned long)sheng_mdss_dsi_audit(SM8550_MDSS_DSI0_BASE));
-	env_set_hex("sheng_mdss_preaud1",
+	SHENG_DBG_ENV("sheng_mdss_preaud1",
 		    (unsigned long)sheng_mdss_dsi1_audit(SM8550_MDSS_DSI1_BASE));
 
 	ret = sheng_mdss_dsi_panel_init(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
@@ -1938,8 +1763,8 @@ static int sheng_mdss_probe(struct udevice *dev)
 	BBR("DSI0 ACK_ERR", SM8550_MDSS_DSI0_BASE, 0x068);
 	BBR("DSI0 TIMEOUT", SM8550_MDSS_DSI0_BASE, 0x0bc);
 	sheng_mdss_phy144_mark(7, SM8550_MDSS_DSI0_PHY_BASE);
-	sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI_PANEL, ret);
-	env_set_hex("sheng_mdss_panel", (unsigned long)ret);
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI_PANEL, ret);
+	SHENG_DBG_ENV("sheng_mdss_panel", (unsigned long)ret);
 	/* Single-host DCS read: the one test that would positively prove
 	 * two-way communication with the panel. See its comment. */
 	/* DISABLED (b106) for the same reason as the pre-init read above: the
@@ -1950,23 +1775,23 @@ static int sheng_mdss_probe(struct udevice *dev)
 	BBM("DCS read attempt SKIPPED (b106: BTA wedges DLN0)");
 	BBR("DSI0 RDBK_DATA0", SM8550_MDSS_DSI0_BASE, 0x068);
 	BBR("DSI0 RDBK_DATA_CTRL", SM8550_MDSS_DSI0_BASE, 0x1d0);
-	env_set_hex("sheng_mdss_trigprobe",
+	SHENG_DBG_ENV("sheng_mdss_trigprobe",
 		    (unsigned long)sheng_mdss_dsi_trigger_probe());
-	env_set_hex("sheng_mdss_retries",
+	SHENG_DBG_ENV("sheng_mdss_retries",
 		    (unsigned long)sheng_mdss_dsi_retry_count());
-	env_set_hex("sheng_mdss_status0_pre",
+	SHENG_DBG_ENV("sheng_mdss_status0_pre",
 		    (unsigned long)sheng_mdss_dsi_status0_before_first_cmd());
-	env_set_hex("sheng_mdss_timeout_diag", (unsigned long)sheng_mdss_dsi_timeout_diag());
-	env_set_hex("sheng_mdss_snap1", (unsigned long)sheng_mdss_dsi_snapshot_1());
-	env_set_hex("sheng_mdss_snap2", (unsigned long)sheng_mdss_dsi_snapshot_2());
-	env_set_hex("sheng_mdss_snap3", (unsigned long)sheng_mdss_dsi_snapshot_3());
-	env_set_hex("sheng_mdss_snap4", (unsigned long)sheng_mdss_dsi_snapshot_4());
-	env_set_hex("sheng_mdss_smmu_diag1", (unsigned long)sheng_mdss_smmu_diag1());
-	env_set_hex("sheng_mdss_smmu_diag2", (unsigned long)sheng_mdss_smmu_diag2());
-	env_set_hex("sheng_mdss_smmu_diag3", (unsigned long)sheng_mdss_smmu_diag3());
-	env_set_hex("sheng_mdss_iova_diag1", (unsigned long)sheng_mdss_iova_diag1());
-	env_set_hex("sheng_mdss_iova_diag2", (unsigned long)sheng_mdss_iova_diag2());
-	env_set_hex("sheng_mdss_dmabuf", (unsigned long)sheng_mdss_dmabuf_diag());
+	SHENG_DBG_ENV("sheng_mdss_timeout_diag", (unsigned long)sheng_mdss_dsi_timeout_diag());
+	SHENG_DBG_ENV("sheng_mdss_snap1", (unsigned long)sheng_mdss_dsi_snapshot_1());
+	SHENG_DBG_ENV("sheng_mdss_snap2", (unsigned long)sheng_mdss_dsi_snapshot_2());
+	SHENG_DBG_ENV("sheng_mdss_snap3", (unsigned long)sheng_mdss_dsi_snapshot_3());
+	SHENG_DBG_ENV("sheng_mdss_snap4", (unsigned long)sheng_mdss_dsi_snapshot_4());
+	SHENG_DBG_ENV("sheng_mdss_smmu_diag1", (unsigned long)sheng_mdss_smmu_diag1());
+	SHENG_DBG_ENV("sheng_mdss_smmu_diag2", (unsigned long)sheng_mdss_smmu_diag2());
+	SHENG_DBG_ENV("sheng_mdss_smmu_diag3", (unsigned long)sheng_mdss_smmu_diag3());
+	SHENG_DBG_ENV("sheng_mdss_iova_diag1", (unsigned long)sheng_mdss_iova_diag1());
+	SHENG_DBG_ENV("sheng_mdss_iova_diag2", (unsigned long)sheng_mdss_iova_diag2());
+	SHENG_DBG_ENV("sheng_mdss_dmabuf", (unsigned long)sheng_mdss_dmabuf_diag());
 	/* Does U-Boot's own MMU even map the HIGH DRAM bank the scratch
 	 * buffer was moved into this session? build_mem_map() maps only
 	 * what the previous bootloader handed over in gd->dram[]; a bank
@@ -1988,7 +1813,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 				break;
 			}
 		}
-		env_set_hex("sheng_mdss_scratch_bank", found);
+		SHENG_DBG_ENV("sheng_mdss_scratch_bank", found);
 		/* Same check for the FRAMEBUFFER, which was never verified --
 		 * only the DSI scratch buffer was. SSPP_SRC0_ADDR is a 32-bit
 		 * register and we hand it raw physical 0xa3200000; if that
@@ -2012,12 +1837,12 @@ static int sheng_mdss_probe(struct udevice *dev)
 					break;
 				}
 			}
-			env_set_hex("sheng_mdss_fb_bank", fb_found);
-			env_set_hex("sheng_mdss_fb_bank_start", fb_start);
-			env_set_hex("sheng_mdss_fb_bank_size", fb_size);
+			SHENG_DBG_ENV("sheng_mdss_fb_bank", fb_found);
+			SHENG_DBG_ENV("sheng_mdss_fb_bank_start", fb_start);
+			SHENG_DBG_ENV("sheng_mdss_fb_bank_size", fb_size);
 		}
-		env_set_hex("sheng_mdss_scratch_bank_start", fstart);
-		env_set_hex("sheng_mdss_scratch_bank_size", fsize);
+		SHENG_DBG_ENV("sheng_mdss_scratch_bank_start", fstart);
+		SHENG_DBG_ENV("sheng_mdss_scratch_bank_size", fsize);
 	}
 	if (ret)
 		return ret;
@@ -2056,14 +1881,14 @@ static int sheng_mdss_probe(struct udevice *dev)
 									SHENG_MDSS_DSI_DMA_SCRATCH);
 		long long err_status = sheng_mdss_dsi_read_error_status(SM8550_MDSS_DSI0_BASE);
 		long long ctrl_state = sheng_mdss_dsi_read_ctrl_state(SM8550_MDSS_DSI0_BASE);
-		env_set_hex("sheng_mdss_power_mode", (unsigned long)power_mode);
-		env_set_hex("sheng_mdss_err_status", (unsigned long)err_status);
-		env_set_hex("sheng_mdss_ctrl_state", (unsigned long)ctrl_state);
-		env_set_hex("sheng_mdss_ctrl_selfcheck",
+		SHENG_DBG_ENV("sheng_mdss_power_mode", (unsigned long)power_mode);
+		SHENG_DBG_ENV("sheng_mdss_err_status", (unsigned long)err_status);
+		SHENG_DBG_ENV("sheng_mdss_ctrl_state", (unsigned long)ctrl_state);
+		SHENG_DBG_ENV("sheng_mdss_ctrl_selfcheck",
 			    (unsigned long)sheng_mdss_dsi_ctrl_writeback_selfcheck(SM8550_MDSS_DSI0_BASE));
-		env_set_hex("sheng_mdss_block_selfcheck",
+		SHENG_DBG_ENV("sheng_mdss_block_selfcheck",
 			    (unsigned long)sheng_mdss_dsi_block_writeback_selfcheck(SM8550_MDSS_DSI0_BASE));
-		env_set_hex("sheng_mdss_earliest_selfcheck",
+		SHENG_DBG_ENV("sheng_mdss_earliest_selfcheck",
 			    (unsigned long)sheng_mdss_dsi_earliest_ctrl_selfcheck());
 	}
 
@@ -2155,7 +1980,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 		 * up, leaving bootargs unset and Linux with no root=. The
 		 * readback is safe and is restored below, because whether the
 		 * fill actually lands in memory has still never been proven. */
-		env_set_hex("sheng_mdss_fb_readback",
+		SHENG_DBG_ENV("sheng_mdss_fb_readback",
 			    (((unsigned long)fb[0]) << 32) |
 			    (unsigned long)fb[fb_words - 1]);
 	}
@@ -2186,7 +2011,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 				    142, 92, 4,
 				    26, 138, 2,
 				    true); /* DSC ruled out as the blocker -- see comment above */
-	env_set_hex("sheng_mdss_dpu_start", (unsigned long)ret);
+	SHENG_DBG_ENV("sheng_mdss_dpu_start", (unsigned long)ret);
 	BBM("dpu_start done");
 	BBR("DSI0 STATUS0 post-dpu", SM8550_MDSS_DSI0_BASE, 0x004);
 	BBR("DSI0 LANE_STATUS post-dpu", SM8550_MDSS_DSI0_BASE, 0x0a4);
@@ -2233,188 +2058,10 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 *
 	 */
 
-	/* Frame/line counters (dpu_hw_intf.c: INTF_FRAME_COUNT=0xAC,
-	 * INTF_LINE_COUNT=0xB0, relative to each intf_N_base) increment
-	 * purely from real active video timing -- independent of whether
-	 * backlight/panel actually show anything visibly. Read twice with
-	 * a delay: if they're incrementing, video is genuinely streaming. */
-	{
-		volatile u32 *intf1_frame = (volatile u32 *)(uintptr_t)
-			(SM8550_MDSS_DPU_BASE + 0x35000 + 0xac);
-		volatile u32 *intf1_line = (volatile u32 *)(uintptr_t)
-			(SM8550_MDSS_DPU_BASE + 0x35000 + 0xb0);
-
-		u32 frame_a = *intf1_frame;
-
-		env_set_hex("sheng_intf1_frame_a", (unsigned long)frame_a);
-		env_set_hex("sheng_intf1_line_a", (unsigned long)*intf1_line);
-		mdelay(500);
-		env_set_hex("sheng_intf1_frame_b", (unsigned long)*intf1_frame);
-		env_set_hex("sheng_intf1_line_b", (unsigned long)*intf1_line);
-
-		/* PLL VCO-BAND CHECK (SPEC.md task #5 log). Research suggested
-		 * the PHY PLL could assert "locked" while having converged on
-		 * the wrong VCO band -- every static register would still match
-		 * Linux, but the emitted clock would be off-frequency and the
-		 * DDIC would silently discard the whole stream. The three
-		 * lane/PLL registers that differ in our sweep (0x6c0/0x6c4 and
-		 * one neighbour) cannot settle it: they read different values on
-		 * two consecutive reads of the same RENDERING Linux, so they are
-		 * dynamic status, not a comparable configuration.
-		 *
-		 * The output frequency itself is directly measurable, though.
-		 * INTF_FRAME_COUNT advances once per real active-video frame, so
-		 * frames observed across a known 500ms window IS the refresh
-		 * rate. Expect ~72 for this panel's 144Hz mode. A value near 72
-		 * means the pixel clock -- and therefore the PLL band, the
-		 * dividers and the whole clock tree -- is correct and this
-		 * hypothesis is dead. A wildly different count (half, double,
-		 * near zero) would be the first hard evidence of a clock fault.
-		 * Exported as a delta so a nonzero starting count cannot fake
-		 * a correct answer, which reading frame_b alone would allow. */
-		/* Sampled with the DPU streaming, matching the state Linux is
-		 * in when read via devmem -- see sheng_mdss_dsi_txpath_state(). */
-		sheng_mdss_gdsc_probe(SM8550_DISPCC_BASE, 2);
-		env_set_hex("sheng_mdss_gdscp",
-			    (unsigned long)sheng_mdss_gdsc_probe_result());
-	env_set_hex("sheng_mdss_txpath",
-			    (unsigned long)sheng_mdss_dsi_txpath_state(SM8550_MDSS_DSI0_BASE));
-		env_set_hex("sheng_mdss_lanact",
-			    (unsigned long)sheng_mdss_dsi_lane_activity(SM8550_MDSS_DSI0_BASE));
-		env_set_hex("sheng_mdss_txpath1",
-			    (unsigned long)sheng_mdss_dsi_txpath_state(SM8550_MDSS_DSI1_BASE));
-		env_set_hex("sheng_mdss_framedelta",
-			    (unsigned long)(*intf1_frame - frame_a));
-	}
-
-	/* Sampled AFTER the DPU has been streaming for 500ms, so any SSPP
-	 * pixel-fetch translation fault has had ~28 frames' worth of
-	 * chances to latch. See sheng_mdss_smmu_fault_diag()'s comment for
-	 * the bit decode -- this is what distinguishes "SSPP is starving
-	 * on an unmapped framebuffer" from "translation is fine, the black
-	 * screen is downstream in SSPP/LM/DSC/CTL config". */
-	env_set_hex("sheng_mdss_smmu_fault",
-		    (unsigned long)sheng_mdss_smmu_fault_diag());
-	env_set_hex("sheng_mdss_smmu_far",
-		    (unsigned long)sheng_mdss_smmu_fault_addr());
-	/* These two have been computed on every single boot since they were
-	 * added and then THROWN AWAY -- neither is on the bootcmd's sheng.*
-	 * list, and the cmdline is CBSIZE-capped so they cannot all fit.
-	 * The blackbox has no such cap. This is the direct test for "SSPP is
-	 * starving on an unmapped framebuffer": fault = [63:32] context-bank
-	 * FSR, [31:0] global GFSR; far = the faulting address. Both zero
-	 * after 500ms of streaming means translation is fine and the black
-	 * screen is downstream of the fetch. */
-	BBS("smmu_fault(FSR<<32|GFSR)", sheng_mdss_smmu_fault_diag());
-	BBS("smmu_far", sheng_mdss_smmu_fault_addr());
-	BBS("smmu_cbx|s2cr_before", sheng_mdss_smmu_diag2());
-	BBV("smmu_sctlr (b105: M bit must be 0)", sheng_mdss_smmu_sctlr());
-	BBV("smmu_s2cr_after", sheng_mdss_smmu_diag3());
-
-	/* Datapath readback, same 500ms-later moment -- see
-	 * sheng_mdss_dpu_readback1()'s comment for the decode. */
-	/* DECISIVE BISECT -- see sheng_mdss_dsi_tpg_enable()'s comment. The
-	 * DSI host generates video internally, bypassing the entire DPU.
-	 * Any visible change means the link reaches the panel; pure black
-	 * means nothing we transmit does. Remove once answered. */
-	sheng_mdss_dsi_tpg_enable(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE);
-
-	/* Whole-pipeline check against the live-hardware reference table --
-	 * see sheng_mdss_verify_pipeline()'s comment. 0 == every programmed
-	 * register matches working silicon. */
-	/* Whole-state capture, REDUCED range set after the full list
-	 * reproducibly killed the boot -- see capture_ranges' comment.
-	 * Scratch moved to 0x82000000 (clear of the pre-console buffer at
-	 * 0x81200000+0x4000 and below kernel_addr_r 0x83000000). */
-	/* DISABLED: writing the capture to DRAM reproducibly kills the boot
-	 * before backlight, even with the range list cut to blocks we read
-	 * every boot and the scratch moved clear of everything known. The
-	 * call site is late in probe and cannot precede backlight init, so
-	 * the mechanism is not understood -- replaced by the checksum-based
-	 * block audit below, which needs no DRAM writes at all. */
-	env_set_hex("sheng_mdss_wrap",
-		    (unsigned long)sheng_mdss_wrapper_audit(SM8550_MDSS_BASE));
-	env_set_hex("sheng_mdss_dsi1_audit",
-		    (unsigned long)sheng_mdss_dsi1_audit(SM8550_MDSS_DSI1_BASE));
-	env_set_hex("sheng_mdss_dsi_audit",
-		    (unsigned long)sheng_mdss_dsi_audit(SM8550_MDSS_DSI0_BASE));
-	/* PHY audit, both PHYs -- see sheng_mdss_phy_audit()'s comment. The
-	 * PHY had no automated verification at all until now. */
-	env_set_hex("sheng_mdss_dispcc_audit",
-		    (unsigned long)sheng_mdss_dispcc_audit(SM8550_DISPCC_BASE));
-	env_set_hex("sheng_mdss_vbif",
-		    (unsigned long)sheng_mdss_vbif_audit(0x0aeb0000));
-	env_set_hex("sheng_mdss_phystat",
-		    (unsigned long)sheng_mdss_phy_state(SM8550_MDSS_DSI0_PHY_BASE,
-							SM8550_MDSS_DSI1_PHY_BASE));
-	env_set_hex("sheng_mdss_clkstat_post",
-		    (((unsigned long)*(volatile u32 *)(uintptr_t)(SM8550_MDSS_DSI0_BASE + 0x11c)) << 32) |
-		    (unsigned long)*(volatile u32 *)(uintptr_t)(SM8550_MDSS_DSI1_BASE + 0x11c));
-	BBM("diag: dsi sweep");
-	env_set_hex("sheng_mdss_dsisweep",
-		    (unsigned long)sheng_mdss_dsi_sweep(SM8550_MDSS_DSI0_BASE));
-	BBM("diag: phy lanepll sweep");
-	env_set_hex("sheng_mdss_lpsweep",
-		    (unsigned long)sheng_mdss_phy_lanepll_sweep(SM8550_MDSS_DSI0_PHY_BASE));
-	BBM("diag: phy cmn sweep");
-	env_set_hex("sheng_mdss_cmnsweep",
-		    (unsigned long)sheng_mdss_phy_cmn_sweep(SM8550_MDSS_DSI0_PHY_BASE));
-	/* First sweep of the SLAVE PHY in this driver's history -- see
-	 * sheng_mdss_phy1_cmn_sweep()'s comment. */
-	BBM("diag: phy1 cmn sweep");
-	env_set_hex("sheng_mdss_phy1_sweep",
-		    (unsigned long)sheng_mdss_phy1_cmn_sweep(SM8550_MDSS_DSI1_PHY_BASE));
-	BBM("diag: phy1 lane sweep");
-	env_set_hex("sheng_mdss_phy1_lane",
-		    (unsigned long)sheng_mdss_phy1_lane_sweep(SM8550_MDSS_DSI1_PHY_BASE));
-	env_set_hex("sheng_mdss_phystatraw",
-		    (unsigned long)sheng_mdss_phy_status_raw(SM8550_MDSS_DSI0_PHY_BASE,
-							      SM8550_MDSS_DSI1_PHY_BASE));
-	env_set_hex("sheng_mdss_p144", (unsigned long)sheng_mdss_phy144_marks());
-	env_set_hex("sheng_mdss_phy0_audit",
-		    (unsigned long)sheng_mdss_phy_audit(SM8550_MDSS_DSI0_PHY_BASE, true));
-	env_set_hex("sheng_mdss_phy1_audit",
-		    (unsigned long)sheng_mdss_phy_audit(SM8550_MDSS_DSI1_PHY_BASE, false));
-	BBM("diag: verify");
-	env_set_hex("sheng_mdss_verify",
-		    (unsigned long)sheng_mdss_verify_pipeline(SM8550_MDSS_DPU_BASE,
-							     SM8550_MDSS_DSI0_BASE));
-	/* Settle before sampling the DSC encoder status (SPEC.md task #5
-	 * log). These are running counters: an early sample catches the
-	 * encoder mid-startup and reads like a stalled one. A previous
-	 * diagnostic happened to insert a 50ms delay here, and removing it
-	 * made a healthy encoder look broken -- so the delay is now
-	 * explicit and fixed, to keep readings comparable across builds. */
-	mdelay(50);
-	env_set_hex("sheng_mdss_dsc_st1",
-		    (unsigned long)sheng_mdss_dsc_status1(SM8550_MDSS_DPU_BASE));
-	env_set_hex("sheng_mdss_dsc_st2",
-		    (unsigned long)sheng_mdss_dsc_status2(SM8550_MDSS_DPU_BASE));
-	env_set_hex("sheng_mdss_dpu_rb1",
-		    (unsigned long)sheng_mdss_dpu_readback1(SM8550_MDSS_DPU_BASE));
-	env_set_hex("sheng_mdss_dpu_rb2",
-		    (unsigned long)sheng_mdss_dpu_readback2(SM8550_MDSS_DPU_BASE));
-	env_set_hex("sheng_mdss_dpu_rb3",
-		    (unsigned long)sheng_mdss_dpu_readback3(SM8550_MDSS_DPU_BASE));
-	env_set_hex("sheng_mdss_dpu_rb4",
-		    (unsigned long)sheng_mdss_dpu_readback4(SM8550_MDSS_DPU_BASE));
-	env_set_hex("sheng_mdss_dsi_vrb1",
-		    (unsigned long)sheng_mdss_dsi_video_readback1(SM8550_MDSS_DSI0_BASE));
-	/* Physical lane state + PHY errors, sampled while streaming -- see
-	 * sheng_mdss_lane_status()'s comment. Live: DSI0 0x00001F00 (lanes
-	 * driven), DSI1 0x00001F1F; PHY_ERR 0x00088888 on both. */
-	env_set_hex("sheng_mdss_lanes",
-		    (unsigned long)sheng_mdss_lane_status(SM8550_MDSS_DSI0_BASE,
-							  SM8550_MDSS_DSI1_BASE));
-	BBM("diag: phy err");
-	env_set_hex("sheng_mdss_phyerr",
-		    (unsigned long)sheng_mdss_phy_err_both(SM8550_MDSS_DSI0_BASE,
-							   SM8550_MDSS_DSI1_BASE));
-	env_set_hex("sheng_mdss_dsi_vrb2",
-		    (unsigned long)sheng_mdss_dsi_video_readback2(SM8550_MDSS_DSI0_BASE,
-								 SM8550_MDSS_DSI1_BASE));
-
-	BBM("probe exit");
+	/* Everything past dpu_start is instrumentation. Costs a 550ms
+	 * settle and many MMIO reads of live blocks; compiled out
+	 * unless CONFIG_VIDEO_SHENG_MDSS_DEBUG=y. */
+	SHENG_DBG_POST_DPU_REPORT();
 
 	/* The end-of-probe DCS diagnostics that used to sit here (a write
 	 * probe behind SHENG_WRITE_PROBE, plus two 0x04 reads at different
@@ -2472,7 +2119,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * glyph pixels measured mid-countdown, on a panel showing black.
 	 *
 	 * It is also the THIRD thing to be silently lost below a `return 0`
-	 * in this function (plat->base was the first, sheng_mdss_final_dump()
+	 * in this function (plat->base was the first, SHENG_DBG_FINAL_DUMP()
 	 * the second). The unreachable duplicate of this whole block that
 	 * used to follow -- a second sheng_mdss_dpu_start(), its diagnostics,
 	 * and a second copy of the framebuffer handoff -- has been DELETED,
@@ -2488,112 +2135,15 @@ static int sheng_mdss_probe(struct udevice *dev)
 	/* The pattern bisect and the post-dump magenta marker that used to sit
 	 * here are gone: they answered their question. Flat colour, a hard
 	 * edge and 1px vertical stripes all rendered from this point, and so
-	 * did a magenta fill painted after sheng_mdss_final_dump() -- while
+	 * did a magenta fill painted after SHENG_DBG_FINAL_DUMP() -- while
 	 * nothing painted after probe returned ever appeared. That is what
 	 * localised the fault to sheng_mdss_teardown() running in
 	 * board_late_init(), i.e. before main_loop(), rather than in
 	 * board_preboot_os(). See that function's comment in board.c. */
 
-	sheng_mdss_final_dump();
+	SHENG_DBG_FINAL_DUMP();
 
 	return 0;
-}
-
-/* Everything worth having, dumped once at the end of probe.
- *
- * This is the payload the 512-byte cmdline could never carry. Each sweep
- * so far reported only "(first mismatching offset << 32) | count" -- so
- * when PHY1 came back with a single mismatch at 0x144 we could not see
- * what the value actually WAS without spending another build on it, and
- * when the DSI host swept clean we never saw the values it swept against.
- * Dump the real contents of every block instead, once, and diff offline
- * against the same registers read from a rendering Linux via devmem. */
-static void sheng_mdss_final_dump(void)
-{
-	BBM("=== FINAL STATE DUMP ===");
-
-	/* DSI hosts: full 0x000-0x2fc, the same span dsi_sweep_table covers. */
-	BBB("DSI0", SM8550_MDSS_DSI0_BASE, 0x000, 192);
-	BBB("DSI1", SM8550_MDSS_DSI1_BASE, 0x000, 192);
-
-	/* Both PHYs: CMN (0x000-0x1fc) and the lane block (0x200-0x47c).
-	 * PHY1's lane block was only ever checked as a pass/fail count. */
-	BBB("PHY0_CMN", SM8550_MDSS_DSI0_PHY_BASE, 0x000, 128);
-	BBB("PHY0_LANE", SM8550_MDSS_DSI0_PHY_BASE, 0x200, 160);
-	BBB("PHY0_PLL", SM8550_MDSS_DSI0_PHY_BASE, 0x500, 128);
-	BBB("PHY1_CMN", SM8550_MDSS_DSI1_PHY_BASE, 0x000, 128);
-	BBB("PHY1_LANE", SM8550_MDSS_DSI1_PHY_BASE, 0x200, 160);
-	BBB("PHY1_PLL", SM8550_MDSS_DSI1_PHY_BASE, 0x500, 128);
-
-	/* DPU: the blocks sheng_mdss_dpu_start() programs. Offsets are from
-	 * dpu_base; see the block map at the top of sheng_mdss_hw.zig. */
-	BBB("DPU_TOP", SM8550_MDSS_DPU_BASE, 0x000, 64);
-	BBB("DPU_CTL0", SM8550_MDSS_DPU_BASE + 0x15000, 0x000, 64);
-	BBB("DPU_SSPP_DMA0", SM8550_MDSS_DPU_BASE + 0x24000, 0x000, 96);
-	BBB("DPU_INTF1", SM8550_MDSS_DPU_BASE + 0x35000, 0x000, 64);
-	BBB("DPU_INTF2", SM8550_MDSS_DPU_BASE + 0x36000, 0x000, 64);
-	BBB("DPU_LM0", SM8550_MDSS_DPU_BASE + 0x44000, 0x000, 32);
-	BBB("DPU_LM1", SM8550_MDSS_DPU_BASE + 0x45000, 0x000, 32);
-	BBB("DPU_MERGE3D", SM8550_MDSS_DPU_BASE + 0x4e000, 0x000, 16);
-	BBB("DPU_PP0", SM8550_MDSS_DPU_BASE + 0x69000, 0x000, 48);
-	BBB("DPU_PP1", SM8550_MDSS_DPU_BASE + 0x6a000, 0x000, 48);
-	BBB("DPU_DCE", SM8550_MDSS_DPU_BASE + 0x80000, 0x000, 64);
-
-	/* Full-width versions of the blocks that were previously truncated.
-	 * Catalog lengths: sspp 0x344, ctl 0x290, lm 0x400, intf 0x300. */
-	BBB("SSPP_DMA0_FULL", SM8550_MDSS_DPU_BASE + 0x24000, 0x000, 209);
-	BBB("CTL0_FULL", SM8550_MDSS_DPU_BASE + 0x15000, 0x000, 164);
-	BBB("LM0_FULL", SM8550_MDSS_DPU_BASE + 0x44000, 0x000, 128);
-	BBB("LM1_FULL", SM8550_MDSS_DPU_BASE + 0x45000, 0x000, 128);
-	BBB("INTF1_FULL", SM8550_MDSS_DPU_BASE + 0x35000, 0x000, 192);
-	BBB("INTF2_FULL", SM8550_MDSS_DPU_BASE + 0x36000, 0x000, 192);
-	BBB("PP0_FULL", SM8550_MDSS_DPU_BASE + 0x69000, 0x000, 64);
-	BBB("PP1_FULL", SM8550_MDSS_DPU_BASE + 0x6a000, 0x000, 64);
-
-	/* MDSS wrapper + VBIF + the whole DISPCC clock controller. */
-	BBB("MDSS_TOP", SM8550_MDSS_BASE, 0x000, 32);
-	/* VBIF is a separate ioremap (reg-names = "mdp", "vbif"), not an
-	 * offset from dpu_base -- see sheng_mdss_vbif_init(). */
-	BBB("VBIF", 0x0aeb0000, 0x000, 64);
-	BBB("DISPCC", SM8550_DISPCC_BASE, 0x000, 128);
-	BBB("DISPCC_MDSS", SM8550_DISPCC_BASE, 0x8000, 128);
-
-	/* DSC LAST, DELIBERATELY.
-	 *
-	 * Reading an unclocked MDSS sub-block wedges this hardware's AHB bus --
-	 * a mis-typed address into a neighbouring DPU block rebooted the device
-	 * outright while capturing the Linux-side reference. We enable DSC, so
-	 * these should be live, but "should" is not "verified": if this hangs,
-	 * everything above it has already been sealed to the blackbox (sealing
-	 * happens after every record), so the log is still recoverable and the
-	 * hang itself localises the problem to exactly these offsets.
-	 */
-	/* DSC -- THE BLOCK WE HAVE NEVER ACTUALLY COMPARED.
-	 *
-	 * dpu_9_0_sm8550.h gives dsc_0/dsc_1 base = 0x80000 and dsc_2/dsc_3
-	 * base = 0x81000, but the real registers are in SUB-BLOCKS:
-	 * dpu_hw_catalog.c's dsc_sblk_0 = { .enc = +0x100 len 0x9c,
-	 * .ctl = +0xF00 len 0x10 } and dsc_sblk_1 = { .enc = +0x200 ... }.
-	 *
-	 * Every previous dump covered 0x80000-0x800fc -- the empty gap BEFORE
-	 * the encoder -- which is why it read 0x101 then all zeros on BOTH
-	 * U-Boot and a rendering Linux and looked like a match. The DSC
-	 * encoder configuration has never been compared at all.
-	 *
-	 * This matters more than anything else left: the panel's DSC decoder
-	 * is configured by the 128-byte PPS (now proven transmitted, byte
-	 * identical to Linux), while the DPU's DSC ENCODER is configured
-	 * separately by us. If those two disagree the panel receives a
-	 * compressed stream it cannot decode -- and shows black while every
-	 * other register in the system reads correct. */
-	BBB("DSC0_ENC", SM8550_MDSS_DPU_BASE + 0x80000, 0x100, 40);
-	BBB("DSC1_ENC", SM8550_MDSS_DPU_BASE + 0x80000, 0x200, 40);
-	BBB("DSC0_CTL", SM8550_MDSS_DPU_BASE + 0x80000, 0xf00, 8);
-	BBB("DSC2_ENC", SM8550_MDSS_DPU_BASE + 0x81000, 0x100, 40);
-	BBB("DSC3_ENC", SM8550_MDSS_DPU_BASE + 0x81000, 0x200, 40);
-	BBB("DSC2_CTL", SM8550_MDSS_DPU_BASE + 0x81000, 0xf00, 8);
-	BBM("=== DUMP COMPLETE ===");
-	sheng_bb_finish();
 }
 
 static const struct udevice_id sheng_mdss_ids[] = {
