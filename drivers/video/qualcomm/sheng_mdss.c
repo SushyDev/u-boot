@@ -2816,145 +2816,43 @@ dpu_started:
 	uc_priv->line_length = SHENG_MDSS_FB_STRIDE;
 	plat->size = (u32)SHENG_MDSS_FB_STRIDE * uc_priv->ysize;
 
-	sheng_mdss_final_dump();
-	return 0;
-
-	/* BREAKTHROUGH (see SPEC.md task #5 log): every hang all session was
-	 * caused by rsc_send_active_write() (the hand-rolled RSC/TCS
-	 * transaction backing sheng_mdss_mmcx_power_on()/sheng_mdss_bcm_vote())
-	 * breaking subsequent AHB access to the whole mdss/DPU address
-	 * range -- not power/clock/VBIF gating. Proven via bisection:
-	 * boot-wrapper-read-no-rsc.img and boot-dpu-read-no-rsc.img both
-	 * reached Linux, reading real register values from the wrapper
-	 * (0x90000001, a structured HW_VERSION) and the DPU
-	 * (SSPP_SRC_SIZE = 0, a plausible unconfigured default) with RSC
-	 * never touched at all. MMCX and BCM MM0 were never actually
-	 * required -- ABL/firmware already leaves whatever's necessary
-	 * active. sheng_mdss_mmcx_power_on()/sheng_mdss_bcm_vote() are
-	 * intentionally NOT called below.
+	/* THIS MUST STAY ABOVE THE RETURN BELOW.
 	 *
-	 * ISOLATION TEST: boot-safe-post-rsc.img (this exact path, stopping
-	 * right after DSI panel init with GCC_DISP_HF_AXI_CLK enabled) HUNG
-	 * even after a genuine full power cycle -- ruling out accumulated
-	 * hardware state from prior hangs. Tracing back: sheng_mdss_gcc_
-	 * disp_hf_axi_clk_enable() (`*cbcr |= 1u`, a WRITE) was never
-	 * actually called in either of the two builds that DID boot
-	 * successfully this session (boot-wrapper-read-no-rsc.img,
-	 * boot-dpu-read-no-rsc.img both stopped before reaching it, at the
-	 * time dead code). Given this session's core finding -- DPU writes
-	 * hang, DPU reads don't -- it's plausible the same asymmetry
-	 * applies to this GCC clock-controller write too. RESULT: booted
-	 * fine -- this write is NOT the issue. Ruled out.
+	 * video_flush_dcache() in video-uclass.c opens with
+	 *   if (!priv->flush_dcache) return;
+	 * so until this call runs the video uclass never pushes a single
+	 * console write out of the CPU dcache. The DPU fetches from DRAM, so
+	 * it keeps scanning out whatever this driver last wrote while the
+	 * framebuffer -- read back by the CPU through those same dirty cache
+	 * lines -- provably holds the console's output. That is exactly the
+	 * contradiction the boot menu produced: white background plus 14416
+	 * glyph pixels measured mid-countdown, on a panel showing black.
 	 *
-	 * RESOLVED (SPEC.md task #5 log): the sheng_mdss_gcc_disp_hf_axi_
-	 * clk_enable() call that used to sit here has MOVED UP to the MDSS
-	 * clock bulk beside sheng_mdss_dispcc_init(), where Linux's
-	 * msm_mdss_enable() puts it. Enabling the AXI data-path clock at
-	 * this point in probe -- i.e. AFTER sheng_mdss_dsi_panel_init() --
-	 * was the root cause of this driver's long-standing DSI command
-	 * DMA hang: the engine's packet fetch is an AXI read, and with the
-	 * bus unclocked it never returned. See the call's new site for the
-	 * full FIFO_STATUS forensics. Do not move it back down here.
-	 */
-
-	/* CONFIRMED (see SPEC.md task #5 log): sheng_mdss_bind() itself was
-	 * the cause of every "post-RSC" hang, not the DPU/GCC/RSC/framebuffer
-	 * math investigated above -- it runs during a pre-relocation DM
-	 * bind pass that's independently fragile on this board (see the
-	 * "RESOLVED: CONFIG_VIDEO early-boot hang" entry further down this
-	 * file for the earlier, related pre-relocation fragility). Removed
-	 * .bind entirely. Instead, self-allocate the framebuffer here in
-	 * probe() (stable, post-relocation context) by setting plat->base
-	 * directly -- alloc_fb() in video-uclass.c explicitly supports this
-	 * ("Allow drivers to allocate the frame buffer themselves": if
-	 * (plat->base) return 0;), completely bypassing the fragile
-	 * bind-time reservation path. SHENG_MDSS_FB_ADDR is manually chosen
-	 * DRAM, clear of SHENG_MDSS_DSI_DMA_SCRATCH (0xa0100000) and well
-	 * below where kernel/dtb get lmb_alloc'd later in boot -- see
-	 * SPEC.md's memory-map notes.
-	 */
-	/* NEW TEST: never tried a WRITE to the MDSS wrapper (0xae00000)
-	 * before -- only reads (proven safe, real HW_VERSION value) and
-	 * DPU writes (proven to hang unconditionally). This is a genuinely
-	 * untested boundary: does the firewall/gate sit exactly at
-	 * 0xae01000 (DPU core), or does it already cover part of the
-	 * wrapper's own register window? Target offset 0x0 (HW_VERSION,
-	 * nominally read-only) specifically so even if the write has no
-	 * software effect, the bus still has to ack the transaction --
-	 * that's the actual thing being tested, not the register's value.
-	 * See SPEC.md's task #5 log.
-	 */
-	sheng_mdss_log_reset();
-	{
-		volatile u32 *wrapper_hwver = (volatile u32 *)(uintptr_t)(SM8550_MDSS_WRAPPER_BASE + 0x0);
-		u32 val = *wrapper_hwver;
-
-		*wrapper_hwver = val;
-		sheng_mdss_log(SHENG_LOG_WRAPPER_WRITE_RET, 1); /* survived the write */
-		sheng_mdss_log(SHENG_LOG_WRAPPER_WRITE_READBACK, *wrapper_hwver);
-	}
-
-	plat->base = SHENG_MDSS_FB_ADDR;
-
-	uc_priv->xsize = 3048;
-	uc_priv->ysize = 2032;
-	uc_priv->bpix = VIDEO_BPP32;
-	/* CHANNEL ORDER, measured on the live panel via Linux /dev/fb0:
-	 * writing u32 0xFF0000FF renders BLUE, so the low byte is blue and
-	 * memory order is B,G,R,A -- i.e. u32 0xAARRGGBB, which is U-Boot's
-	 * VIDEO_X8R8G8B8. The driver never set .format at all, leaving it
-	 * VIDEO_UNKNOWN, so the uclass's colour conversion was wrong: that
-	 * is why video_clear() painted the screen WHITE instead of black. */
-	uc_priv->format = VIDEO_X8R8G8B8;
-	uc_priv->rot = 0;
-
-	/* STRIDE MUST MATCH THE DPU, NOT THE NAIVE WIDTH.
+	 * It is also the THIRD thing to be silently lost below a `return 0`
+	 * in this function (plat->base was the first, sheng_mdss_final_dump()
+	 * the second). The unreachable duplicate of this whole block that
+	 * used to follow -- a second sheng_mdss_dpu_start(), its diagnostics,
+	 * and a second copy of the framebuffer handoff -- has been DELETED,
+	 * not left in place, so there is no longer anywhere for an edit to
+	 * land and do nothing. Do not add code after the return.
 	 *
-	 * sheng_mdss_dpu_start() programs SSPP_SRC_YSTRIDE0 as
-	 * ALIGN(3048,32) * 4 = 3072 * 4 = 12288, matching live silicon. The
-	 * video uclass would otherwise compute xsize * bpp = 3048 * 4 =
-	 * 12192, so every console line would land 96 bytes short of where
-	 * the DPU fetches it -- text skews progressively down the screen
-	 * while a solid fill still looks perfect, which is exactly what we
-	 * saw (green fine, console "super glitchy").
-	 *
-	 * video_post_probe() only computes line_length when the driver has
-	 * not set one (`if (!priv->line_length)`), so presetting it here
-	 * wins. plat->size has to use the same stride or the last rows fall
-	 * outside the mapped framebuffer. */
-	uc_priv->line_length = SHENG_MDSS_FB_STRIDE;
-	plat->size = (u32)SHENG_MDSS_FB_STRIDE * uc_priv->ysize;
-
-	sheng_mdss_log(SHENG_LOG_PLAT_BASE, (u32)plat->base);
-
-	/* Let video_post_probe() run this time -- that's the actual test:
-	 * does video_clear() survive with a manually-chosen, definitely-
-	 * real DRAM plat->base instead of relying on the fragile bind-time
-	 * mechanism? sheng_mdss_dpu_start() stays unreachable regardless
-	 * (separate, already-confirmed problem: DPU writes hang).
+	 * Pairs with CONFIG_VIDEO_DAMAGE=y: CONFIG_CYCLIC is off, so
+	 * video_sync() is not rate-limited and every putc syncs. Without
+	 * damage tracking that is a 24MB flush per character.
 	 */
-	return 0;
-
-	ret = sheng_mdss_dpu_start(SM8550_MDSS_DPU_BASE,
-				    SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
-				    plat->base,
-				    uc_priv->xsize, uc_priv->ysize,
-				    SHENG_PANEL_HFRONT_PORCH, SHENG_PANEL_HBACK_PORCH,
-				    SHENG_PANEL_HSYNC_WIDTH,
-				    SHENG_PANEL_VFRONT_PORCH, SHENG_PANEL_VBACK_PORCH,
-				    SHENG_PANEL_VSYNC_WIDTH,
-				    true);
-	sheng_mdss_status_set(SHENG_MDSS_STATUS_DPU, ret);
-	BBS("dpu_start_ret", ret);
-	if (ret) {
-		BBM("ABORT: dpu_start failed");
-		sheng_mdss_final_dump();
-		return ret;
-	}
-
-	sheng_mdss_final_dump();
-
 	video_set_flush_dcache(dev, true);
+
+	/* The pattern bisect and the post-dump magenta marker that used to sit
+	 * here are gone: they answered their question. Flat colour, a hard
+	 * edge and 1px vertical stripes all rendered from this point, and so
+	 * did a magenta fill painted after sheng_mdss_final_dump() -- while
+	 * nothing painted after probe returned ever appeared. That is what
+	 * localised the fault to sheng_mdss_teardown() running in
+	 * board_late_init(), i.e. before main_loop(), rather than in
+	 * board_preboot_os(). See that function's comment in board.c. */
+
+	sheng_mdss_final_dump();
+
 	return 0;
 }
 
@@ -3065,29 +2963,15 @@ static const struct udevice_id sheng_mdss_ids[] = {
  * reliably hung the board, confirmed via bisection this session. The
  * framebuffer is self-allocated directly in .probe instead. */
 
-/* The console writes the framebuffer through the CPU cache, but the DPU
- * fetches from DRAM. This driver's own fills are visible precisely because
- * they end with an explicit flush; console output had no such guarantee,
- * which is why the buffer could be full of text (read back through the same
- * cache) while the panel showed only what we had flushed.
+/* NB: no .video_sync op here on purpose.
  *
- * video_sync() calls this before its own handling, so flushing the whole
- * framebuffer here makes every console update reach the DPU. */
-static int sheng_mdss_video_sync(struct udevice *dev)
-{
-	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
-
-	if (uc_priv->fb && uc_priv->fb_size) {
-		flush_dcache_range((ulong)uc_priv->fb,
-				   (ulong)uc_priv->fb + uc_priv->fb_size);
-		dsb();
-	}
-	return 0;
-}
-
-static const struct video_ops sheng_mdss_video_ops = {
-	.video_sync = sheng_mdss_video_sync,
-};
+ * We briefly had one that flushed the WHOLE 24MB framebuffer, which the
+ * video uclass then flushed again -- redundant, and ruinous during the boot
+ * menu, whose countdown redraws every second: the panel blanked while the
+ * framebuffer provably still held the menu (measured mid-countdown: white
+ * background plus 14416 glyph pixels). video_flush_dcache() in
+ * video-uclass.c already covers priv->fb..fb_size.
+ */
 
 U_BOOT_DRIVER(sheng_mdss) = {
 	.name		= "sheng_mdss",
@@ -3095,5 +2979,4 @@ U_BOOT_DRIVER(sheng_mdss) = {
 	.of_match	= sheng_mdss_ids,
 	.probe		= sheng_mdss_probe,
 	.priv_auto	= sizeof(struct sheng_mdss_priv),
-	.ops		= &sheng_mdss_video_ops,
 };

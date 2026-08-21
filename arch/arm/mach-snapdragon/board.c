@@ -15,6 +15,7 @@
 #include <asm/io.h>
 #include <asm/psci.h>
 #include <asm/system.h>
+#include <bootm.h>
 #include <cpu_func.h>
 #include <dm/device.h>
 #include <dm/pinctrl.h>
@@ -1060,11 +1061,28 @@ static void sheng_ktz8866_backlight_init(void)
 	 * ms is generous for the EN-to-I2C-ready time on this class of
 	 * chip; the real driver's own kinetic,led-enable-ramp-delay-ms=8
 	 * property only bounds the LED current ramp, not I2C readiness.
-	 * Fault-clear cycle (LOW then HIGH) instead of a plain enable now
-	 * -- see its own comment -- in case the MDP_CLK_CBCR transient
-	 * (which now runs before this, per board_late_init()'s reordering)
-	 * latched a UVLO/protection fault inside the chip. */
-	sheng_backlight_gpio_fault_clear_cycle();
+	 * DO NOT PUT THE FAULT-CLEAR CYCLE BACK.
+	 *
+	 * This used to call sheng_backlight_gpio_fault_clear_cycle(), which
+	 * drives the KTZ8866 EN line LOW and then HIGH. That was added on the
+	 * belief that this function "runs BEFORE the video probe, per
+	 * board_late_init()'s reordering", so that dropping EN could only
+	 * clear a latched UVLO fault before the panel existed.
+	 *
+	 * That belief is false. board_late_init() is INITCALL slot 758;
+	 * stdio_add_devices() probes every UCLASS_VIDEO device at slot 729 and
+	 * console_init_r() prints the banner at 734. The panel is already
+	 * initialised and scanning out by the time we get here, so dropping EN
+	 * removed its AVDD/AVEE and destroyed the DDIC's state -- and every
+	 * frame after this point, the startup log included, went to a dead
+	 * panel. Measured directly: a magenta fill painted immediately before
+	 * this call appears, a cyan fill painted immediately after it never
+	 * does.
+	 *
+	 * Enable-only. The chip is already enabled by this point anyway, and
+	 * the fault it was meant to clear was hypothetical; the panel
+	 * rendering is not. */
+	sheng_backlight_gpio_enable();
 	u32 io_readback = sheng_backlight_gpio_set(1);
 	mdelay(2);
 
@@ -1214,6 +1232,14 @@ int board_late_init(void)
 	 * -- and the panel showing nothing even for the DSI host's OWN
 	 * internal test pattern generator, which bypasses the whole DPU.
 	 * Digital side perfect, analog side unpowered. */
+	/* NOTE ON ORDERING, since the comment above is about to mislead
+	 * someone again: this does NOT run before the video probe.
+	 * board_late_init() is INITCALL slot 758; stdio_add_devices() probes
+	 * every UCLASS_VIDEO device at slot 729 and console_init_r() prints
+	 * the banner at 734. The panel is already initialised and scanning out
+	 * by the time we get here, so nothing in here may disturb its power.
+	 * That is why the EN fault-clear cycle had to go -- see
+	 * sheng_ktz8866_backlight_init(). */
 	sheng_ktz8866_backlight_init();
 
 	if (IS_ENABLED(CONFIG_VIDEO)) {
@@ -1240,25 +1266,46 @@ int board_late_init(void)
 	 * pins -- see sheng_ktz8866_bias_readback()'s comment. */
 	sheng_ktz8866_bias_readback();
 
-	/* Visual hold, moved out of sheng_ktz8866_backlight_init() now that
-	 * that runs before the video probe -- gives a real chance to see
-	 * the picture before the teardown below. */
-	mdelay(5000);
+	return 0;
+}
 
-	/* Tear the DPU pipeline down cleanly now that the visual hold
-	 * (backlight init's own 5s mdelay, just above) has given a real
-	 * chance to actually see the picture -- see sheng_mdss_teardown()'s
-	 * comment. Must happen right before Linux boots, not right after
-	 * dpu_start(), or there'd be nothing left to look at. Guarded here
-	 * (not just inside sheng_mdss_teardown() itself) because
-	 * sheng_mdss.c/sheng_mdss_teardown() don't even get compiled in at
-	 * all when CONFIG_VIDEO_SHENG_MDSS is off (obj-$(CONFIG_VIDEO_
-	 * SHENG_MDSS) in drivers/video/qualcomm/Makefile) -- calling it
-	 * unconditionally would be a link error in that config. */
+/* Tear the DPU pipeline down cleanly, immediately before jumping into the
+ * OS -- boot_selected_os() calls this right before boot_fn().
+ *
+ * THIS USED TO BE THE LAST THING IN board_late_init(), WHICH IS WHY U-BOOT
+ * HAD NO USABLE DISPLAY.
+ *
+ * Its old comment claimed it ran "right before Linux boots". It did not:
+ * board_late_init() finishes before main_loop(), so the teardown fired
+ * before the console banner was ever printed, before bootcmd, and before
+ * the boot menu. U-Boot destroyed its own display and then spent the whole
+ * interactive session drawing into a dead panel. A 5s mdelay() sat just
+ * above it as a "visual hold" -- that hold was the entire "quick flash",
+ * and everything after it was black.
+ *
+ * Measured, once the boundary was bisected: patterns painted at the end of
+ * sheng_mdss_probe() render (flat colour, a hard edge, 1px stripes), a
+ * magenta fill painted after sheng_mdss_final_dump() renders, and then
+ * NOTHING does -- not the startup log, not the boot menu, not even the menu
+ * loop repainting the framebuffer green/blue once a second with the exact
+ * same DRAM-write-plus-flush the patterns use (crumbs confirm fb[0] really
+ * held 00ff00/0000ff on all five ticks). It also explains why reading
+ * INTF1_FRAME_COUNT from the menu wedged the AHB bus in sheng.b=316: after
+ * the teardown the MDSS is unclocked.
+ *
+ * The visual hold is gone with it. It only existed because the display was
+ * about to be destroyed; now the display simply stays up, which is what the
+ * boot menu needs.
+ *
+ * Guarded on CONFIG_VIDEO_SHENG_MDSS (not just inside sheng_mdss_teardown()
+ * itself) because sheng_mdss.c isn't compiled in at all when that is off --
+ * obj-$(CONFIG_VIDEO_SHENG_MDSS) in drivers/video/qualcomm/Makefile -- so an
+ * unconditional call would be a link error in that config.
+ */
+void board_preboot_os(void)
+{
 	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS))
 		sheng_mdss_teardown();
-
-	return 0;
 }
 
 static void build_mem_map(void)

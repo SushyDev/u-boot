@@ -174,12 +174,22 @@ CONFIG_SYS_CONSOLE_IS_IN_ENV=y
 # area of 8x16. Select it alone so it is the one actually used.
 # CONFIG_VIDEO_FONT_8X16 is not set
 CONFIG_VIDEO_FONT_16X32=y
+# CONFIG_VIDEO_DAMAGE: REQUIRED here, not an optimisation.
+#
+# CONFIG_CYCLIC is off, so video_sync()'s rate limiter
+# (`if (CONFIG_IS_ENABLED(CYCLIC) && !force && ...) return 0;`) never
+# fires and EVERY putc runs a full sync. Without damage tracking
+# video_flush_dcache() then flushes the entire framebuffer -- 24MB, i.e.
+# ~390k cache-maintenance ops per character -- which is what made the
+# boot menu's once-a-second countdown redraw unusable. With it on, only
+# the rectangle that actually changed is flushed.
+CONFIG_VIDEO_DAMAGE=y
 # U-Boot defaults to BLACK text on a WHITE background. That is why the panel
 # showed a white screen after video_clear(), and why the console became
 # invisible the moment uc_priv->format was set correctly: the foreground
 # ended up black on black. White-on-black is both the conventional choice
 # and unambiguous to verify on a panel we cannot otherwise inspect.
-CONFIG_SYS_WHITE_ON_BLACK=y
+# CONFIG_SYS_WHITE_ON_BLACK is not set
 # Interactive boot menu on the panel. The board has no reachable UART, so
 # the only usable input is the physical buttons: BUTTON_KEYBOARD turns them
 # into a keyboard, BUTTON_QCOM_PMIC covers the PMIC pwrkey/resin, and
@@ -188,7 +198,11 @@ CONFIG_DM_KEYBOARD=y
 CONFIG_BUTTON_KEYBOARD=y
 CONFIG_BUTTON_QCOM_PMIC=y
 CONFIG_CMD_BOOTMENU=y
-# CONFIG_VIDEO_ANSI: OFF for now, deliberately.
+# CONFIG_VIDEO_ANSI: ON. (Historical note, kept because it is the record of
+# a wrong diagnosis.) It was held off on the theory that the menu rendered
+# "invisibly" -- a colour/attribute bug. It was not: the escapes were always
+# honoured and the glyphs were always drawn, they just never left the CPU
+# dcache, because video_set_flush_dcache() sat below probe's return.
 #
 # The boot menu needs it -- it clears the screen, positions the cursor and
 # uses reverse video for the selected entry. With it enabled the escapes ARE
@@ -197,7 +211,8 @@ CONFIG_CMD_BOOTMENU=y
 # timeout. That is a colour/attribute problem, not a menu problem, and it
 # costs the working startup log to chase. Leaving it off keeps the console
 # useful; re-enable together with a fix for the menu's colour handling.
-# CONFIG_VIDEO_ANSI is not set
+CONFIG_SYS_DEVICE_NULLDEV=y
+CONFIG_VIDEO_ANSI=y
 # AUTOBOOT_MENU_SHOW: OFF, paired with VIDEO_ANSI being off. It replaces the
 # plain countdown with the boot menu, and the menu emits ANSI escapes that a
 # non-ANSI vidconsole prints as raw control characters -- which wipes the

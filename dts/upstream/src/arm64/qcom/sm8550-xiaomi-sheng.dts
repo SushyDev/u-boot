@@ -545,8 +545,13 @@
 };
 
 &pon_resin {
-	/* U-Boot only: KEY_ENTER so Volume Down selects a menu entry. */
-	linux,code = <KEY_ENTER>;
+	/* Deliberately NOT KEY_ENTER for now. The menu exits well before its
+	 * timeout, which is what a stuck ENTER looks like: draw once, receive
+	 * a keypress, select entry 0, boot. Mapping this to an inert code
+	 * isolates "menu cannot draw" from "menu is being auto-selected".
+	 * button-qcom-pmic advertises pm8916/pm8941/pm8998 and this is a
+	 * pm8550, so its read may not be meaningful at all. */
+	linux,code = <KEY_VOLUMEDOWN>;
 	status = "okay";
 };
 

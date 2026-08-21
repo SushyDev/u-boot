@@ -96,6 +96,14 @@ static char *bootmenu_choice_entry(void *data)
 		if (menu->delay >= 0) {
 			/* Autoboot was not stopped */
 			key = bootmenu_autoboot_loop(menu, cch);
+			{
+				volatile u32 *c =
+					(volatile u32 *)(uintptr_t)0xa5100000;
+
+				c[0] = 0x5348434du;
+				c[29] = 0x8000u + (c[29] & 0xfffu) + 1;
+				c[31] = 0x8000u | (u32)key;
+			}
 		} else {
 			/* Some key was pressed, so autoboot was stopped */
 			key = bootmenu_loop(menu, cch);
@@ -123,6 +131,17 @@ static char *bootmenu_choice_entry(void *data)
 							       cch->shortcut_key;
 			fallthrough;
 		case BKEY_SELECT:
+			{
+				/* SHENG: which key ended the menu? It exits well
+				 * before its timeout, which is what a stuck
+				 * button looks like. No console on this board,
+				 * so record it in DRAM. */
+				volatile u32 *c =
+					(volatile u32 *)(uintptr_t)0xa5100000;
+
+				c[0] = 0x5348434du;
+				c[30] = 0x8000u | (u32)key;
+			}
 			iter = menu->first;
 			for (i = 0; i < menu->active; ++i)
 				iter = iter->next;
