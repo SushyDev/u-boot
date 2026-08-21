@@ -2420,21 +2420,17 @@ bringup_done:
 		 * background, and doubles as the "is the panel alive" signal: a
 		 * black screen with legible text is success, not failure. */
 		{
-			size_t x, y;
-			const u32 bandcol[4] = {
-				0xffff0000u, /* red   */
-				0xff00ff00u, /* green */
-				0xff0000ffu, /* blue  */
-				0xff000000u, /* black */
-			};
+			/* Solid black. The RGB band pattern proved stride 12288 and
+			 * channel order X8R8G8B8 against live silicon, and it has now
+			 * done its job. The console draws directly on top of whatever
+			 * this leaves behind, so anything but a flat dark background
+			 * makes U-Boot's white-on-black text unreadable -- which is
+			 * exactly what "super glitchy screen" was: real text over
+			 * coloured stripes. */
+			size_t i;
 
-			for (y = 0; y < 2032; y++) {
-				u32 c = bandcol[(y * 4) / 2032];
-
-				for (x = 0; x < aligned_hactive; x++)
-					fb[y * aligned_hactive + x] =
-						(x >= 3048) ? 0xff000000u : c;
-			}
+			for (i = 0; i < fb_words; i++)
+				fb[i] = 0xff000000u;
 		}
 		(void)px;
 		flush_dcache_range(SHENG_MDSS_FB_ADDR,
