@@ -140,6 +140,10 @@ CONFIG_VIDEO_SHENG_MDSS=y
 # budget. Trim what we don't need: the embedded splash logo and its
 # BMP decode support save real space for zero functional loss (we
 # don't use splash screens).
+# CONFIG_VIDEO_LOGO must stay OFF: show_splash() is called from
+# video_post_probe() and its failure return propagates out, which would
+# abort the console bind that happens after it. The logo is a BMP and
+# CONFIG_BMP / CONFIG_VIDEO_BMP_RLE8 are both disabled here.
 # CONFIG_VIDEO_LOGO is not set
 # CONFIG_VIDEO_BMP_RLE8 is not set
 # CONFIG_BMP is not set
@@ -170,6 +174,18 @@ CONFIG_SYS_CONSOLE_IS_IN_ENV=y
 # area of 8x16. Select it alone so it is the one actually used.
 # CONFIG_VIDEO_FONT_8X16 is not set
 CONFIG_VIDEO_FONT_16X32=y
+# U-Boot defaults to BLACK text on a WHITE background. That is why the panel
+# showed a white screen after video_clear(), and why the console became
+# invisible the moment uc_priv->format was set correctly: the foreground
+# ended up black on black. White-on-black is both the conventional choice
+# and unambiguous to verify on a panel we cannot otherwise inspect.
+CONFIG_SYS_WHITE_ON_BLACK=y
+# `version` is used by bootcmd to put real U-Boot build info on the panel.
+# U-Boot's own banner is printed before the video device probes and is then
+# wiped by video_clear(), so it never reaches the screen; re-emitting it from
+# bootcmd is the way to actually see it. Without this the command does not
+# exist, bootcmd fails at that point, and every && after it is skipped.
+CONFIG_CMD_VERSION=y
 # Still hung with just those two off -- force off the rest of what
 # CONFIG_VIDEO implies too, to isolate whether it's one of these or
 # something in the core video uclass itself.

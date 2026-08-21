@@ -2406,42 +2406,34 @@ bringup_done:
 		size_t fb_words = aligned_hactive * 2032;
 		size_t px;
 
-		/* KNOWN TEST PATTERN, drawn with the exact geometry measured
-		 * on live Linux via /dev/fb0: stride 12288 bytes (3072 px, NOT
-		 * 3048), 24969216 bytes total, ARGB8888 stored little-endian as
-		 * 0xAABBGGRR -- so red is 0xFF0000FF and blue is 0xFFFF0000.
+		/* Solid BLACK, not a pattern and not green.
 		 *
-		 * A solid fill cannot diagnose anything: it looks identical at
-		 * any stride and any channel order. These bands can. Read the
-		 * screen top to bottom -- red, green, blue, white -- with a
-		 * 64px white frame around the whole visible area:
-		 *   bands crisp, correct colours, frame flush to all 4 edges
-		 *      -> framebuffer geometry and format are exactly right and
-		 *         any remaining mess is the console's own drawing
-		 *   bands sheared diagonally  -> stride still wrong
-		 *   colours permuted          -> channel order wrong
-		 *   frame clipped or wrapped  -> width/height wrong */
+		 * The RGB band pattern did its job -- it proved stride 12288 and
+		 * channel order X8R8G8B8 against live silicon -- but it must not
+		 * stay: video_clear() does not repaint this buffer, so the console
+		 * draws directly ON TOP of whatever we leave here. With the pattern
+		 * in place, U-Boot's black-on-white default happened to be readable
+		 * over the white frame, and enabling SYS_WHITE_ON_BLACK then made
+		 * white text land on that same white frame and vanish.
+		 *
+		 * Clearing to black gives the white-on-black console a correct
+		 * background, and doubles as the "is the panel alive" signal: a
+		 * black screen with legible text is success, not failure. */
 		{
 			size_t x, y;
 			const u32 bandcol[4] = {
 				0xffff0000u, /* red   */
 				0xff00ff00u, /* green */
 				0xff0000ffu, /* blue  */
-				0xffffffffu, /* white */
+				0xff000000u, /* black */
 			};
 
 			for (y = 0; y < 2032; y++) {
 				u32 c = bandcol[(y * 4) / 2032];
 
-				for (x = 0; x < aligned_hactive; x++) {
-					bool frame = (y < 64 || y >= 2032 - 64 ||
-						      x < 64 || x >= 3048 - 64);
-					bool pad = (x >= 3048);
-
+				for (x = 0; x < aligned_hactive; x++)
 					fb[y * aligned_hactive + x] =
-						pad ? 0xff000000u :
-						frame ? 0xffffffffu : c;
-				}
+						(x >= 3048) ? 0xff000000u : c;
 			}
 		}
 		(void)px;
