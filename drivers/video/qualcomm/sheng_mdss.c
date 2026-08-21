@@ -2781,15 +2781,41 @@ dpu_started:
 		SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH, 0x04, 1));
 	BBS("id maxsz=3", sheng_mdss_dsi_read_dcs_reg_max(
 		SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH, 0x04, 3));
-	BBS("read 0x0a power_mode", sheng_mdss_dsi_read_dcs_reg(
-		SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH, 0x0a));
-	BBS("read 0x0c pixel_format", sheng_mdss_dsi_read_dcs_reg(
-		SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH, 0x0c));
-	BBS("read 0x04 display_id", sheng_mdss_dsi_read_dcs_reg(
-		SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH, 0x04));
-	BBS("END-OF-PROBE read (expect 0x18 if write landed)",
-	    sheng_mdss_dsi_read_power_mode_single(SM8550_MDSS_DSI0_BASE,
-						  SHENG_MDSS_DSI_DMA_SCRATCH));
+	/* HAND THE FRAMEBUFFER TO THE VIDEO UCLASS.
+	 *
+	 * This must happen BEFORE probe returns. It previously sat below the
+	 * `return 0` a few lines down, i.e. in dead code, so plat->base stayed
+	 * 0, video_post_probe() mapped a framebuffer at NULL, and every write
+	 * from the console went nowhere. Measured directly: the console binds,
+	 * probes, registers as stdio "vidconsole", is selected as stdout and
+	 * receives 106 puts() calls -- into a video_priv whose fb is NULL.
+	 * That is why the panel only ever showed what this driver wrote. */
+	plat->base = SHENG_MDSS_FB_ADDR;
+
+	uc_priv->xsize = 3048;
+	uc_priv->ysize = 2032;
+	uc_priv->bpix = VIDEO_BPP32;
+	/* Channel order measured on the live panel via Linux /dev/fb0: writing
+	 * u32 0xFF0000FF renders BLUE, so memory order is B,G,R,A -- u32
+	 * 0xAARRGGBB, i.e. VIDEO_X8R8G8B8. Leaving it unset left it
+	 * VIDEO_UNKNOWN and made video_clear() paint white. */
+	/* Channel order measured on the live panel via /dev/fb0: writing u32
+	 * 0xFF0000FF renders BLUE, so memory is B,G,R,A -- VIDEO_X8R8G8B8.
+	 * Alpha is irrelevant here: the mixers are programmed
+	 * LM_CONST_ALPHA_OPAQUE / LM_BLEND_OP_OPAQUE, so the layer is opaque
+	 * regardless of the per-pixel alpha byte. */
+	uc_priv->format = VIDEO_X8R8G8B8;
+	uc_priv->rot = 0;
+
+	/* Stride must match the DPU, not the naive width:
+	 * sheng_mdss_dpu_start() programs SSPP_SRC_YSTRIDE0 as
+	 * ALIGN(3048,32) * 4 = 12288, while the uclass would compute
+	 * 3048 * 4 = 12192 and shear every console line by 96 bytes.
+	 * video_post_probe() only computes line_length when the driver has not
+	 * set one, so presetting it wins. */
+	uc_priv->line_length = SHENG_MDSS_FB_STRIDE;
+	plat->size = (u32)SHENG_MDSS_FB_STRIDE * uc_priv->ysize;
+
 	sheng_mdss_final_dump();
 	return 0;
 
@@ -3038,10 +3064,36 @@ static const struct udevice_id sheng_mdss_ids[] = {
  * why: a .bind hook (even one doing nothing but a single struct write)
  * reliably hung the board, confirmed via bisection this session. The
  * framebuffer is self-allocated directly in .probe instead. */
+
+/* The console writes the framebuffer through the CPU cache, but the DPU
+ * fetches from DRAM. This driver's own fills are visible precisely because
+ * they end with an explicit flush; console output had no such guarantee,
+ * which is why the buffer could be full of text (read back through the same
+ * cache) while the panel showed only what we had flushed.
+ *
+ * video_sync() calls this before its own handling, so flushing the whole
+ * framebuffer here makes every console update reach the DPU. */
+static int sheng_mdss_video_sync(struct udevice *dev)
+{
+	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
+
+	if (uc_priv->fb && uc_priv->fb_size) {
+		flush_dcache_range((ulong)uc_priv->fb,
+				   (ulong)uc_priv->fb + uc_priv->fb_size);
+		dsb();
+	}
+	return 0;
+}
+
+static const struct video_ops sheng_mdss_video_ops = {
+	.video_sync = sheng_mdss_video_sync,
+};
+
 U_BOOT_DRIVER(sheng_mdss) = {
 	.name		= "sheng_mdss",
 	.id		= UCLASS_VIDEO,
 	.of_match	= sheng_mdss_ids,
 	.probe		= sheng_mdss_probe,
 	.priv_auto	= sizeof(struct sheng_mdss_priv),
+	.ops		= &sheng_mdss_video_ops,
 };
