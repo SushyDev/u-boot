@@ -1022,6 +1022,9 @@ static void sheng_mdss_status_set(unsigned int stage, int ret)
  * the same free System RAM span, well clear of the next reserved
  * region (0xccd00000, rmtfs_mem). See SHENG_MDSS_DSI_DMA_SCRATCH's
  * comment for why this moved from its old 0xa0200000. */
+/* ALIGN(3048, 32) * 4 bytes -- the stride sheng_mdss_dpu_start()
+ * programs into SSPP_SRC_YSTRIDE0. */
+#define SHENG_MDSS_FB_STRIDE		12288
 #define SHENG_MDSS_FB_ADDR		0xa3200000
 
 /* 144Hz mode, xiaomi,sheng-nt36532e panel. Confirmed against the live
@@ -1227,7 +1230,7 @@ struct sheng_mdss_priv {
  * pm_runtime/GDSC and link-clock enable, which normalises the block, so it
  * cannot see the difference it was built to find. Restored to 0 so Linux
  * gets a proper hand-off and renders again. */
-#define SHENG_SKIP_TEARDOWN 1
+#define SHENG_SKIP_TEARDOWN 0
 
 /* Forward-bisect master switch -- see its block comment at the top of
  * sheng_mdss_probe(). 1 = probe touches no hardware at all and ABL's
@@ -2403,8 +2406,45 @@ bringup_done:
 		size_t fb_words = aligned_hactive * 2032;
 		size_t px;
 
-		for (px = 0; px < fb_words; px++)
-			fb[px] = 0xff00ff00u; /* XRGB8888 solid green */
+		/* KNOWN TEST PATTERN, drawn with the exact geometry measured
+		 * on live Linux via /dev/fb0: stride 12288 bytes (3072 px, NOT
+		 * 3048), 24969216 bytes total, ARGB8888 stored little-endian as
+		 * 0xAABBGGRR -- so red is 0xFF0000FF and blue is 0xFFFF0000.
+		 *
+		 * A solid fill cannot diagnose anything: it looks identical at
+		 * any stride and any channel order. These bands can. Read the
+		 * screen top to bottom -- red, green, blue, white -- with a
+		 * 64px white frame around the whole visible area:
+		 *   bands crisp, correct colours, frame flush to all 4 edges
+		 *      -> framebuffer geometry and format are exactly right and
+		 *         any remaining mess is the console's own drawing
+		 *   bands sheared diagonally  -> stride still wrong
+		 *   colours permuted          -> channel order wrong
+		 *   frame clipped or wrapped  -> width/height wrong */
+		{
+			size_t x, y;
+			const u32 bandcol[4] = {
+				0xffff0000u, /* red   */
+				0xff00ff00u, /* green */
+				0xff0000ffu, /* blue  */
+				0xffffffffu, /* white */
+			};
+
+			for (y = 0; y < 2032; y++) {
+				u32 c = bandcol[(y * 4) / 2032];
+
+				for (x = 0; x < aligned_hactive; x++) {
+					bool frame = (y < 64 || y >= 2032 - 64 ||
+						      x < 64 || x >= 3048 - 64);
+					bool pad = (x >= 3048);
+
+					fb[y * aligned_hactive + x] =
+						pad ? 0xff000000u :
+						frame ? 0xffffffffu : c;
+				}
+			}
+		}
+		(void)px;
 		flush_dcache_range(SHENG_MDSS_FB_ADDR,
 				    SHENG_MDSS_FB_ADDR + fb_words * 4);
 		dsb();
@@ -2845,9 +2885,31 @@ dpu_started:
 	uc_priv->xsize = 3048;
 	uc_priv->ysize = 2032;
 	uc_priv->bpix = VIDEO_BPP32;
+	/* CHANNEL ORDER, measured on the live panel via Linux /dev/fb0:
+	 * writing u32 0xFF0000FF renders BLUE, so the low byte is blue and
+	 * memory order is B,G,R,A -- i.e. u32 0xAARRGGBB, which is U-Boot's
+	 * VIDEO_X8R8G8B8. The driver never set .format at all, leaving it
+	 * VIDEO_UNKNOWN, so the uclass's colour conversion was wrong: that
+	 * is why video_clear() painted the screen WHITE instead of black. */
+	uc_priv->format = VIDEO_X8R8G8B8;
 	uc_priv->rot = 0;
 
-	plat->size = (u32)uc_priv->xsize * uc_priv->ysize * VNBYTES(uc_priv->bpix);
+	/* STRIDE MUST MATCH THE DPU, NOT THE NAIVE WIDTH.
+	 *
+	 * sheng_mdss_dpu_start() programs SSPP_SRC_YSTRIDE0 as
+	 * ALIGN(3048,32) * 4 = 3072 * 4 = 12288, matching live silicon. The
+	 * video uclass would otherwise compute xsize * bpp = 3048 * 4 =
+	 * 12192, so every console line would land 96 bytes short of where
+	 * the DPU fetches it -- text skews progressively down the screen
+	 * while a solid fill still looks perfect, which is exactly what we
+	 * saw (green fine, console "super glitchy").
+	 *
+	 * video_post_probe() only computes line_length when the driver has
+	 * not set one (`if (!priv->line_length)`), so presetting it here
+	 * wins. plat->size has to use the same stride or the last rows fall
+	 * outside the mapped framebuffer. */
+	uc_priv->line_length = SHENG_MDSS_FB_STRIDE;
+	plat->size = (u32)SHENG_MDSS_FB_STRIDE * uc_priv->ysize;
 
 	sheng_mdss_log(SHENG_LOG_PLAT_BASE, (u32)plat->base);
 

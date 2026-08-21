@@ -150,8 +150,26 @@ CONFIG_VIDEO_SHENG_MDSS=y
 # was never set up with those and hung silently before any console
 # output at all when this was left on (confirmed on hardware). Force
 # both off; a single fixed serial console is all that's needed here.
-# CONFIG_CONSOLE_MUX is not set
-# CONFIG_SYS_CONSOLE_IS_IN_ENV is not set
+# RE-ENABLED (display now works). These were forced off because the board
+# "hung silently before any console output at all" -- the comment above
+# names the cause: CONSOLE_MUX + SYS_CONSOLE_IS_IN_ENV make console_init_r()
+# look up stdin/stdout/stderr from the environment, and this board's env did
+# not define them. sheng.env now sets all three explicitly, so that premise
+# no longer holds. Both are required for the panel to show U-Boot's console:
+# without SYS_CONSOLE_IS_IN_ENV the env's stdout is never consulted, and
+# without CONSOLE_MUX stdout can only be a single device, so the
+# "serial,vidconsole" setting cannot take effect.
+CONFIG_CONSOLE_MUX=y
+CONFIG_SYS_CONSOLE_IS_IN_ENV=y
+# The panel is 3048x2032, so an 8x16 bitmap font is ~1/380th of the screen
+# width: the console renders correctly but is effectively invisible (7 lines
+# read as "nothing on screen", 40 lines only showed up as faint glitching).
+# CONSOLE_TRUETYPE would give a scalable font but cannot be built here --
+# stb_truetype uses floating point and U-Boot's arm64 build is
+# -mgeneral-regs-only. 16x32 is the largest bitmap font available, 4x the
+# area of 8x16. Select it alone so it is the one actually used.
+# CONFIG_VIDEO_FONT_8X16 is not set
+CONFIG_VIDEO_FONT_16X32=y
 # Still hung with just those two off -- force off the rest of what
 # CONFIG_VIDEO implies too, to isolate whether it's one of these or
 # something in the core video uclass itself.
