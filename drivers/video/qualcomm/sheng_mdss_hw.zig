@@ -1011,87 +1011,6 @@ export fn sheng_mdss_dispcc_dsi_clks_init(dispcc_base: usize) callconv(.c) c_int
     return clkBranchEnable(dispcc_base, ESC1_CLK_CBCR);
 }
 
-/// Bring up disp_cc_pll0, then the AHB (bus, 19.2MHz off XO) and MDP
-/// (DPU core, 514MHz off PLL0) clocks, plus the MDP LUT and VSYNC
-/// clocks the DPU sub-block's own devicetree node additionally
-/// requires (see the comment above). pclk0/byte0/esc0 are NOT done
-/// here -- they mux from the DSI PHY's own PLL output rather than
-/// DISPCC's internal PLL0, so they belong with DSI PHY bring-up
-/// (sheng_mdss_dsi_phy_init) instead.
-// Backlight-kill bisection (see board.c/sheng_mdss.c SPEC.md task #5
-// log): full sheng_mdss_dispcc_init() kills backlight even for Linux's
-// later re-init; core_reset+GDSC alone don't. Narrowing inside DISPCC
-// itself -- PLL0 lock vs. the AHB/MDP/LUT/VSYNC clock branch enables
-// that follow it.
-export fn sheng_mdss_dispcc_init_pll0_only(dispcc_base: usize) callconv(.c) c_int {
-    return dispCcPll0Enable(dispcc_base);
-}
-
-export fn sheng_mdss_dispcc_init_thru_ahb(dispcc_base: usize) callconv(.c) c_int {
-    var ret = dispCcPll0Enable(dispcc_base);
-    if (ret != 0) return ret;
-
-    ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-    return clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
-}
-
-export fn sheng_mdss_dispcc_init_thru_mdp_rcg_only(dispcc_base: usize) callconv(.c) c_int {
-    var ret = dispCcPll0Enable(dispcc_base);
-    if (ret != 0) return ret;
-
-    ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
-    if (ret != 0) return ret;
-
-    // MDP clock source configured (src_sel + divider written) but the
-    // CBCR branch itself never enabled -- narrows whether the RCG
-    // config write or the actual clock-branch-on transition is what
-    // disrupts something.
-    return rcg2ConfigureHidOnly(dispcc_base, MDP_CLK_SRC_CMD_RCGR, MDP_CLK_SRC_SEL_PLL0, MDP_CLK_DIV_REG_VAL);
-}
-
-export fn sheng_mdss_dispcc_init_thru_mdp(dispcc_base: usize) callconv(.c) c_int {
-    var ret = dispCcPll0Enable(dispcc_base);
-    if (ret != 0) return ret;
-
-    ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
-    if (ret != 0) return ret;
-
-    ret = rcg2ConfigureHidOnly(dispcc_base, MDP_CLK_SRC_CMD_RCGR, MDP_CLK_SRC_SEL_PLL0, MDP_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-    return clkBranchEnable(dispcc_base, MDP_CLK_CBCR);
-}
-
-// Bisection landed here: MDP_CLK_CBCR's branch-enable transition
-// (clkBranchEnable) specifically kills backlight (RCG src config alone
-// is harmless; AHB is harmless). The DSI-bypass pixel path
-// (sheng_mdss_dsi_test_patch) never touches the DPU pixel pipeline at
-// all -- it's pure DSI command-mode DMA sourced from DSI's own byte/
-// pixel clocks (DSI PHY PLL) plus AHB, not the MDP core clock. So skip
-// just this one branch enable and keep going through DSI PHY/panel
-// init, to get backlight AND the red square in the same build.
-export fn sheng_mdss_dispcc_init_no_mdp_branch(dispcc_base: usize) callconv(.c) c_int {
-    var ret = dispCcPll0Enable(dispcc_base);
-    if (ret != 0) return ret;
-
-    ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
-    if (ret != 0) return ret;
-
-    // MDP_CLK_CBCR branch enable intentionally skipped.
-    ret = rcg2ConfigureHidOnly(dispcc_base, MDP_CLK_SRC_CMD_RCGR, MDP_CLK_SRC_SEL_PLL0, MDP_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-
-    ret = rcg2ConfigureHidOnly(dispcc_base, VSYNC_CLK_SRC_CMD_RCGR, VSYNC_CLK_SRC_SEL_XO, VSYNC_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-    return clkBranchEnable(dispcc_base, VSYNC_CLK_CBCR);
-}
-
 // REAL GAP FOUND (SPEC.md task #5 log): sm8550.dtsi's mdss node
 // (display-subsystem@ae00000, the TOP-LEVEL MDSS wrapper block --
 // parent of both the DPU at ae01000 and the DSI hosts at ae94000/
@@ -3490,84 +3409,6 @@ fn dsiCmdDmaTxDual(dsi0_base: usize, dsi1_base: usize, dma_addr: usize, len: usi
 ///     whose every register matches working silicon.
 ///   zero on one, data on the other -> the trigger pattern itself is the
 ///     difference, and it applies to every command we have ever sent.
-/// INSTRUMENT CHECK: read an ARBITRARY DCS register, not just 0x0A.
-///
-/// Every read this driver has ever done returns payload 0x08. That is the
-/// correct "alive but uninitialised" power-mode value, so it looks right --
-/// but a decode that always yields 0x08 would look identical. Reading a
-/// different register proves the difference: 0x0C (get_pixel_format) must
-/// NOT return 0x08 on a live panel (expect 0x70/0x77-class), and 0x04
-/// (get_display_id) returns vendor bytes.
-///
-/// If every register reads 0x08, the read path is fabricating it and every
-/// conclusion drawn from "the panel answers 0x08" collapses.
-export fn sheng_mdss_dsi_read_dcs_reg_max(dsi0_base: usize, dma_scratch: usize, reg: u8, maxsz: u8) callconv(.c) i64 {
-    // DOES ANY WRITE LAND? 0x37 (set maximum return packet size) is an
-    // ordinary short WRITE. If writes never reach the panel, changing maxsz
-    // cannot change anything. If they do, the response must change shape:
-    // a 1-byte answer comes back as data_id 0x21, a 2-byte one as 0x22, and
-    // a longer one as a long-read response 0x1A. Reading 0x04
-    // (get_display_id, 3 bytes on a real panel) with maxsz=1 vs 3 is
-    // therefore a direct test of write delivery that does not depend on the
-    // panel executing any state-changing command.
-    const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
-    const ctrl_restore = mmioRead32(dsi0_base, DSI_CTRL);
-    mmioWrite32(dsi0_base, DSI_CTRL, ctrl_restore | CTRL_CMD_MODE_EN | CTRL_ENABLE);
-    defer mmioWrite32(dsi0_base, DSI_CTRL, ctrl_restore);
-
-    dst[0] = maxsz;
-    dst[1] = 0;
-    dst[2] = 0x37;
-    dst[3] = 0x80;
-    if (dsiCmdDmaTxOne(dsi0_base, dma_scratch, 4) != 0) return -1;
-
-    mmioWrite32(dsi0_base, DSI_RDBK_DATA_CTRL, RDBK_DATA_CTRL_CLR);
-    mmioWrite32(dsi0_base, DSI_RDBK_DATA_CTRL, 0);
-
-    dst[0] = reg;
-    dst[1] = 0x00;
-    dst[2] = 0x06;
-    dst[3] = 0x80 | 0x20;
-    if (dsiCmdDmaTxOne(dsi0_base, dma_scratch, 4) != 0) return -2;
-
-    var w: u32 = 0;
-    while (w < 20000) : (w += 20) {
-        if ((mmioRead32(dsi0_base, DSI_INTR_CTRL) & (1 << 20)) != 0) break;
-        udelay(20);
-    }
-    return (@as(i64, mmioRead32(dsi0_base, DSI_RDBK_DATA0)) << 32) | @as(i64, maxsz);
-}
-
-export fn sheng_mdss_dsi_read_dcs_reg(dsi0_base: usize, dma_scratch: usize, reg: u8) callconv(.c) i64 {
-    const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
-    const ctrl_restore = mmioRead32(dsi0_base, DSI_CTRL);
-    mmioWrite32(dsi0_base, DSI_CTRL, ctrl_restore | CTRL_CMD_MODE_EN | CTRL_ENABLE);
-    defer mmioWrite32(dsi0_base, DSI_CTRL, ctrl_restore);
-
-    dst[0] = 1;
-    dst[1] = 0;
-    dst[2] = 0x37; // set maximum return packet size = 1
-    dst[3] = 0x80;
-    if (dsiCmdDmaTxOne(dsi0_base, dma_scratch, 4) != 0) return -1;
-
-    mmioWrite32(dsi0_base, DSI_RDBK_DATA_CTRL, RDBK_DATA_CTRL_CLR);
-    mmioWrite32(dsi0_base, DSI_RDBK_DATA_CTRL, 0);
-
-    dst[0] = reg;
-    dst[1] = 0x00;
-    dst[2] = 0x06; // DCS read, no parameter
-    dst[3] = 0x80 | 0x20;
-    if (dsiCmdDmaTxOne(dsi0_base, dma_scratch, 4) != 0) return -2;
-
-    var waited: u32 = 0;
-    while (waited < 20000) : (waited += 20) {
-        if ((mmioRead32(dsi0_base, DSI_INTR_CTRL) & (1 << 20)) != 0) break;
-        udelay(20);
-    }
-    const rdbk = mmioRead32(dsi0_base, DSI_RDBK_DATA0);
-    return (@as(i64, rdbk) << 32) | @as(i64, reg);
-}
-
 export fn sheng_mdss_dsi_read_power_mode_single(dsi0_base: usize, dma_scratch: usize) callconv(.c) i64 {
     const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
 
@@ -3928,64 +3769,6 @@ export fn sheng_mdss_dsi_block_writeback_selfcheck(dsi_base: usize) callconv(.c)
 /// teardown below removes the panel's ability to receive commands at
 /// all. Best-effort: DSI is being torn down regardless, so a failure
 /// here doesn't abort the rest of the teardown.
-/// DIAGNOSTIC BISECT (SPEC.md task #5 log): MIPI DCS 0x23,
-/// ALL_PIXELS_ON. The panel drives every pixel to full-on from its own
-/// internal logic -- it needs NO video data, no DSC stream, no DPU
-/// pipeline. It is therefore a direct test of a question none of the
-/// register diagnostics can answer: does this panel actually RECEIVE
-/// AND EXECUTE our commands?
-///
-/// Every command so far has "succeeded" only in the sense that the DSI
-/// DMA engine shipped bytes down the lanes. DCS reads have never
-/// returned data on this hardware (the long-standing zero-byte BTA
-/// result), so sheng.power_mode=0 is a failed read rather than the
-/// panel reporting itself off -- meaning we have never once confirmed
-/// the panel processed anything we sent.
-///
-///   Screen goes WHITE -> panel is alive, command path works end to
-///     end, display is genuinely on. The black screen is then isolated
-///     to the video/DSC data path, and everything downstream of the
-///     DSI host is what needs attention.
-///   Screen stays BLACK -> the panel is not acting on commands at all.
-///     Every DPU/LM/DSC/rate finding is then downstream of a dead
-///     command path, and the entire DPU investigation is misdirected.
-///
-/// Deliberately left ACTIVE (no 0x22 restore) so the result is
-/// unambiguous to the naked eye.
-export fn sheng_mdss_dsi_all_pixels_on(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) c_int {
-    return dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x23, &[_]u8{});
-}
-
-/// Single DCS write, for the b2xx write-probe: does ANY write reach the
-/// DDIC? The panel answers our reads (end-of-probe read returns payload
-/// 0x08, the correct "alive but uninitialised" value), but a full init
-/// leaves it reading 0x08 too -- byte-identical to sending nothing. So
-/// send exactly one command whose effect is visible in that same read:
-/// 0x11 exit_sleep_mode should flip SLEEP_OUT (bit 4), 0x08 -> 0x18.
-export fn sheng_mdss_dsi_exit_sleep_only(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) c_int {
-    _ = dsi1_base;
-    // SINGLE-HOST write, mirroring exactly how the WORKING read sends its
-    // first packet (dsiCmdDmaTxOne on DSI0, CMD_MODE_EN on DSI0 only).
-    //
-    // Reads provably reach the panel: RDBK_DATA0 comes back 0x21080037,
-    // byte-identical in format to Linux's ground truth, payload 0x08. Writes
-    // provably do not: a full 94-command init, and a lone 0x11, both leave
-    // that read at 0x08. The two paths differ in exactly one way -- reads
-    // start single-host, writes always go through dsiCmdDmaTxDual, which
-    // enables CMD_MODE_EN on BOTH hosts and triggers both. If a write sent
-    // the read's way lands (0x08 -> 0x18), the dual-host transmit is the bug.
-    const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
-    const ctrl_restore = mmioRead32(dsi0_base, DSI_CTRL);
-    mmioWrite32(dsi0_base, DSI_CTRL, ctrl_restore | CTRL_CMD_MODE_EN | CTRL_ENABLE);
-    defer mmioWrite32(dsi0_base, DSI_CTRL, ctrl_restore);
-
-    dst[0] = 0x11; // DCS exit_sleep_mode
-    dst[1] = 0x00;
-    dst[2] = 0x05; // short write, no parameter
-    dst[3] = 0x80; // last packet
-    return dsiCmdDmaTxOne(dsi0_base, dma_scratch, 4);
-}
-
 export fn sheng_mdss_dsi_panel_sleep(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) void {
     _ = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x28, &[_]u8{});
     udelay(20000); // datasheet-typical gap between display-off and sleep-in
@@ -4023,8 +3806,6 @@ export fn sheng_mdss_dsi_panel_sleep(dsi0_base: usize, dsi1_base: usize, dma_scr
 /// changed nothing, as expected in hindsight.
 const DSI_INTER_CMD_DELAY_US: u32 = 0;
 
-var g_init_sent: i32 = -1;
-export fn sheng_mdss_init_sent() callconv(.c) i32 { return g_init_sent; }
 
 fn dsiSendDcs(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, cmd: u8, args: []const u8) c_int {
     var buf: [16]u8 = undefined;
@@ -4363,7 +4144,6 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
         udelay(INIT_CMD_PACING_US);
         idx += 1;
     }
-    g_init_sent = idx;
     }
 
     if (enable_dsc) {

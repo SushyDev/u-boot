@@ -438,46 +438,6 @@ static int __maybe_unused sheng_mdss_mmcx_power_on(void)
  * gated consumer clock nobody else enables for us. Cheap, simple,
  * un-polled register set -- try this before any more RPMh/BCM work.
  */
-/* DON'T-TOUCH-THE-PANEL TEST (SPEC.md task #5 log).
- *
- * Established facts, as of this test:
- *   - Linux renders correctly on this panel (green NixOS prompt + login
- *     visible) AFTER this driver has run, so the panel, the physical link
- *     and the DDIC all work, and nothing we do breaks them permanently.
- *   - The SSPP genuinely fetches: pointing it at an unmapped IOVA produced
- *     CB_FSR=0x402 (TF) with CB_FAR=0x500017c0, while the real address
- *     faults not at all.
- *   - Every register in DISPCC, both DSI hosts, both PHYs, the DPU (CTL,
- *     SSPP, LM, PP, INTF, DCE), the MDSS wrapper and VBIF matches the
- *     working kernel write-for-write, verified by tracing every write the
- *     kernel makes.
- *
- * So the video path is correct and the panel is good -- yet our frames are
- * not visible. The remaining untested split is: is it our VIDEO path that
- * fails, or our PANEL INIT?
- *
- * ABL initialises this panel for its own splash. The DDIC keeps that
- * configuration as long as it stays powered and un-reset -- and ABL's
- * teardown only stops the SoC side (measured: DSI CTRL=0, both PHY PLLs
- * stopped at handoff), it does not necessarily reset the panel.
- *
- * This test therefore does not touch the panel AT ALL: no cold-start bias
- * teardown, no reset pulse, no DCS init sequence. Everything on the SoC
- * side runs exactly as before and we stream video at whatever state ABL
- * left the DDIC in.
- *
- *   image appears -> our VIDEO path is fine and our PANEL INIT is what
- *     breaks it. That is a completely different search, on a much smaller
- *     surface (87 DCS commands + PPS), and it explains every "everything
- *     matches and it is still black" result so far.
- *   still black -> our video path cannot drive even a panel that is
- *     already initialised and known-good, despite matching the kernel
- *     write-for-write.
- *
- * Diagnostic only -- set to 0 for a normal boot.
- */
-#define SHENG_SKIP_PANEL_TOUCH 0
-
 #define SM8550_GCC_BASE			0x00100000
 #define GCC_DISP_HF_AXI_CLK_CBCR_OFF		0x2700c
 
@@ -1045,11 +1005,6 @@ extern void sheng_mdss_ubwc_init(unsigned long mdss_base);
 extern unsigned int sheng_mdss_wrapper_audit(unsigned long mdss_base);
 extern int sheng_mdss_dispcc_init(unsigned long dispcc_base);
 extern int sheng_mdss_dispcc_dsi_clks_init(unsigned long dispcc_base);
-extern int sheng_mdss_dispcc_init_pll0_only(unsigned long dispcc_base);
-extern int sheng_mdss_dispcc_init_thru_ahb(unsigned long dispcc_base);
-extern int sheng_mdss_dispcc_init_thru_mdp(unsigned long dispcc_base);
-extern int sheng_mdss_dispcc_init_thru_mdp_rcg_only(unsigned long dispcc_base);
-extern int sheng_mdss_dispcc_init_no_mdp_branch(unsigned long dispcc_base);
 extern int sheng_mdss_dsi_phy_init(unsigned long dsi_phy_base, bool is_master);
 extern int sheng_mdss_dsi_phy_start_dual(unsigned long phy0_base, unsigned long phy1_base);
 extern int sheng_mdss_replay_bringup(unsigned long phy0, unsigned long phy1, unsigned long dsi0, unsigned long dsi1);
@@ -1086,13 +1041,6 @@ extern long long sheng_mdss_smmu_fault_addr(void);
 extern void sheng_mdss_dsi_tpg_enable(unsigned long dsi0_base,
 				     unsigned long dsi1_base);
 extern void sheng_mdss_capture_state(unsigned long dst);
-extern long long sheng_mdss_dsi_read_dcs_reg_max(unsigned long dsi0_base,
-						 unsigned long dma_scratch,
-						 unsigned char reg, unsigned char maxsz);
-extern long long sheng_mdss_dsi_read_dcs_reg(unsigned long dsi0_base,
-					     unsigned long dma_scratch, unsigned char reg);
-extern int sheng_mdss_dsi_exit_sleep_only(unsigned long dsi0_base, unsigned long dsi1_base,
-					   unsigned long dma_scratch);
 extern long long sheng_mdss_dsi_read_power_mode_single(unsigned long dsi0_base,
 						       unsigned long dma_scratch);
 extern unsigned int sheng_mdss_dsi_retry_count(void);
@@ -1104,9 +1052,6 @@ extern long long sheng_mdss_verify_pipeline(unsigned long dpu_base,
 extern long long sheng_mdss_dsc_status1(unsigned long dpu_base);
 extern long long sheng_mdss_dsc_status2(unsigned long dpu_base);
 extern long long sheng_mdss_dpu_readback1(unsigned long dpu_base);
-extern int sheng_mdss_dsi_all_pixels_on(unsigned long dsi0_base,
-					unsigned long dsi1_base,
-					unsigned long dma_scratch);
 extern long long sheng_mdss_phy_audit(unsigned long phy_base, bool is_master);
 extern void sheng_mdss_smmu_setup(void);
 
@@ -1185,183 +1130,13 @@ struct sheng_mdss_priv {
  * state dangling across the handoff regardless. No-op if
  * CONFIG_VIDEO_SHENG_MDSS isn't even enabled (sheng_mdss.c/
  * sheng_mdss_hw.o aren't even compiled in that case). */
-/* HANDOFF TEST (SPEC.md task #5 log): leave the panel exactly as this
- * driver configured it, instead of returning it to cold state.
- *
- * Pairs with a kernel built to SKIP its own panel bring-up
- * (SHENG_NOPREP). Together they answer the one question U-Boot cannot ask
- * directly -- this panel implements no DCS reads, so the DDIC cannot be
- * interrogated -- namely: does our 87-command init + PPS actually
- * configure the panel?
- *
- *   Linux renders -> our panel init WORKS, and the fault is confined to
- *     our video path.
- *   Linux black   -> our panel init never takes, and every video-path
- *     measurement this session was made against an unconfigured panel.
- *
- * The first attempt at this test left the teardown ENABLED, which sends
- * Display Off + Sleep In and then asserts reset and drops avdd/avee. That
- * guarantees Linux sees a cold panel no matter how well our init worked,
- * so the result was meaningless. This flag is the fix.
- *
- * Diagnostic only: with this set, U-Boot hands Linux a live panel and a
- * still-configured DPU/DSI, which is exactly what the teardown exists to
- * avoid. Set back to 0 for normal boots.
- */
-#define SHENG_GRACEFUL_RESTART 1
-#define SHENG_REPLAY_BRINGUP 0 /* WITHDRAWN: the captured trace contains deferred-probe retries (bring-up runs 3x, early passes end with PLL bias disabled), so a verbatim replay does not produce a coherent end state -- measured phy0=0x801fff7c7ebc7e1d, zero frames. Our own bring-up matches live exhaustively; use it. */
-/* PAIRED WITH THE KERNEL'S SHENG_PRE PROBE (SPEC.md task #5 log).
- *
- * Set to 1 so the panel is handed to Linux still powered and un-reset,
- * preserving whatever DCS state U-Boot actually managed to write. Yes,
- * skipping the teardown breaks Linux's own render -- that is fine and
- * irrelevant here, because the instrument is a DCS READ of the panel's
- * power mode taken before Linux resets it, not what appears on screen.
- * That is precisely what makes this test unconfounded where the old
- * SHENG_NOINIT one was not: it never looks at the display.
- *
- * Set back to 0 once the answer is in. */
-/* The SHENG_HOSTDUMP/SHENG_PHYDUMP experiment this enabled is DONE, and it
- * came back negative in a useful way: across all 192 DSI host registers and
- * 128 PHY registers on both links, the state inherited before a FAILING
- * bring-up was byte-identical to the state inherited before a SUCCEEDING
- * one -- and identical again whether it was inherited from U-Boot or from
- * Linux itself. The dump point (just before dsi_timing_setup) sits after
- * pm_runtime/GDSC and link-clock enable, which normalises the block, so it
- * cannot see the difference it was built to find. Restored to 0 so Linux
- * gets a proper hand-off and renders again. */
-#define SHENG_SKIP_TEARDOWN 0
-
-/* Forward-bisect master switch -- see its block comment at the top of
- * sheng_mdss_probe(). 1 = probe touches no hardware at all and ABL's
- * live display is handed straight through. Requires
- * SHENG_SKIP_TEARDOWN=1 above. Set both back to 0 for normal boots. */
-#define SHENG_MDSS_DO_NOTHING 0
-
-/* b108: hand the panel over initialised but with NO video streaming. */
-#define SHENG_SKIP_DPU_START 0
-
-/* Send the panel init sequence AFTER dpu_start(), so the DCS commands go
- * out onto an already-streaming link the way the kernel does it. See the
- * call site after sheng_mdss_dpu_start() for the full reasoning.
- *
- * TESTED AND REVERTED -- it is strictly worse (b71 and b72):
- *
- *              init BEFORE dpu   init AFTER dpu
- *   sheng.panel        0          -10000 (command #0 failed)
- *   sheng.rd1   0x01F7_0000       -1 (max-pkt-size DMA failed)
- *   sheng.lanact   241/256        0/256
- *
- * b72 additionally fixed dsiWait4VideoEngBusy() to wait on the real
- * VIDEO_DONE interrupt instead of a bit that never clears, and the result
- * was byte-identical -- so landing inside BLLP is not what the command
- * engine is missing.
- *
- * Ordering is dpu_start -> panel_init -> lane sampling, so the failed
- * command comes first and WEDGES the host: video then never reaches the
- * lanes either (0/256), whereas the old order's vacuous init "success"
- * at least left the host streaming (241/256). Both end black, but the
- * pre-DPU order is the better baseline and keeps Linux rendering.
- *
- * Kept as a flag rather than deleted: it is still the ordering the kernel
- * uses, so if the command path is ever fixed this is worth retrying. */
-/* RE-ENABLED on hard evidence (b77 per-command trace).
- *
- * LANE_STATUS sampled between DMA trigger and completion, over all 100
- * commands of a boot:
- *     mid LANE = 0x1f1f (every lane in STOPSTATE) on 98 of 100
- *     mid LANE = 0x1f00 (data lanes DRIVING)      on 2 of 100
- * and those 2 are exactly the commands where STATUS0 had bit 3 set --
- * VIDEO_MODE_ENGINE_BUSY. Every one of them reported ret=0 with ACK_ERR=0.
- *
- * So commands only reach the wire while the video engine is streaming.
- * With panel_init before dpu_start there is no video, the lanes never
- * leave stop state, and all 87 init commands are silently discarded --
- * which is precisely the "DMA succeeds, panel receives nothing, every
- * register still correct" contradiction this driver has had all along.
- *
- * Paired with the dsiWait4VideoEngBusy() mask fix; b71/b72 tried this
- * ordering and died at command 0 because that wait could never see
- * VIDEO_DONE with the interrupt masked off. */
-/* Back to 0. b78 tried this ordering WITH the dsiWait4VideoEngBusy() mask
- * fix and panel_init still aborted after ~3 commands (12 failed attempts,
- * 4 retries each), ACK_ERR=0 throughout.
- *
- * And the b77 reasoning that motivated it was wrong: the two commands
- * showing mid LANE=0x1f00 were the dual DCS read running after dpu_start,
- * so LANE_STATUS at that sample point was reporting VIDEO traffic on the
- * lanes, not command transmission. b78 falsified it outright -- 12
- * commands ran with VIDEO_MODE_ENGINE_BUSY set and the lanes still read
- * 0x1f1f.
- *
- * What survives: with the mask fix the BLLP wait genuinely works now, and
- * commands issued inside BLLP time out. That is a different failure from
- * the silent vacuous success, and a sharper one -- Linux issues commands
- * in exactly that window and succeeds. */
-/* CONFIRMED FAILING -- do not re-enable without new information.
- *
- * Tested three times now (b71, b78, b88). b88 was a deliberate retry after
- * b87 exposed this driver's documented intermittent fault live, which made
- * b78's single failing boot untrustworthy. b88 reproduced it exactly on a
- * clean boot:
- *
- *     sheng.panel = -10000   (command #0 failed)
- *     16 commands, 12 of them ETIMEDOUT (r=110)
- *     sheng.lanact = 0       (video never reaches the lanes afterwards)
- *
- * versus the pre-DPU ordering on the same build: panel_init_ret = 0, 100
- * commands, zero timeouts.
- *
- * So it is real, and it is a SPECIFIC divergence from Linux worth keeping
- * in view: our command DMA transmits fine with no video running (proven --
- * the 132-byte PPS takes 114us at LP escape rate) but times out the moment
- * the DPU is streaming. Linux issues its commands into exactly that window
- * and succeeds. TRIG_CTRL matches bit-for-bit (0x80001004, including
- * BLOCK_DMA_WITHIN_FRAME), the INTF timing/porches are identical, and
- * dsiWait4VideoEngBusy() now genuinely waits on VIDEO_DONE. Whatever lets
- * the kernel interleave commands with live video, we have not found it. */
-/* CONFIRMED BROKEN (b71/b78/b88), and b90 captured WHY.
- *
- * With the DPU streaming before panel_init, the DSI video engine goes busy
- * but never completes a frame:
- *
- *     vwait: waited_us=70000 VIDEO_DONE=0 intr=02220200 st0=0b lane=00001f1f
- *     series(st0/fifo/lane): 0b/55551011/1f1f  x10, stable over 10ms
- *
- * MASK_VIDEO_DONE is enabled and VIDEO_DONE never fires in 70ms -- about
- * ten frame periods at 144Hz. LANE_STATUS bit4 (CLKLN_STOPSTATE) is SET,
- * so the CLOCK LANE never enters HS; the working ordering reads 0x1f00
- * with that bit clear. FIFO_STATUS goes 0x11111210 (healthy) -> 0x55551011,
- * i.e. the video FIFO backs up and stops draining.
- *
- * So the command timeouts are a CONSEQUENCE, not the cause: the video
- * engine stalls with a parked clock lane, no frame ever completes, the
- * BLLP wait burns its full 70ms, and every command then times out.
- *
- * The real finding: video only streams if the DCS init ran FIRST. Something
- * in the panel-init sequence is what gets the clock lane into HS. That is
- * the specific divergence from Linux worth chasing -- the kernel streams
- * video and injects commands into it without needing that ordering. */
-#define SHENG_PANEL_AFTER_DPU 0
-
 void sheng_mdss_teardown(void)
 {
 	if (!IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS))
 		return;
 
-	if (SHENG_SKIP_TEARDOWN)
-		return;
-
-	/* DIAGNOSTIC TEST RESULT (SPEC.md task #5 log): temporarily
-	 * disabling this teardown reproduced the exact same silent
-	 * "backlight only, no picture" Linux symptom -- confirmed via dmesg
-	 * that NONE of arm-smmu context faults, dsi_tx_timeout/DCS errors,
-	 * or PLL lock timeouts appear. msm_dpu/msm_dsi/adreno gpu all bind
-	 * and initialize cleanly regardless. Whatever U-Boot leaves behind
-	 * that disrupts Linux's render is silent at the kernel fault/
-	 * timeout level -- not a logged hardware fault. This teardown is
-	 * the confirmed, working fix; do not disable it again without a
-	 * specific new hypothesis to test. */
+	/* Skipping this leaves Linux with backlight and no picture, and the
+	 * kernel logs no fault of any kind while it happens. Keep it. */
 
 	/* 1. Panel: Display Off (0x28) + Sleep In (0x10) over the DSI
 	 * command channel, while the host/PHY can still carry commands. */
@@ -1577,12 +1352,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * because we half-configured the hardware. Touch nothing and Linux
 	 * gets the pristine ABL state that debian-sheng's drm/msm booted from
 	 * successfully before sheng_mdss.c existed at all. */
-	if (SHENG_MDSS_DO_NOTHING) {
-		BBM("DO_NOTHING: probe returning immediately, ABL state untouched");
-		sheng_bb_finish();
-		return 0;
-	}
-
 	for (unsigned int i = 0; i < SHENG_MDSS_STATUS_COUNT; i++)
 		sheng_mdss_status_set(i, SHENG_MDSS_STATUS_NOT_REACHED);
 
@@ -1617,11 +1386,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * a graceful Display Off + Sleep In, and only THEN power-cycle it and
 	 * run the real init. That reproduces, for our own init, exactly the
 	 * starting conditions that make Linux's init work. */
-	if (!SHENG_SKIP_PANEL_TOUCH && !SHENG_GRACEFUL_RESTART) {
-		sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 0); /* reset asserted */
-		sheng_mdss_raw_gpio_set(TLMM_PANEL_AVEE_GPIO, 0);
-		sheng_mdss_raw_gpio_set(TLMM_PANEL_AVDD_GPIO, 0);
-	}
 	sheng_mdss_gdsc_probe(SM8550_DISPCC_BASE, 0);
 	sheng_mdss_gdsc_disable(SM8550_DISPCC_BASE);
 	BBM("gdsc collapsed");
@@ -1793,33 +1557,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * DSI1 is slave (sources its bit clock from DSI0 over
 	 * qcom,sync-dual-dsi) -- see sheng_mdss_dsi_phy_init()'s comment
 	 * in sheng_mdss_hw.zig. Both must succeed. */
-	/* VERBATIM REPLAY of the kernel's bring-up write sequence -- see
-	 * sheng_mdss_replay_bringup()'s comment. Replaces our own PHY reset,
-	 * per-PHY init, dual PLL start and DSI host bring-up with the exact
-	 * 347 writes the working kernel issues, in order. Everything before
-	 * this (GDSC, DISPCC, UBWC, regulators) and after it (DSI link clocks,
-	 * panel power/reset, DCS init, DPU) is unchanged. */
-	if (SHENG_REPLAY_BRINGUP) {
-		/* Phase 0: PHY writes only. The DSI host half must wait until
-		 * the link clocks exist -- see the phase function's comment. */
-		sheng_mdss_replay_bringup_phase(0,
-						 SM8550_MDSS_DSI0_PHY_BASE,
-						 SM8550_MDSS_DSI1_PHY_BASE,
-						 SM8550_MDSS_DSI0_BASE,
-						 SM8550_MDSS_DSI1_BASE);
-		ret = sheng_mdss_dispcc_dsi_clks_init(SM8550_DISPCC_BASE);
-		env_set_hex("sheng_mdss_replay", (unsigned long)ret);
-		if (ret)
-			return ret;
-		/* Phase 1: DSI host writes, now that byte/pclk/esc are live. */
-		sheng_mdss_replay_bringup_phase(1,
-						 SM8550_MDSS_DSI0_PHY_BASE,
-						 SM8550_MDSS_DSI1_PHY_BASE,
-						 SM8550_MDSS_DSI0_BASE,
-						 SM8550_MDSS_DSI1_BASE);
-		goto bringup_done;
-	}
-
 	sheng_mdss_dsi_reset_both_phys(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE);
 	ret = sheng_mdss_dsi_phy_init(SM8550_MDSS_DSI0_PHY_BASE, true);
 	BBS("phy0_init_ret", ret);
@@ -1867,12 +1604,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	env_set_hex("sheng_mdss_dsi_clks", (unsigned long)ret);
 	if (ret)
 		return ret;
-
-	/* Replay path rejoins HERE, past the link-clock init -- it already ran
-	 * it between its two phases. Calling it twice re-runs
-	 * rcg2ConfigureHidOnly()'s update-poll on RCGs that are already
-	 * running, which times out and aborted probe on b49. */
-bringup_done:
 
 	/* BISECTION: reset-toggle + GDSC + DISPCC + both DSI PHYs confirmed
 	 * reaching Linux. Next: add DSI panel init back and stop right
@@ -1937,25 +1668,22 @@ bringup_done:
 	sheng_mdss_dsi_host_video_prepare(SM8550_MDSS_DSI0_BASE,
 					  SM8550_MDSS_DSI1_BASE);
 
-	if (SHENG_GRACEFUL_RESTART) {
-		/* ABL's panel is still powered and configured at this point.
-		 * Shut it down the same way our own teardown shuts it down for
-		 * Linux -- Display Off, then Sleep In -- before removing power.
-		 * See the comment at the cold-start block above. */
-		sheng_mdss_smmu_setup();
-		sheng_mdss_dsi_panel_sleep(SM8550_MDSS_DSI0_BASE,
-					    SM8550_MDSS_DSI1_BASE,
-					    SHENG_MDSS_DSI_DMA_SCRATCH);
+	/* ABL hands over a live, configured panel. Shut it down gracefully --
+	 * Display Off, Sleep In -- before cutting power, then power-cycle it.
+	 * A DDIC that loses power without Sleep In can latch a state that a
+	 * later reset does not clear. */
+	sheng_mdss_smmu_setup();
+	sheng_mdss_dsi_panel_sleep(SM8550_MDSS_DSI0_BASE,
+				    SM8550_MDSS_DSI1_BASE,
+				    SHENG_MDSS_DSI_DMA_SCRATCH);
 
-		/* Now the power-cycle, in the teardown's order: reset asserted
-		 * first, then avee, then avdd. Held off long enough for the
-		 * panel rails to genuinely discharge rather than glitch. */
-		sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 0);
-		sheng_mdss_raw_gpio_set(TLMM_PANEL_AVEE_GPIO, 0);
-		sheng_mdss_raw_gpio_set(TLMM_PANEL_AVDD_GPIO, 0);
-		/* The GPIOs alone do not remove panel power -- LCD_BIAS_EN is
-		 * latched over I2C too. Clear it so the rails genuinely collapse. */
-		BBS("bias OFF over i2c", sheng_ktz8866_set_bias(0));
+	/* Power-cycle in teardown order: reset, then avee, then avdd. */
+	sheng_mdss_raw_gpio_set(TLMM_PANEL_RESET_GPIO, 0);
+	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVEE_GPIO, 0);
+	sheng_mdss_raw_gpio_set(TLMM_PANEL_AVDD_GPIO, 0);
+	/* GPIOs gate the rails, they do not create them. LCD_BIAS_CFG1 is
+	 * latched over I2C -- clear it or the rails never collapse. */
+	BBS("bias OFF over i2c", sheng_ktz8866_set_bias(0));
 
 		/* THE UNMEASURED STEP (b104).
 		 *
@@ -1979,49 +1707,29 @@ bringup_done:
 		 * also gates these rails over I2C), the DDIC never loses power,
 		 * and no amount of correct DCS traffic can bring it up.
 		 *
-		 * Packed: [31:16] avdd IN_OUT, [15:0] avee IN_OUT. Expect 0. */
-		{
-			volatile u32 *p_io = (volatile u32 *)(uintptr_t)
-				(SM8550_TLMM_BASE + 0x4 +
-				 TLMM_GPIO_REG_SIZE * TLMM_PANEL_AVDD_GPIO);
-			volatile u32 *n_io = (volatile u32 *)(uintptr_t)
-				(SM8550_TLMM_BASE + 0x4 +
-				 TLMM_GPIO_REG_SIZE * TLMM_PANEL_AVEE_GPIO);
+	 */
+	{
+		volatile u32 *p_io = (volatile u32 *)(uintptr_t)
+			(SM8550_TLMM_BASE + 0x4 +
+			 TLMM_GPIO_REG_SIZE * TLMM_PANEL_AVDD_GPIO);
+		volatile u32 *n_io = (volatile u32 *)(uintptr_t)
+			(SM8550_TLMM_BASE + 0x4 +
+			 TLMM_GPIO_REG_SIZE * TLMM_PANEL_AVEE_GPIO);
 
-			mdelay(20);
-			BBV("rails DURING off (expect 0, avdd<<16|avee)",
-			    (((unsigned long long)(*p_io & 0xffff)) << 16) |
-			    ((unsigned long long)(*n_io & 0xffff)));
-			mdelay(60);
-			BBV("rails LATE in off window",
-			    (((unsigned long long)(*p_io & 0xffff)) << 16) |
-			    ((unsigned long long)(*n_io & 0xffff)));
-			/* b2xx: was mdelay(40), giving a 120ms total off window.
-			 * The true control (no commands, no video) proved the panel
-			 * is already unresponsive after U-Boot's power+reset alone,
-			 * while Linux's blank/unblank -- which holds the rails down
-			 * for ~1-2s -- leaves it answering 0x08. The GPIOs do go low
-			 * (measured 0x0 across the window), so if 120ms simply is not
-			 * long enough for the KTZ8866 rails to discharge, the DDIC
-			 * never truly loses power and never resets its state. */
-			mdelay(1000);
-		}
+		/* Rails need a long off window to discharge. Shorter than
+		 * ~1s and the DDIC keeps its state across the cycle. */
+		mdelay(20);
+		BBV("rails DURING off (expect 0, avdd<<16|avee)",
+		    (((unsigned long long)(*p_io & 0xffff)) << 16) |
+		    ((unsigned long long)(*n_io & 0xffff)));
+		mdelay(60);
+		BBV("rails LATE in off window",
+		    (((unsigned long long)(*p_io & 0xffff)) << 16) |
+		    ((unsigned long long)(*n_io & 0xffff)));
+		mdelay(1000);
 	}
-	/* NB: this used to be a braceless `if` with the two diagnostic calls
-	 * below dangling outside it -- harmless while the flag was 0, but a
-	 * silent lie the moment it isn't. Braced. */
-	if (!SHENG_SKIP_PANEL_TOUCH) {
-		sheng_mdss_panel_power_and_reset();
-		BBM("panel powered + reset pulsed");
-	} else {
-		/* INHERIT PATH: ABL handed us a live, already-initialised DDIC
-		 * (sheng.abl measured reset deasserted + both bias rails high).
-		 * Touch none of it -- no power cycle, no reset pulse, no DCS --
-		 * and stream video at a panel a working bootloader configured.
-		 * This is the only way to exercise our video path WITHOUT its
-		 * result depending on our own unverifiable DCS init. */
-		BBM("panel UNTOUCHED (inheriting ABL init)");
-	}
+	sheng_mdss_panel_power_and_reset();
+	BBM("panel powered + reset pulsed");
 	sheng_mdss_phy144_mark(6, SM8550_MDSS_DSI0_PHY_BASE);
 
 	/* EARLIEST-POSSIBLE BTA, minimal configuration -- see
@@ -2220,24 +1928,15 @@ bringup_done:
 	env_set_hex("sheng_mdss_preaud1",
 		    (unsigned long)sheng_mdss_dsi1_audit(SM8550_MDSS_DSI1_BASE));
 
-	if (SHENG_SKIP_PANEL_TOUCH || SHENG_PANEL_AFTER_DPU) {
-		/* panel_init() normally does this first; still required for the
-		 * DPU's own SSPP fetch -- and when SHENG_PANEL_AFTER_DPU moves
-		 * panel_init() past dpu_start(), this standalone call is what
-		 * keeps the SSPP's translation set up in time. */
-		sheng_mdss_smmu_setup();
-		ret = 0;
-	} else {
-		ret = sheng_mdss_dsi_panel_init(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
-						 SHENG_MDSS_DSI_DMA_SCRATCH, true);
-		BBS("panel_init_ret", ret);
-		BBR("DSI0 CTRL", SM8550_MDSS_DSI0_BASE, 0x000);
-		BBR("DSI0 STATUS0", SM8550_MDSS_DSI0_BASE, 0x004);
-		BBR("DSI0 FIFO", SM8550_MDSS_DSI0_BASE, 0x008);
-		BBR("DSI0 LANE_STATUS", SM8550_MDSS_DSI0_BASE, 0x0a4);
-		BBR("DSI0 ACK_ERR", SM8550_MDSS_DSI0_BASE, 0x068);
-		BBR("DSI0 TIMEOUT", SM8550_MDSS_DSI0_BASE, 0x0bc);
-	}
+	ret = sheng_mdss_dsi_panel_init(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
+					 SHENG_MDSS_DSI_DMA_SCRATCH, true);
+	BBS("panel_init_ret", ret);
+	BBR("DSI0 CTRL", SM8550_MDSS_DSI0_BASE, 0x000);
+	BBR("DSI0 STATUS0", SM8550_MDSS_DSI0_BASE, 0x004);
+	BBR("DSI0 FIFO", SM8550_MDSS_DSI0_BASE, 0x008);
+	BBR("DSI0 LANE_STATUS", SM8550_MDSS_DSI0_BASE, 0x0a4);
+	BBR("DSI0 ACK_ERR", SM8550_MDSS_DSI0_BASE, 0x068);
+	BBR("DSI0 TIMEOUT", SM8550_MDSS_DSI0_BASE, 0x0bc);
 	sheng_mdss_phy144_mark(7, SM8550_MDSS_DSI0_PHY_BASE);
 	sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI_PANEL, ret);
 	env_set_hex("sheng_mdss_panel", (unsigned long)ret);
@@ -2480,12 +2179,6 @@ bringup_done:
 	 *     SSPP fetch or framebuffer content) and the command path is done.
 	 *   Linux reads -61  -> the init does not take even on a healthy link,
 	 *     and the video stream is irrelevant. */
-	if (SHENG_SKIP_DPU_START) {
-		BBM("dpu_start SKIPPED (b108: isolating init from video)");
-		env_set_hex("sheng_mdss_dpu_start", 0);
-		goto dpu_started;
-	}
-
 	ret = sheng_mdss_dpu_start(SM8550_MDSS_DPU_BASE,
 				    SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
 				    SHENG_MDSS_FB_ADDR,
@@ -2495,7 +2188,6 @@ bringup_done:
 				    true); /* DSC ruled out as the blocker -- see comment above */
 	env_set_hex("sheng_mdss_dpu_start", (unsigned long)ret);
 	BBM("dpu_start done");
-dpu_started:
 	BBR("DSI0 STATUS0 post-dpu", SM8550_MDSS_DSI0_BASE, 0x004);
 	BBR("DSI0 LANE_STATUS post-dpu", SM8550_MDSS_DSI0_BASE, 0x0a4);
 	/* THE instrument for the b95 PLL0 rate fix. This is the register that
@@ -2539,17 +2231,7 @@ dpu_started:
 	 * Linux -- and a DDIC that receives nothing, answers no BTA, and
 	 * stays unconfigured while perfectly good video is sent to it.
 	 *
-	 * Flip SHENG_PANEL_AFTER_DPU back to 0 to restore the old ordering. */
-	if (SHENG_PANEL_AFTER_DPU && !SHENG_SKIP_PANEL_TOUCH) {
-		ret = sheng_mdss_dsi_panel_init(SM8550_MDSS_DSI0_BASE,
-						 SM8550_MDSS_DSI1_BASE,
-						 SHENG_MDSS_DSI_DMA_SCRATCH, true);
-		sheng_mdss_status_set(SHENG_MDSS_STATUS_DSI_PANEL, ret);
-		env_set_hex("sheng_mdss_panel", (unsigned long)ret);
-		env_set_hex("sheng_mdss_rdsingle",
-			    (unsigned long)sheng_mdss_dsi_read_power_mode_single(
-				    SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH));
-	}
+	 */
 
 	/* Frame/line counters (dpu_hw_intf.c: INTF_FRAME_COUNT=0xAC,
 	 * INTF_LINE_COUNT=0xB0, relative to each intf_N_base) increment
