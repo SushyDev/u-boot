@@ -84,9 +84,11 @@ void sheng_mdss_debug_start(void);
 void sheng_mdss_debug_stage(unsigned int stage, int ret);
 void sheng_mdss_debug_env(const char *name, unsigned long long v);
 void sheng_mdss_debug_log(unsigned int tag, unsigned int value);
+void sheng_mdss_debug_pin(const char *name, unsigned int gpio);
 void sheng_mdss_debug_finish(void);
 void sheng_mdss_debug_final_dump(void);
 void sheng_mdss_debug_post_dpu_report(void);
+void sheng_mdss_debug_post_panel_report(void);
 
 #define BBM(n)		sheng_bb_mark(n)
 #define BBV(n, v)	sheng_bb_val((n), (unsigned long long)(v))
@@ -99,10 +101,12 @@ void sheng_mdss_debug_post_dpu_report(void);
 #define SHENG_DBG_ENV(n, v)	sheng_mdss_debug_env((n), (unsigned long long)(v))
 #define SHENG_DBG_STAGE(s, r)	sheng_mdss_debug_stage((s), (r))
 #define SHENG_DBG_LOG(t, v)	sheng_mdss_debug_log((t), (unsigned int)(v))
+#define SHENG_DBG_PIN(n, g)	sheng_mdss_debug_pin((n), (g))
 #define SHENG_DBG_START()	sheng_mdss_debug_start()
 #define SHENG_DBG_FINISH()	sheng_mdss_debug_finish()
 #define SHENG_DBG_FINAL_DUMP()	sheng_mdss_debug_final_dump()
 #define SHENG_DBG_POST_DPU_REPORT()	sheng_mdss_debug_post_dpu_report()
+#define SHENG_DBG_POST_PANEL_REPORT()	sheng_mdss_debug_post_panel_report()
 
 #else
 
@@ -116,10 +120,12 @@ void sheng_mdss_debug_post_dpu_report(void);
 #define SHENG_DBG_ENV(n, v)	((void)0)
 #define SHENG_DBG_STAGE(s, r)	((void)0)
 #define SHENG_DBG_LOG(t, v)	((void)0)
+#define SHENG_DBG_PIN(n, g)	((void)0)
 #define SHENG_DBG_START()	((void)0)
 #define SHENG_DBG_FINISH()	((void)0)
 #define SHENG_DBG_FINAL_DUMP()	((void)0)
 #define SHENG_DBG_POST_DPU_REPORT()	((void)0)
+#define SHENG_DBG_POST_PANEL_REPORT()	((void)0)
 
 #endif /* CONFIG_VIDEO_SHENG_MDSS_DEBUG */
 

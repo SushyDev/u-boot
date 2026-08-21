@@ -9,6 +9,8 @@
  */
 
 #include <env.h>
+#include <vsprintf.h>
+#include <asm/global_data.h>
 #include <asm/io.h>
 #include <asm/barriers.h>
 #include <cpu_func.h>
@@ -16,6 +18,8 @@
 #include <linux/kconfig.h>
 #include <linux/types.h>
 #include <stdbool.h>
+
+DECLARE_GLOBAL_DATA_PTR;
 
 #include "sheng_mdss_debug.h"
 #include "sheng_mdss_regs.h"
@@ -62,6 +66,19 @@ void sheng_mdss_debug_log(unsigned int tag, unsigned int value)
 	entries[*count * 2 + 1] = value;
 	(*count)++;
 	breadcrumb_flush(SHENG_MDSS_LOG_ADDR, 4 + (*count) * 8);
+}
+
+/* CFG in the high half, IN_OUT in the low half. In IN_OUT, bit 0 is the
+ * value driven and bit 1 is what the pad actually reads: a pin driven
+ * low must read 0. Anything else means something is holding the line. */
+void sheng_mdss_debug_pin(const char *name, unsigned int gpio)
+{
+	volatile u32 *ctl = (volatile u32 *)(uintptr_t)
+		(SM8550_TLMM_BASE + TLMM_GPIO_REG_SIZE * gpio);
+	volatile u32 *io = (volatile u32 *)(uintptr_t)
+		(SM8550_TLMM_BASE + 0x4 + TLMM_GPIO_REG_SIZE * gpio);
+
+	sheng_bb_val(name, (((unsigned long long)*ctl) << 32) | *io);
 }
 
 void sheng_mdss_debug_env(const char *name, unsigned long long v)
@@ -297,4 +314,73 @@ void sheng_mdss_debug_post_dpu_report(void)
 						     SM8550_MDSS_DSI1_BASE));
 
 	BBM("probe exit");
+}
+
+long long sheng_mdss_dsi_trigger_probe(void);
+unsigned int sheng_mdss_dsi_retry_count(void);
+unsigned int sheng_mdss_dsi_status0_before_first_cmd(void);
+long long sheng_mdss_dsi_timeout_diag(void);
+long long sheng_mdss_dsi_snapshot_1(void);
+long long sheng_mdss_dsi_snapshot_2(void);
+long long sheng_mdss_dsi_snapshot_3(void);
+long long sheng_mdss_dsi_snapshot_4(void);
+unsigned int sheng_mdss_smmu_diag1(void);
+long long sheng_mdss_iova_diag1(void);
+long long sheng_mdss_iova_diag2(void);
+long long sheng_mdss_dmabuf_diag(void);
+
+/* Which DRAM bank, if any, holds addr. build_mem_map() maps only what
+ * the previous bootloader reported in gd->dram[], so an address in a
+ * bank U-Boot does not own is simply unmapped: CPU stores go nowhere
+ * and the DPU fetches a region it may not read. Both look identical to
+ * a correctly programmed pipeline with no pixels. */
+static void report_dram_bank(const char *what, unsigned long addr)
+{
+	char name[48];
+	int b;
+
+	for (b = 0; b < CONFIG_NR_DRAM_BANKS; b++) {
+		if (!gd->dram[b].size)
+			continue;
+		if (addr < gd->dram[b].start ||
+		    addr >= gd->dram[b].start + gd->dram[b].size)
+			continue;
+
+		snprintf(name, sizeof(name), "sheng_mdss_%s_bank", what);
+		sheng_mdss_debug_env(name, b);
+		snprintf(name, sizeof(name), "sheng_mdss_%s_bank_start", what);
+		sheng_mdss_debug_env(name, gd->dram[b].start);
+		snprintf(name, sizeof(name), "sheng_mdss_%s_bank_size", what);
+		sheng_mdss_debug_env(name, gd->dram[b].size);
+		return;
+	}
+
+	snprintf(name, sizeof(name), "sheng_mdss_%s_bank", what);
+	sheng_mdss_debug_env(name, ~0UL);
+}
+
+/* State right after the DCS init, before the DPU starts streaming. */
+void sheng_mdss_debug_post_panel_report(void)
+{
+	BBR("DSI0 RDBK_DATA0", SM8550_MDSS_DSI0_BASE, 0x068);
+	BBR("DSI0 RDBK_DATA_CTRL", SM8550_MDSS_DSI0_BASE, 0x1d0);
+
+	SHENG_DBG_ENV("sheng_mdss_trigprobe", sheng_mdss_dsi_trigger_probe());
+	SHENG_DBG_ENV("sheng_mdss_retries", sheng_mdss_dsi_retry_count());
+	SHENG_DBG_ENV("sheng_mdss_status0_pre",
+		      sheng_mdss_dsi_status0_before_first_cmd());
+	SHENG_DBG_ENV("sheng_mdss_timeout_diag", sheng_mdss_dsi_timeout_diag());
+	SHENG_DBG_ENV("sheng_mdss_snap1", sheng_mdss_dsi_snapshot_1());
+	SHENG_DBG_ENV("sheng_mdss_snap2", sheng_mdss_dsi_snapshot_2());
+	SHENG_DBG_ENV("sheng_mdss_snap3", sheng_mdss_dsi_snapshot_3());
+	SHENG_DBG_ENV("sheng_mdss_snap4", sheng_mdss_dsi_snapshot_4());
+	SHENG_DBG_ENV("sheng_mdss_smmu_diag1", sheng_mdss_smmu_diag1());
+	SHENG_DBG_ENV("sheng_mdss_smmu_diag2", sheng_mdss_smmu_diag2());
+	SHENG_DBG_ENV("sheng_mdss_smmu_diag3", sheng_mdss_smmu_diag3());
+	SHENG_DBG_ENV("sheng_mdss_iova_diag1", sheng_mdss_iova_diag1());
+	SHENG_DBG_ENV("sheng_mdss_iova_diag2", sheng_mdss_iova_diag2());
+	SHENG_DBG_ENV("sheng_mdss_dmabuf", sheng_mdss_dmabuf_diag());
+
+	report_dram_bank("scratch", SHENG_MDSS_DSI_DMA_SCRATCH);
+	report_dram_bank("fb", SHENG_MDSS_FB_ADDR);
 }
