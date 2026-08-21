@@ -184,12 +184,19 @@ CONFIG_VIDEO_FONT_16X32=y
 # boot menu's once-a-second countdown redraw unusable. With it on, only
 # the rectangle that actually changed is flushed.
 CONFIG_VIDEO_DAMAGE=y
-# U-Boot defaults to BLACK text on a WHITE background. That is why the panel
-# showed a white screen after video_clear(), and why the console became
-# invisible the moment uc_priv->format was set correctly: the foreground
-# ended up black on black. White-on-black is both the conventional choice
-# and unambiguous to verify on a panel we cannot otherwise inspect.
-# CONFIG_SYS_WHITE_ON_BLACK is not set
+# Dark console: WHITE text on a BLACK background.
+#
+# U-Boot's default is the other way round, which is why video_clear() painted
+# the whole 3048x2032 panel white -- a full-brightness flash on every screen
+# clear, and the boot menu rendered as a white sheet. It is also the wrong
+# background for this driver: sheng_mdss_probe() fills the framebuffer solid
+# black before handing it over, so black-on-white put black glyphs on black
+# until video_clear() repainted, and any region the console had not touched
+# stayed black anyway.
+#
+# White-on-black matches the driver's own fill, so the panel is uniformly
+# dark from the very first frame through to the menu.
+CONFIG_SYS_WHITE_ON_BLACK=y
 # Interactive boot menu on the panel. The board has no reachable UART, so
 # the only usable input is the physical buttons: BUTTON_KEYBOARD turns them
 # into a keyboard, BUTTON_QCOM_PMIC covers the PMIC pwrkey/resin, and

@@ -1241,9 +1241,6 @@ struct sheng_mdss_priv {
 /* b108: hand the panel over initialised but with NO video streaming. */
 #define SHENG_SKIP_DPU_START 0
 
-/* b2xx: send exactly one DCS write and look for its effect. */
-#define SHENG_WRITE_PROBE 0
-
 /* Send the panel init sequence AFTER dpu_start(), so the DCS commands go
  * out onto an already-streaming link the way the kernel does it. See the
  * call site after sheng_mdss_dpu_start() for the full reasoning.
@@ -2735,52 +2732,16 @@ dpu_started:
 		    (unsigned long)sheng_mdss_dsi_video_readback2(SM8550_MDSS_DSI0_BASE,
 								 SM8550_MDSS_DSI1_BASE));
 
-	/* No large hold here anymore -- board.c calls backlight init
-	 * AFTER this probe() returns, with its own 5s hold at the end.
-	 * Holding here would delay backlight turning on at all (exactly
-	 * what made it "come on very late" before this was found). */
+	BBM("probe exit");
 
-	/* THIS is probe's real exit -- everything below it is unreachable
-	 * (the second sheng_mdss_dpu_start() and its diagnostics included).
-	 * b74 attached the final dump down there and it silently never ran,
-	 * which is why that log ended abruptly after "dpu_start done". */
-	BBM("probe exit (real return 0)");
-	/* END-OF-PROBE READ. Is the panel still alive when we hand it to Linux?
-	 *
-	 * b105 proved the DDIC answers 0x08 right after our power+reset. Yet
-	 * Linux, booted noinit=1 noreset=1 so it neither resets nor initialises,
-	 * reads -61 -- even in the true control where U-Boot sends NO commands
-	 * and starts NO video. So the panel dies somewhere between those two
-	 * points, and the whole SHENG_PM chain assumed that point was ours.
-	 *
-	 * If this read succeeds, the panel is alive at handoff and it is LINUX's
-	 * own DSI/PHY bring-up that wedges it -- which would make SHENG_PM an
-	 * invalid judge of U-Boot's init, and invalidate a long line of
-	 * conclusions drawn from it, including "our init does not take".
-	 * If it fails, the panel died inside our own probe after power+reset.
-	 *
-	 * Safe to do here even though a BTA can wedge the link: this runs after
-	 * everything, and in the control build there is no video to disturb. */
-	/* WRITE PROBE: one command, effect visible in the read below.
-	 * 0x08 -> 0x18 means writes land. Still 0x08 means no write ever
-	 * reaches the DDIC, even though it answers our reads. */
-	if (SHENG_WRITE_PROBE) {
-		int wr = sheng_mdss_dsi_exit_sleep_only(SM8550_MDSS_DSI0_BASE,
-							SM8550_MDSS_DSI1_BASE,
-							SHENG_MDSS_DSI_DMA_SCRATCH);
-		BBS("write probe: 0x11 exit_sleep ret", wr);
-		mdelay(150);
-	}
-	/* Instrument check: three different DCS registers. If all three come
-	 * back with the same payload, the read path is fabricating it. */
-	/* WRITE-DELIVERY TEST: same register, two different max-packet sizes.
-	 * If 0x37 (an ordinary short write) lands, the response shape MUST
-	 * change between these two. If both come back identical, no write
-	 * this driver sends ever reaches the panel. */
-	BBS("id maxsz=1", sheng_mdss_dsi_read_dcs_reg_max(
-		SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH, 0x04, 1));
-	BBS("id maxsz=3", sheng_mdss_dsi_read_dcs_reg_max(
-		SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH, 0x04, 3));
+	/* The end-of-probe DCS diagnostics that used to sit here (a write
+	 * probe behind SHENG_WRITE_PROBE, plus two 0x04 reads at different
+	 * max-packet sizes) are gone. They existed to answer "does anything
+	 * this driver sends actually reach the DDIC", which the panel now
+	 * answers by rendering, and they are DCS traffic on a live link right
+	 * before handoff -- exactly the kind of thing that has no business in
+	 * a normal boot. */
+
 	/* HAND THE FRAMEBUFFER TO THE VIDEO UCLASS.
 	 *
 	 * This must happen BEFORE probe returns. It previously sat below the

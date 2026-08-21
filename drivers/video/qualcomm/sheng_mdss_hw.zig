@@ -4023,11 +4023,6 @@ export fn sheng_mdss_dsi_panel_sleep(dsi0_base: usize, dsi1_base: usize, dma_scr
 /// changed nothing, as expected in hindsight.
 const DSI_INTER_CMD_DELAY_US: u32 = 0;
 
-/// -1 = send the whole table. >=0 = send only the first N entries, then
-/// skip straight to the DSC tail. Bisect target for b110.
-/// 94 = the entire table but NONE of the DSC tail. First split:
-/// table (87) vs tail (7). Then bisect whichever side is guilty.
-const INIT_STOP_AFTER: i32 = -1;
 var g_init_sent: i32 = -1;
 export fn sheng_mdss_init_sent() callconv(.c) i32 { return g_init_sent; }
 
@@ -4357,28 +4352,18 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
         // pacing proven irrelevant (b109: +1ms per command, no change).
         // Yet these same 94 bytes replayed from Linux reach 0x9c.
         //
-        // So ONE of these commands leaves the DDIC unresponsive when we
-        // send it. b105 measured the split directly: the read BEFORE the
-        // table returns 0x08, the read AFTER it times out. Binary-search
-        // the boundary -- U-Boot sends the first N, hands over with
-        // SHENG_SKIP_TEARDOWN=1, and Linux (noinit=1 noreset=1) reads the
-        // panel. Not -61 => the first N are safe.
-        if (INIT_STOP_AFTER >= 0 and idx >= INIT_STOP_AFTER) break;
+        // The INIT_STOP_AFTER bisect that used to gate this loop (send only
+        // the first N commands, skip the DSC tail, and let Linux read the
+        // DDIC's power mode) is gone. It was chasing "one of these commands
+        // wedges the panel", which was never true: the panel was fine and
+        // the display was being torn down later in board_late_init(). See
+        // board_preboot_os() and sheng_ktz8866_backlight_init() in board.c.
         const ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, entry.cmd, entry.args);
         if (ret != 0) return -(10000 + idx);
         udelay(INIT_CMD_PACING_US);
         idx += 1;
     }
     g_init_sent = idx;
-    // When bisecting, send NOTHING after the truncated table -- no DSC
-    // enable, no PPS, no framerate ctrl, no sleep-out/display-on. b110 got
-    // this wrong: it truncated the table but still ran the whole tail, so
-    // -61 could not distinguish "a table command wedged the DDIC" from
-    // "the tail wedged it" from "a partial init is simply incomplete".
-    // With the tail skipped the readout means one thing only:
-    //   panel still answers (0x08-ish) -> the first N commands are safe
-    //   -61                            -> one of the first N wedges it
-    if (INIT_STOP_AFTER >= 0) return 0;
     }
 
     if (enable_dsc) {
