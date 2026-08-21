@@ -198,7 +198,13 @@ CONFIG_CMD_BOOTMENU=y
 # costs the working startup log to chase. Leaving it off keeps the console
 # useful; re-enable together with a fix for the menu's colour handling.
 # CONFIG_VIDEO_ANSI is not set
-CONFIG_AUTOBOOT_MENU_SHOW=y
+# AUTOBOOT_MENU_SHOW: OFF, paired with VIDEO_ANSI being off. It replaces the
+# plain countdown with the boot menu, and the menu emits ANSI escapes that a
+# non-ANSI vidconsole prints as raw control characters -- which wipes the
+# startup log and leaves a blank panel. Both must be enabled together, and
+# only once the menu's colour handling renders visibly. CMD_BOOTMENU stays
+# available so `bootmenu` can still be run by hand.
+# CONFIG_AUTOBOOT_MENU_SHOW is not set
 # `version` is used by bootcmd to put real U-Boot build info on the panel.
 # U-Boot's own banner is printed before the video device probes and is then
 # wiped by video_clear(), so it never reaches the screen; re-emitting it from
