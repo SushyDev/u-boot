@@ -941,6 +941,113 @@ static int sheng_ktz8866_write_chip(const char *path, u32 *bl_en_readback_out)
 
 extern void sheng_mdss_teardown(void);
 
+
+/* POST-PANEL-POWER BIAS READBACK (SPEC.md task #5 log).
+ *
+ * The last unverified link in the panel-power chain. We write LCD_BIAS_CFG1
+ * (0x09 = 0x9F, LCD_BIAS_EN) to both KTZ8866s in
+ * sheng_ktz8866_backlight_init(), which runs BEFORE the video probe. The
+ * video probe then drops GPIO 30/31 (avdd/avee enables) as part of its
+ * cold-start teardown and re-raises them ~100ms later. Nothing has ever
+ * checked what the bias IC looks like AFTER that cycle.
+ *
+ * Two things worth knowing, neither ever measured:
+ *   0x09 LCD_BIAS_CFG1 -- did our LCD_BIAS_EN write actually stick, and
+ *                         does it survive the enable-pin cycle?
+ *   0x0F FLAG          -- the chip's own fault register. If the KTZ8866
+ *                         latched an OVP/OCP/UVLO fault on OUTP/OUTN, the
+ *                         +/-5.8V panel rails are OFF regardless of both
+ *                         the enable pins (verified driven high at the pad
+ *                         via sheng.biasgpio) and the 0x09 enable bit.
+ *
+ * A latched bias fault would explain every remaining observation at once:
+ * an unpowered panel is deaf to LP and HS alike, never answers a BTA, never
+ * drives contention onto the lanes, and shows black while every SoC-side
+ * register legitimately matches working silicon -- which is exactly the
+ * state we are in, now that the lanes are confirmed to be driven
+ * (sheng.lanes = 0x00001F00 on both links, matching live).
+ *
+ * Read live under a WORKING Linux display, both chips: 0x09 = 0x9f,
+ * 0x0F = 0x00 (no faults). Anything else here names the culprit.
+ *
+ * Packed: [63:56] A 0x09, [55:48] A 0x0F, [31:24] B 0x09, [23:16] B 0x0F.
+ */
+static int sheng_ktz8866_read_chip(const char *path, u8 *cfg1, u8 *flag)
+{
+	struct udevice *bus, *chip;
+	ofnode i2c_node;
+	int ret;
+
+	*cfg1 = 0xff;
+	*flag = 0xff;
+
+	i2c_node = ofnode_path(path);
+	if (!ofnode_valid(i2c_node))
+		return -ENOENT;
+	ret = uclass_get_device_by_ofnode(UCLASS_I2C, i2c_node, &bus);
+	if (ret)
+		return ret;
+	ret = dm_i2c_probe(bus, 0x11, 0, &chip);
+	if (ret)
+		return ret;
+
+	ret = dm_i2c_read(chip, 0x09, cfg1, 1);
+	if (ret)
+		return ret;
+	return dm_i2c_read(chip, 0x0f, flag, 1);
+}
+
+/* Drive LCD_BIAS_CFG1 (0x09) on both KTZ8866s. 0x9F = LCD_BIAS_EN set,
+ * 0x1F = enable cleared.
+ *
+ * WHY THIS EXISTS: U-Boot's panel "power cycle" only toggles GPIO 30/31.
+ * Those are the chip's enable pins, but LCD_BIAS_EN is also latched over
+ * I2C, and we set it to 0x9F before probe. If the chip keeps the +/-5.8V
+ * rails up on the strength of that I2C bit, the DDIC never actually loses
+ * power -- so a reset pulse alone cannot clear its state and it will not
+ * accept a fresh init sequence.
+ *
+ * That matches every measurement: the panel answers DCS reads (its logic
+ * rail is fine), an ordinary write lands (0x37 changes the read response),
+ * but 0x11 exit_sleep and the whole 94-command init leave power_mode at
+ * 0x08. Linux's own boot-time init fails identically when it inherits our
+ * rails, and only succeeds after a blank/unblank -- which goes through the
+ * ktz8866 regulator driver and therefore clears the bias over I2C.
+ */
+int sheng_ktz8866_set_bias(int enable)
+{
+	static const char * const paths[] = {
+		"/soc@0/geniqup@ac0000/i2c@a84000",
+		"/soc@0/geniqup@9c0000/i2c@988000",
+	};
+	u8 val = enable ? 0x9f : 0x1f;
+	int i, rc = 0;
+
+	for (i = 0; i < 2; i++) {
+		struct udevice *bus, *chip;
+		ofnode node = ofnode_path(paths[i]);
+
+		if (!ofnode_valid(node) ||
+		    uclass_get_device_by_ofnode(UCLASS_I2C, node, &bus) ||
+		    dm_i2c_probe(bus, 0x11, 0, &chip) ||
+		    dm_i2c_write(chip, 0x09, &val, 1))
+			rc = -1;
+	}
+	return rc;
+}
+
+static void sheng_ktz8866_bias_readback(void)
+{
+	u8 a_cfg1, a_flag, b_cfg1, b_flag;
+
+	sheng_ktz8866_read_chip("/soc@0/geniqup@ac0000/i2c@a84000", &a_cfg1, &a_flag);
+	sheng_ktz8866_read_chip("/soc@0/geniqup@9c0000/i2c@988000", &b_cfg1, &b_flag);
+
+	env_set_hex("sheng_bl_post",
+		    (((unsigned long)a_cfg1) << 56) | (((unsigned long)a_flag) << 48) |
+		    (((unsigned long)b_cfg1) << 24) | (((unsigned long)b_flag) << 16));
+}
+
 static void sheng_ktz8866_backlight_init(void)
 {
 	int ret;
@@ -1128,6 +1235,10 @@ int board_late_init(void)
 		}
 		env_set_hex("sheng_mdss_vret", (unsigned long)vret);
 	}
+
+	/* Bias IC state AFTER the video probe cycled the avdd/avee enable
+	 * pins -- see sheng_ktz8866_bias_readback()'s comment. */
+	sheng_ktz8866_bias_readback();
 
 	/* Visual hold, moved out of sheng_ktz8866_backlight_init() now that
 	 * that runs before the video probe -- gives a real chance to see

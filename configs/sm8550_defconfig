@@ -16,7 +16,27 @@ CONFIG_FIT=y
 CONFIG_FIT_VERBOSE=y
 CONFIG_BOOTSTD_FULL=y
 # CONFIG_BOOTMETH_VBE is not set
-CONFIG_BOOTDELAY=1
+# Interactive serial console for display bring-up debugging.
+#
+# Was 1 second, which is unusable -- and irrelevant until now, because
+# &uart7 was left status="disabled" so there was no console to interrupt at
+# all. With the UART enabled and stdout-path set in the board DTS, 30s is a
+# real window to hit a key and land at the U-Boot prompt.
+#
+# Deliberately NOT -1 (never autoboot). If the serial wiring or baud is
+# wrong on the first attempt, -1 would leave a board that never boots Linux
+# and therefore has no exec.sh either -- recoverable only by reflashing.
+# With 30 it still boots normally if untouched, so a silent console costs
+# nothing. Once the prompt is confirmed working, -1 is the better setting.
+CONFIG_BOOTDELAY=30
+
+# Needed to poke MDSS/DSI/PHY registers live from the prompt (md/mw) and to
+# drive the panel reset and bias lines by hand (gpio). Both default to y in
+# Kconfig, but this board's defconfig never stated them -- make it explicit
+# so an upstream default change cannot silently remove the console tooling
+# this debugging depends on.
+CONFIG_CMD_MEMORY=y
+CONFIG_CMD_GPIO=y
 CONFIG_OF_BOARD_SETUP=y
 CONFIG_SAVE_PREV_BL_INITRAMFS_START_ADDR=y
 CONFIG_SYS_CBSIZE=512

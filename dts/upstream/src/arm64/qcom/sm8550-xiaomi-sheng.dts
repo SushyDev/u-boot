@@ -96,6 +96,11 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
+
+		/* Points U-Boot's console at serial0 (= &uart7, the GENI debug
+		 * UART). Without this the serial driver may bind but nothing is
+		 * selected as stdout, so the board stays silent. */
+		stdout-path = "serial0:115200n8";
 	};
 
 	gpio-keys {
@@ -548,6 +553,27 @@
 };
 
 &qupv3_id_1 {
+	status = "okay";
+};
+
+/*
+ * Debug UART -- GENI QUP1 SE7 at 0x00a9c000, the SAME physical port Linux
+ * drives as ttyMSM0 (console=ttyMSM0,115200n8 in bootargs).
+ *
+ * sm8550.dtsi marks it status = "disabled" and this board file only ever
+ * declared the serial0 alias, never enabled the node. So U-Boot has had NO
+ * serial console on this board at all: every diagnostic in this project has
+ * had to be smuggled out as sheng.* entries on the kernel command line and
+ * read back from /proc/cmdline after Linux boots, one boot per datapoint,
+ * inside a CONFIG_SYS_CBSIZE=512 budget.
+ *
+ * With this enabled and stdout-path set in /chosen, U-Boot gets a real
+ * interactive console: md/mw to read and write MDSS/DSI/PHY registers live,
+ * retry panel init without reflashing, and see printf() output as it
+ * happens. CONFIG_PRE_CONSOLE_BUFFER=y is already set, so output produced
+ * before the console is up is buffered and flushed rather than lost.
+ */
+&uart7 {
 	status = "okay";
 };
 
