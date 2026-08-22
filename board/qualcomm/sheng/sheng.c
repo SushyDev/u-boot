@@ -404,9 +404,13 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	 * Linux under /proc/device-tree/chosen/. There is no console during
 	 * probe, so this is the only way the results get out.
 	 *
-	 * mdss-status is 9 stages x 4 bytes, in SHENG_MDSS_STATUS_* order.
-	 * The count MUST track SHENG_MDSS_STATUS_COUNT. Each slot is
+	 * mdss-status is 11 stages x 4 bytes, in SHENG_MDSS_STATUS_* order.
+	 * The length MUST track SHENG_MDSS_STATUS_COUNT. Each slot is
 	 * 0x7fffffff for a stage never reached, 0 on success, or -errno.
+	 *
+	 * The last slot is the probe result. Anything but 0 there means an
+	 * early return and therefore backlight with no picture; the first
+	 * non-zero slot before it names the stage that failed.
 	 */
 	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS) && IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
 		int nodeoff = fdt_path_offset(blob, "/chosen");
@@ -414,7 +418,7 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 		if (nodeoff >= 0) {
 			fdt_setprop(blob, nodeoff, "sheng,mdss-status",
 				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3000),
-				    36);
+				    11 * 4);
 			fdt_setprop(blob, nodeoff, "sheng,uclass-get-device-ret",
 				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3020),
 				    4);

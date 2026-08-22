@@ -37,6 +37,42 @@ extern int sheng_rsc_send_active_write(u32 resource_addr, u32 data);
 extern int sheng_bcm_vote(u32 addr);
 extern int sheng_regulator_vote(u32 addr, u32 millivolts);
 
+/*
+ * Per-stage bring-up status, relayed into /chosen by ft_board_setup()
+ * and readable from Linux at /proc/device-tree/chosen/sheng,mdss-status.
+ *
+ * Always built, unlike the rest of the debug channel. Every early return
+ * in probe aborts before the framebuffer handoff while the backlight
+ * still comes up, so without this a failed bring-up is indistinguishable
+ * from any other -- backlight on, nothing rendered, no clue which stage.
+ *
+ * D-cache is on, so each slot must be pushed to DRAM as it is written:
+ * a hang on the next instruction would otherwise leave it in a dirty
+ * cache line that a post-mortem scrape never sees.
+ */
+#define SHENG_MDSS_STATUS_ADDR	(CONFIG_PRE_CON_BUF_ADDR + 0x3000)
+
+void sheng_mdss_stage_record(unsigned int stage, int ret)
+{
+	volatile int *slots = (volatile int *)(uintptr_t)SHENG_MDSS_STATUS_ADDR;
+
+	if (!IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
+		return;
+
+	slots[stage] = ret;
+	flush_dcache_range(SHENG_MDSS_STATUS_ADDR + stage * sizeof(*slots),
+			   SHENG_MDSS_STATUS_ADDR + (stage + 1) * sizeof(*slots));
+	dsb();
+}
+
+void sheng_mdss_stage_init(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < SHENG_MDSS_STATUS_COUNT; i++)
+		sheng_mdss_stage_record(i, SHENG_MDSS_STATUS_NOT_REACHED);
+}
+
 /* Panel bias: KTZ8866 over I2C plus GPIOs 30/31. The DDIC needs it
  * before any DCS command. Without it commands go nowhere and the host
  * still reports success -- a plain DCS write needs no ACK, so an
@@ -311,6 +347,8 @@ static int sheng_mdss_probe(struct udevice *dev)
 	SHENG_DBG_PIN("abl avdd", TLMM_PANEL_AVDD_GPIO);
 	SHENG_DBG_PIN("abl avee", TLMM_PANEL_AVEE_GPIO);
 
+	sheng_mdss_stage_init();
+
 	priv->mdss_base = dev_read_addr(dev);
 	SHENG_DBG_START();
 	BBM("probe entry");
@@ -349,6 +387,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * covers qns_mem_noc_hf exactly. Without this vote mmss_noc keeps
 	 * the AXI gate for MASTER_MDP closed. */
 	ret = sheng_mdss_bcm_vote("MM0");
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_BCM_MM0, ret);
 	SHENG_DBG_ENV("sheng_mdss_bcm_mm0", (unsigned long)ret);
 
 	/* GCC_DISP_HF_AXI_CLK must be on before any DSI command DMA: it is
@@ -428,6 +467,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * writel() hook in dsi_phy_7nm.c. */
 	ret = sheng_mdss_dsi_phy_start_dual(SM8550_MDSS_DSI0_PHY_BASE,
 					     SM8550_MDSS_DSI1_PHY_BASE);
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI_PHY_START, ret);
 	SHENG_DBG_ENV("sheng_mdss_phy_start", (unsigned long)ret);
 	BBS("phy_start_dual_ret", ret);
 	BBR("PHY0 STATUS", SM8550_MDSS_DSI0_PHY_BASE, 0x140);
@@ -441,6 +481,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * matter what MDP_CLK does. Must follow the PHY PLL lock above:
 	 * these mux from the PHY PLL, not DISPCC's PLL0. */
 	ret = sheng_mdss_dispcc_dsi_clks_init(SM8550_DISPCC_BASE);
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI_LINK_CLKS, ret);
 	sheng_mdss_phy144_mark(5, SM8550_MDSS_DSI0_PHY_BASE);
 	SHENG_DBG_ENV("sheng_mdss_dsi_clks", (unsigned long)ret);
 	if (ret)
@@ -573,6 +614,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 				    SHENG_PANEL_VBACK_PORCH,
 				    SHENG_PANEL_VSYNC_WIDTH,
 				    true /* DSC */);
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DPU, ret);
 	SHENG_DBG_ENV("sheng_mdss_dpu_start", (unsigned long)ret);
 	BBM("dpu_start done");
 	BBR("DSI0 STATUS0 post-dpu", SM8550_MDSS_DSI0_BASE, 0x004);
@@ -657,6 +699,10 @@ static int sheng_mdss_probe(struct udevice *dev)
 	video_set_flush_dcache(dev, true);
 
 	SHENG_DBG_FINAL_DUMP();
+
+	/* Reached the framebuffer handoff. Any other value in this slot
+	 * means an early return above and therefore no picture. */
+	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_PROBE, 0);
 
 	return 0;
 }

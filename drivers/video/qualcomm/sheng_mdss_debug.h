@@ -56,19 +56,39 @@ enum {
 /* A stage that never ran. */
 #define SHENG_MDSS_STATUS_NOT_REACHED	0x7fffffff
 
-/* Bring-up stages, one status slot each. */
+/*
+ * Bring-up stages, one status slot each. There must be a slot for EVERY
+ * early return in sheng_mdss_probe(): any of them aborts before the
+ * framebuffer handoff, and the backlight still comes up in
+ * board_late_init(), so the board shows backlight and no picture with
+ * no other clue as to why.
+ *
+ * ft_board_setup() relays these into /chosen, so its length must track
+ * SHENG_MDSS_STATUS_COUNT.
+ */
 enum {
 	SHENG_MDSS_STATUS_MDSS_RESET,
-	SHENG_MDSS_STATUS_BCM_MM0,
-	SHENG_MDSS_STATUS_MMCX,
 	SHENG_MDSS_STATUS_GDSC,
+	SHENG_MDSS_STATUS_BCM_MM0,
 	SHENG_MDSS_STATUS_DISPCC,
 	SHENG_MDSS_STATUS_DSI0_PHY,
 	SHENG_MDSS_STATUS_DSI1_PHY,
+	SHENG_MDSS_STATUS_DSI_PHY_START,
+	SHENG_MDSS_STATUS_DSI_LINK_CLKS,
 	SHENG_MDSS_STATUS_DSI_PANEL,
 	SHENG_MDSS_STATUS_DPU,
+	SHENG_MDSS_STATUS_PROBE,
 	SHENG_MDSS_STATUS_COUNT,
 };
+
+/*
+ * The stage relay is NOT part of the debug rig. It is nine DRAM writes
+ * with no MMIO, and it is the only way to tell which stage aborted on a
+ * board with no console. Always built.
+ */
+void sheng_mdss_stage_record(unsigned int stage, int ret);
+void sheng_mdss_stage_init(void);
+#define SHENG_DBG_STAGE(s, r)	sheng_mdss_stage_record((s), (r))
 
 #if IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS_DEBUG)
 
@@ -83,7 +103,6 @@ void sheng_bb_block(const char *name, unsigned long base,
 void sheng_bb_finish(void);
 
 void sheng_mdss_debug_start(void);
-void sheng_mdss_debug_stage(unsigned int stage, int ret);
 void sheng_mdss_debug_env(const char *name, unsigned long long v);
 void sheng_mdss_debug_log(unsigned int tag, unsigned int value);
 void sheng_mdss_debug_pin(const char *name, unsigned int gpio);
@@ -101,7 +120,6 @@ void sheng_mdss_debug_post_panel_report(void);
 
 /* Named so it reads as a report, not a setter. */
 #define SHENG_DBG_ENV(n, v)	sheng_mdss_debug_env((n), (unsigned long long)(v))
-#define SHENG_DBG_STAGE(s, r)	sheng_mdss_debug_stage((s), (r))
 #define SHENG_DBG_LOG(t, v)	sheng_mdss_debug_log((t), (unsigned int)(v))
 #define SHENG_DBG_PIN(n, g)	sheng_mdss_debug_pin((n), (g))
 #define SHENG_DBG_START()	sheng_mdss_debug_start()
@@ -124,7 +142,6 @@ void sheng_mdss_debug_post_panel_report(void);
 #define BBB(n, b, s, c)		((void)(sizeof(n) + sizeof(b) + \
 					sizeof(s) + sizeof(c)))
 #define SHENG_DBG_ENV(n, v)	((void)(sizeof(n) + sizeof(v)))
-#define SHENG_DBG_STAGE(s, r)	((void)(sizeof(s) + sizeof(r)))
 #define SHENG_DBG_LOG(t, v)	((void)(sizeof(t) + sizeof(v)))
 #define SHENG_DBG_PIN(n, g)	((void)(sizeof(n) + sizeof(g)))
 #define SHENG_DBG_START()	((void)0)

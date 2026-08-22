@@ -26,9 +26,8 @@ DECLARE_GLOBAL_DATA_PTR;
 #include "sheng_mdss_debug.h"
 #include "sheng_mdss_regs.h"
 
-/* Status slots, then the log ring. Keep these apart: the status block
- * ends at +0x3000 + SHENG_MDSS_STATUS_COUNT*4. */
-#define SHENG_MDSS_STATUS_ADDR		(CONFIG_PRE_CON_BUF_ADDR + 0x3000)
+/* The log ring. The stage slots live at +0x3000 and are written from
+ * sheng_mdss.c; keep clear of them. */
 #define SHENG_MDSS_LOG_ADDR		(CONFIG_PRE_CON_BUF_ADDR + 0x3100)
 #define SHENG_MDSS_LOG_MAX		64
 
@@ -44,18 +43,6 @@ static void breadcrumb_flush(uintptr_t addr, size_t len)
 {
 	flush_dcache_range(addr, addr + len);
 	dsb();
-}
-
-void sheng_mdss_debug_stage(unsigned int stage, int ret)
-{
-	volatile int *slots = (volatile int *)(uintptr_t)SHENG_MDSS_STATUS_ADDR;
-
-	if (!IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
-		return;
-
-	slots[stage] = ret;
-	breadcrumb_flush(SHENG_MDSS_STATUS_ADDR + stage * sizeof(*slots),
-			 sizeof(*slots));
 }
 
 void sheng_mdss_debug_log(unsigned int tag, unsigned int value)
@@ -95,15 +82,11 @@ void sheng_mdss_debug_env(const char *name, unsigned long long v)
 void sheng_mdss_debug_start(void)
 {
 	volatile u32 *count = (volatile u32 *)(uintptr_t)SHENG_MDSS_LOG_ADDR;
-	unsigned int i;
 
 	if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
 		*count = 0;
 		breadcrumb_flush(SHENG_MDSS_LOG_ADDR, sizeof(*count));
 	}
-
-	for (i = 0; i < SHENG_MDSS_STATUS_COUNT; i++)
-		sheng_mdss_debug_stage(i, SHENG_MDSS_STATUS_NOT_REACHED);
 
 	/* Reserve the blackbox for the same reason the driver reserves its
 	 * framebuffer: it is a fixed address that U-Boot's allocator knows
