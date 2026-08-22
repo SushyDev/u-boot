@@ -119,12 +119,63 @@ static u32 sheng_tlmm_io_read(unsigned int gpio)
 		(SHENG_TLMM_BASE + 0x4 + SHENG_TLMM_GPIO_REG_SIZE * gpio);
 }
 
+/* KTZ8866 state as ABL left it: BL_EN, brightness, and the LCD bias
+ * enable, read before anything of ours writes to the chip.
+ *
+ * HOW DID ABL BLANK THE PANEL? It leaves the rails and EN high but the
+ * screen dark, and there are three candidate mechanisms with very
+ * different consequences:
+ *
+ *   brightness 0, BL_EN set  -> it dimmed the backlight. The DDIC may
+ *                               still be initialised and even scanning;
+ *                               restoring could be a single I2C write.
+ *   BL_EN clear              -> it disabled the current sinks.
+ *   both look live           -> it blanked over DCS (display-off /
+ *                               sleep-in) or stopped the DPU, and
+ *                               pm_pre_val will say which.
+ *
+ * Packed: BL_EN << 24 | BRT_MSB << 16 | BRT_LSB << 8 | LCD_BIAS_CFG1.
+ */
+static u32 sheng_handover_blregs = 0xffffffff;
+static int sheng_handover_blret;
+
+static int sheng_ktz8866_read_handover(const char *path)
+{
+	struct udevice *bus, *chip;
+	ofnode i2c_node;
+	u8 en = 0xff, lsb = 0xff, msb = 0xff, bias = 0xff;
+	int ret;
+
+	i2c_node = ofnode_path(path);
+	if (!ofnode_valid(i2c_node))
+		return -ENOENT;
+	ret = uclass_get_device_by_ofnode(UCLASS_I2C, i2c_node, &bus);
+	if (ret)
+		return ret;
+	ret = dm_i2c_probe(bus, 0x11, 0, &chip);
+	if (ret)
+		return ret;
+
+	/* Read-only. Writing anything here would destroy the very state we
+	 * are trying to observe. */
+	dm_i2c_read(chip, 0x08, &en, 1);	/* BL_EN */
+	dm_i2c_read(chip, 0x05, &msb, 1);	/* BL_BRT_MSB */
+	dm_i2c_read(chip, 0x04, &lsb, 1);	/* BL_BRT_LSB */
+	dm_i2c_read(chip, 0x09, &bias, 1);	/* LCD_BIAS_CFG1 */
+
+	sheng_handover_blregs = ((u32)en << 24) | ((u32)msb << 16) |
+				((u32)lsb << 8) | (u32)bias;
+	return 0;
+}
+
 void qcom_board_init(void)
 {
 	sheng_handover_bl = sheng_tlmm_io_read(SHENG_BACKLIGHT_GPIO);
 	sheng_handover_avdd = sheng_tlmm_io_read(SHENG_PANEL_AVDD_GPIO);
 	sheng_handover_avee = sheng_tlmm_io_read(SHENG_PANEL_AVEE_GPIO);
 	sheng_handover_rst = sheng_tlmm_io_read(SHENG_PANEL_RESET_GPIO);
+	sheng_handover_blret =
+		sheng_ktz8866_read_handover("/soc@0/geniqup@ac0000/i2c@a84000");
 
 	/* ANSWERED 2026-08-22 (b359): the panel is ALREADY BLACK during a
 	 * 3s hold here, with backlight EN and both rails still reading
@@ -403,9 +454,64 @@ static void sheng_ktz8866_bias_readback(void)
 		    (((unsigned long)b_cfg1) << 24) | (((unsigned long)b_flag) << 16));
 }
 
+/* Brightness only -- two writes, for when the chip is already configured
+ * and enabled. See the fast path in sheng_ktz8866_backlight_init(). */
+static int sheng_ktz8866_set_brightness(const char *path)
+{
+	struct udevice *bus, *chip;
+	ofnode i2c_node;
+	u8 val;
+	int ret;
+
+	i2c_node = ofnode_path(path);
+	if (!ofnode_valid(i2c_node))
+		return -ENOENT;
+	ret = uclass_get_device_by_ofnode(UCLASS_I2C, i2c_node, &bus);
+	if (ret)
+		return ret;
+	ret = dm_i2c_probe(bus, 0x11, 0, &chip);
+	if (ret)
+		return ret;
+
+	val = SHENG_KTZ8866_BRIGHTNESS & 0x7;
+	ret = dm_i2c_write(chip, 0x04, &val, 1);
+	if (ret)
+		return ret;
+	val = (SHENG_KTZ8866_BRIGHTNESS >> 3) & 0xff;
+	return dm_i2c_write(chip, 0x05, &val, 1);
+}
+
 static void sheng_ktz8866_backlight_init(void)
 {
 	int ret;
+
+	/* FAST PATH: ABL already configured and enabled this chip.
+	 *
+	 * Measured (b367): ABL hands over BL_EN=0x7f, brightness 1390, LCD
+	 * bias on -- i.e. the backlight is LIT the whole time. The screen is
+	 * dark because the DDIC is asleep behind it, not because the
+	 * backlight is off. Re-running the full twelve-register init to
+	 * reach a state the chip is already in costs ~110ms, and every one
+	 * of those milliseconds is inside the black gap.
+	 *
+	 * Requires the master-enable bit (0x40 in BL_EN) and LCD_BIAS_EN
+	 * (0x80 in LCD_BIAS_CFG1) to both be set in what we actually read at
+	 * board_init(). Anything else -- including a failed read, which
+	 * leaves blregs at 0xffffffff -- takes the full path.
+	 */
+	if (sheng_handover_blret == 0 &&
+	    sheng_handover_blregs != 0xffffffff &&
+	    ((sheng_handover_blregs >> 24) & 0x40) &&
+	    (sheng_handover_blregs & 0x80)) {
+		sheng_backlight_gpio_enable();
+		ret = sheng_ktz8866_set_brightness("/soc@0/geniqup@ac0000/i2c@a84000");
+		sheng_ktz8866_status_set(0, ret);
+		ret = sheng_ktz8866_set_brightness("/soc@0/geniqup@9c0000/i2c@988000");
+		sheng_ktz8866_status_set(1, ret);
+		env_set_hex("sheng_bl_fast", 1);
+		return;
+	}
+	env_set_hex("sheng_bl_fast", 0);
 
 	sheng_ktz8866_status_set(0, SHENG_KTZ8866_STATUS_NOT_REACHED);
 	sheng_ktz8866_status_set(1, SHENG_KTZ8866_STATUS_NOT_REACHED);
@@ -451,6 +557,200 @@ static void sheng_ktz8866_backlight_init(void)
 	env_set_hex("sheng_bl_en_rb_a", (unsigned long)bl_en_rb_a);
 	env_set_hex("sheng_bl_en_rb_b", (unsigned long)bl_en_rb_b);
 
+}
+
+/* XBL/ABL's own log, scraped out of the reserved region it writes into.
+ *
+ * xbl-dt-log-region@81a00000 (256KB) is declared in this board's DTS and
+ * is where the earlier boot stages log. Linux CANNOT read it -- it is
+ * no-map, so /dev/mem returns EFAULT (measured) -- but U-Boot has plain
+ * access, so relaying it through /chosen is the only way to ever see
+ * what ABL said.
+ *
+ * Worth having because ABL blanks the panel before handing over and we
+ * have no idea why. If it logs anything about display teardown, it is
+ * sitting in DRAM on every single boot, free.
+ *
+ * Scans for the first printable ASCII run of at least MINRUN characters
+ * and copies from there, so a region full of binary or zeros costs a
+ * scan and yields an empty property rather than garbage.
+ */
+#define SHENG_XBL_LOG_ADDR	0x81a00000
+#define SHENG_XBL_LOG_SIZE	0x40000
+#define SHENG_XBL_LOG_COPY	768
+#define SHENG_XBL_LOG_MINRUN	16
+
+/* Keywords worth finding. Dumping from the start of the region just
+ * shows PBL/XBL boot banners (verified b367) -- anything ABL says about
+ * the display is much further in, past 256KB of earlier logging. */
+static const char * const sheng_xbl_keys[] = {
+	"Display", "display", "DISPLAY", "MDP", "Splash", "splash", "Panel",
+};
+
+static bool sheng_mem_match(const volatile u8 *p, unsigned int off,
+			    unsigned int limit, const char *s)
+{
+	unsigned int k;
+
+	for (k = 0; s[k]; k++) {
+		if (off + k >= limit || p[off + k] != (u8)s[k])
+			return false;
+	}
+	return true;
+}
+
+/* Same tail-dump, over an arbitrary region.
+ *
+ * WHY A SECOND REGION: xbl-dt-log-region@81a00000 ends at "SBL1, End"
+ * (1.479s). ABL runs from there until it hands over at ~5.57s -- FOUR
+ * SECONDS, 62% of the whole boot, and where the panel goes dark -- and
+ * it keeps its own log somewhere else.
+ *
+ * xbl-ramdump-region@81200000 is 0x280000 (2.5MB). U-Boot's pre-console
+ * buffer sits at its START and is only CONFIG_PRE_CON_BUF_SZ (16KB), so
+ * anything ABL left beyond that is intact. Skip our own 16KB and scan
+ * the rest rather than relocating PRE_CON_BUF_ADDR, which would have
+ * been the risky way to answer the same question.
+ */
+static int sheng_log_tail(const volatile u8 *p, unsigned int size,
+			  char *out, int outlen)
+{
+	unsigned int i, j, last_text = 0;
+	int n = 0;
+
+	for (i = 0; i < size; i++) {
+		if (sheng_mem_match(p, i, size, "B - ") ||
+		    sheng_mem_match(p, i, size, "S - ") ||
+		    sheng_mem_match(p, i, size, "D - "))
+			last_text = i;
+	}
+	if (!last_text)
+		return 0;
+
+	{
+		unsigned int start = last_text > SHENG_XBL_LOG_COPY ?
+					last_text - SHENG_XBL_LOG_COPY : 0;
+
+		while (start < size && p[start] != '\n')
+			start++;
+
+		for (j = start; j < size && n < outlen - 2 &&
+				j < last_text + 200; j++) {
+			u8 c = p[j];
+
+			out[n++] = ((c >= 0x20 && c < 0x7f) || c == '\n')
+					? (char)c : '.';
+		}
+	}
+	out[n] = '\0';
+	return n + 1;
+}
+
+#define SHENG_ABL_LOG_ADDR	(CONFIG_PRE_CON_BUF_ADDR + CONFIG_PRE_CON_BUF_SZ)
+#define SHENG_ABL_LOG_SIZE	(0x280000 - CONFIG_PRE_CON_BUF_SZ)
+
+static int sheng_xbl_log_scrape(char *out, int outlen)
+{
+	const volatile u8 *p = (const volatile u8 *)(uintptr_t)SHENG_XBL_LOG_ADDR;
+	unsigned int i, j;
+	int n = 0;
+
+	/* Find the END of the text log first, then walk back.
+	 *
+	 * Dumping from the start shows PBL/XBL banners; keyword-searching
+	 * forward hits the binary devcfg tables that follow the text
+	 * (NAMEDNODE_Display / SIDMappings -- SID mapping data, not a log).
+	 * Both were tried (b367/b368). The LATEST boot stage is at the END
+	 * of the text, so that is where ABL's own lines are, including
+	 * anything it says about tearing the display down.
+	 */
+	{
+		unsigned int last_text = 0;
+
+		for (i = 0; i < SHENG_XBL_LOG_SIZE; i++) {
+			/* "B - " / "S - " / "D - " line prefixes are the
+			 * log's own format; use them as the marker for
+			 * genuine log text rather than any printable byte.
+			 *
+			 * Match the WHOLE prefix at i. The previous version
+			 * tested for " - " at i AND p[i] being B/S/D, which
+			 * cannot both hold -- so last_text stayed 0 and this
+			 * whole block was dead, silently falling through to
+			 * the keyword scan. */
+			if (sheng_mem_match(p, i, SHENG_XBL_LOG_SIZE, "B - ") ||
+			    sheng_mem_match(p, i, SHENG_XBL_LOG_SIZE, "S - ") ||
+			    sheng_mem_match(p, i, SHENG_XBL_LOG_SIZE, "D - "))
+				last_text = i;
+		}
+
+		if (last_text) {
+			unsigned int start = last_text;
+			unsigned int back = 0;
+
+			/* Walk back ~SHENG_XBL_LOG_COPY bytes of lines so we
+			 * get the tail in context, not just the final line. */
+			while (start > 0 && back < SHENG_XBL_LOG_COPY) {
+				start--;
+				back++;
+			}
+			while (start < SHENG_XBL_LOG_SIZE && p[start] != '\n')
+				start++;
+
+			for (j = start; j < SHENG_XBL_LOG_SIZE &&
+					n < outlen - 2 &&
+					j < last_text + 200; j++) {
+				u8 c = p[j];
+
+				out[n++] = ((c >= 0x20 && c < 0x7f) || c == '\n')
+						? (char)c : '.';
+			}
+			out[n] = '\0';
+			return n + 1;
+		}
+	}
+
+	for (i = 0; i < SHENG_XBL_LOG_SIZE && n < outlen - 2; i++) {
+		bool hit = false;
+
+		for (j = 0; j < ARRAY_SIZE(sheng_xbl_keys); j++) {
+			if (sheng_mem_match(p, i, SHENG_XBL_LOG_SIZE,
+					    sheng_xbl_keys[j])) {
+				hit = true;
+				break;
+			}
+		}
+		if (!hit)
+			continue;
+
+		/* Back up to the start of the line so the timestamp and log
+		 * type come with it -- the format is
+		 * "B - <microsec> - <message>". */
+		{
+			unsigned int start = i;
+			unsigned int back = 0;
+
+			while (start > 0 && back < 80 && p[start - 1] != '\n') {
+				start--;
+				back++;
+			}
+
+			for (j = start; j < SHENG_XBL_LOG_SIZE &&
+					n < outlen - 2; j++) {
+				u8 c = p[j];
+
+				if (c == '\n')
+					break;
+				out[n++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+			}
+			out[n++] = '\n';
+			i = j; /* resume past this line */
+		}
+	}
+
+	if (!n)
+		return 0;
+	out[n] = '\0';
+	return n + 1;
 }
 
 int ft_board_setup(void *blob, struct bd_info *bd)
@@ -507,14 +807,17 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 						      " abl=%lums relocdone=%lums"
 						      " backlight=%lums"
 						      " handover[bl=%x avdd=%x"
-						      " avee=%x rst=%x]",
+						      " avee=%x rst=%x"
+						      " blregs=%08x/%d]",
 						      sheng_uboot_entry_us / 1000,
 						      sheng_board_init_us / 1000,
 						      sheng_backlight_us / 1000,
 						      sheng_handover_bl,
 						      sheng_handover_avdd,
 						      sheng_handover_avee,
-						      sheng_handover_rst);
+						      sheng_handover_rst,
+						      sheng_handover_blregs,
+						      sheng_handover_blret);
 					fdt_setprop(blob, nodeoff,
 						    "sheng,boot-timing", t, n + 1);
 				}
@@ -528,6 +831,27 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 				if (n > 0)
 					fdt_setprop(blob, nodeoff,
 						    "sheng,display-diag", t, n);
+			}
+
+			/* XBL/ABL's log. Separate buffer: it is larger than
+			 * the diag strings and unrelated to the display
+			 * driver, so it must not be gated on it. */
+			{
+				static char xbl[SHENG_XBL_LOG_COPY + 1];
+				int n = sheng_xbl_log_scrape(xbl, sizeof(xbl));
+
+				if (n > 0)
+					fdt_setprop(blob, nodeoff,
+						    "sheng,xbl-log", xbl, n);
+
+				/* ABL's own log, if it lives in the ramdump
+				 * region past our pre-console buffer. */
+				n = sheng_log_tail(
+					(const volatile u8 *)(uintptr_t)SHENG_ABL_LOG_ADDR,
+					SHENG_ABL_LOG_SIZE, xbl, sizeof(xbl));
+				if (n > 0)
+					fdt_setprop(blob, nodeoff,
+						    "sheng,abl-log", xbl, n);
 			}
 		}
 	}

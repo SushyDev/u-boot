@@ -126,6 +126,36 @@ extern long long sheng_mdss_dsi_read_power_mode_single(unsigned long dsi0_base,
 /* What the DDIC says it is doing, read by U-Boot at end of probe. */
 static long long sheng_panel_pm;
 
+/* Same read, taken BEFORE we sleep and power-cycle the panel -- i.e. the
+ * state ABL actually handed over.
+ *
+ * THE HANDOVER QUESTION. ABL leaves the rails and backlight EN high but
+ * the screen dark, and we have never asked the DDIC what it thinks is
+ * going on at that moment:
+ *
+ *   0x9c -> ABL left it fully initialised and merely stopped feeding it.
+ *           We could inherit: skip the power-cycle AND the 94-command
+ *           init, program the DPU, display-on, raise brightness. That is
+ *           ~700ms of our ~1.2s black gap, and it is what the Android
+ *           kernel's continuous-splash path does.
+ *   0x08 -> ABL slept the panel; a real init is required and ~1.2s is
+ *           close to a floor.
+ *
+ * Safe to read here even though the MDSS core reset has already run: the
+ * DDIC is a separate chip and keeps its state as long as its rails stay
+ * up, which they do until the power-cycle below.
+ */
+static long long sheng_panel_pm_pre;
+
+/* Did we take the skip-our-own-teardown path? See its comment in probe. */
+static int sheng_fastpath;
+
+/* Whether ABL handed the panel over in the known-quiet 0x08 state. Drives
+ * both the fast path and the discharge length -- kept separate because
+ * the fast path may later be disabled independently while the discharge
+ * still needs to know what state we started from. */
+static int sheng_fastpath_state_ok;
+
 #define SHENG_DIAG_N 9
 static u32 sheng_diag[SHENG_DIAG_N];
 static int sheng_panel_init_ret;
@@ -154,12 +184,13 @@ static int sheng_panel_init_ret_first = 0x7fffffff;
 int sheng_mdss_diag_fmt(char *buf, int len)
 {
 	return snprintf(buf, len,
-			"probes=%u panel_init_first=%d panel_init=%d"
+			"fastpath=%d probes=%u panel_init_first=%d panel_init=%d"
 			" gdsc[%012llx] collapse_us=%d"
 			" status0=%08x fifo=%08x fifo_late=%08x lane=%08x"
 			" ackerr=%08x timeout=%08x pll_l=%08x"
-			" frames=%u->%u pm=%012llx pm_val=%02x",
-			sheng_probe_count, sheng_panel_init_ret_first,
+			" frames=%u->%u pm=%012llx pm_val=%02x"
+			" pm_pre=%012llx pm_pre_val=%02x",
+			sheng_fastpath, sheng_probe_count, sheng_panel_init_ret_first,
 			sheng_panel_init_ret,
 			(unsigned long long)sheng_mdss_gdsc_probe_result(),
 			(int)sheng_mdss_gdsc_collapse_us(),
@@ -167,7 +198,9 @@ int sheng_mdss_diag_fmt(char *buf, int len)
 			sheng_diag[2], sheng_diag[3], sheng_diag[4],
 			sheng_diag[5], sheng_diag[6], sheng_diag[7],
 			(unsigned long long)sheng_panel_pm,
-			(unsigned int)(sheng_panel_pm & 0xff)) + 1;
+			(unsigned int)(sheng_panel_pm & 0xff),
+			(unsigned long long)sheng_panel_pm_pre,
+			(unsigned int)(sheng_panel_pm_pre & 0xff)) + 1;
 }
 
 static void sheng_tmark(const char *name)
@@ -667,6 +700,38 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * A DDIC that loses power without Sleep In can latch a state that a
 	 * later reset does not clear. */
 	sheng_mdss_smmu_setup();
+
+	/* Ask the DDIC what ABL left it in, BEFORE we sleep or power-cycle
+	 * it. Placed after host_video_prepare (we need a working DSI to
+	 * ask) but before panel_sleep, so it reports ABL's state, not
+	 * ours. See sheng_panel_pm_pre. */
+	sheng_panel_pm_pre = sheng_mdss_dsi_read_power_mode_single(
+				SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH);
+
+	/* FAST PATH: ABL already slept the panel for us.
+	 *
+	 * Measured (b367): ABL hands the DDIC over reading 0x08 -- sleep-in,
+	 * display-off. It does not merely stop feeding a live panel, it
+	 * sends Display Off + Sleep In itself. So our own Display Off +
+	 * Sleep In (87ms) is re-sleeping an already-slept panel, and the
+	 * rail power-cycle (248ms) exists to recover a DDIC in an UNKNOWN
+	 * state -- which this demonstrably is not.
+	 *
+	 * A cleanly-slept DDIC plus the reset pulse below should accept a
+	 * fresh init without ever losing power. Worth ~335ms of the ~1.2s
+	 * black gap between the Xiaomi logo and U-Boot's first pixels.
+	 *
+	 * Guarded on BOTH the payload being exactly 0x08 AND the read being
+	 * trustworthy (CTRL 0x01f7 = CMD_MODE_EN asserted, BTA genuinely
+	 * issued). A null or untrustworthy read falls through to the proven
+	 * full power-cycle -- never skip work on the strength of a
+	 * measurement that might not have happened.
+	 */
+	sheng_fastpath_state_ok = ((sheng_panel_pm_pre & 0xff) == 0x08) &&
+				  (((sheng_panel_pm_pre >> 16) & 0xffff) == 0x01f7);
+	sheng_fastpath = sheng_fastpath_state_ok;
+
+	if (!sheng_fastpath) {
 	sheng_mdss_dsi_panel_sleep(SM8550_MDSS_DSI0_BASE,
 				    SM8550_MDSS_DSI1_BASE,
 				    SHENG_MDSS_DSI_DMA_SCRATCH);
@@ -700,7 +765,26 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * (soak.sh) before trusting it, and if panel init goes intermittent
 	 * raise this before touching either pacing knob. */
 	{
-		const unsigned int discharge_ms = 200;
+		/* ADAPTIVE, because the right value depends on what ABL
+		 * handed us:
+		 *
+		 *   0x08 (cleanly slept)  -> 200ms is proven good (b353-b374,
+		 *        many boots). ABL sent Display Off + Sleep In itself,
+		 *        so the DDIC is already in a known, quiet state.
+		 *
+		 *   anything else -> use the original 1080ms. Once
+		 *        /reserved-memory/splash_region is advertised, ABL
+		 *        hands over a LIVE, STREAMING panel instead (b375:
+		 *        pm_pre_val=00, bias 0x9f, different GDSC state), and
+		 *        200ms did NOT recover it -- no picture at all. A
+		 *        panel killed mid-scan is the case the long window was
+		 *        tuned for.
+		 *
+		 * Erring long on the unknown path costs boot time only when we
+		 * cannot prove the panel was quiescent, which is the right way
+		 * round.
+		 */
+		const unsigned int discharge_ms = sheng_fastpath_state_ok ? 200 : 1080;
 
 		mdelay(20);
 		SHENG_DBG_PIN("avdd during off", TLMM_PANEL_AVDD_GPIO);
@@ -710,6 +794,12 @@ static int sheng_mdss_probe(struct udevice *dev)
 		SHENG_DBG_PIN("avee late in off", TLMM_PANEL_AVEE_GPIO);
 		mdelay(discharge_ms - 80);
 	}
+	} /* !sheng_fastpath */
+
+	/* Runs on BOTH paths. On the fast path the rails are already up, so
+	 * the enables are idempotent and what matters is the reset pulse --
+	 * a hardware reset of the DDIC's digital state, which is what
+	 * actually prepares it for a fresh init. */
 	sheng_mdss_panel_power_and_reset();
 	sheng_tmark("panel pwr cycle");
 	BBM("panel powered + reset pulsed");
@@ -813,11 +903,17 @@ static int sheng_mdss_probe(struct udevice *dev)
 		sheng_diag[0] = readl((void __iomem *)(uintptr_t)(d0 + 0x004));
 		sheng_diag[1] = readl((void __iomem *)(uintptr_t)(d0 + 0x008));
 		sheng_diag[2] = readl((void __iomem *)(uintptr_t)(d0 + 0x0a4));
-		sheng_diag[3] = readl((void __iomem *)(uintptr_t)(d0 + 0x068));
+		/* 0x064 is ACK_ERR_STATUS. 0x068 -- which this read used to
+		 * use -- is RDBK_DATA0, so it was echoing the panel read's
+		 * response and reporting it as an ACK error. */
+		sheng_diag[3] = readl((void __iomem *)(uintptr_t)(d0 + 0x064));
 		sheng_diag[4] = readl((void __iomem *)(uintptr_t)(d0 + 0x0bc));
 		sheng_diag[5] = readl((void __iomem *)(uintptr_t)(SM8550_DISPCC_BASE + 0x010));
 		sheng_diag[6] = readl((void __iomem *)(uintptr_t)(intf + 0x0ac));
-		mdelay(40);
+		/* 8ms, not 40ms. Long enough for ~1 frame at 144Hz, which is
+		 * all "is the timing engine advancing" needs, and this sits
+		 * directly in the black gap the user sees. */
+		mdelay(8);
 		sheng_diag[7] = readl((void __iomem *)(uintptr_t)(intf + 0x0ac));
 		/* Re-read FIFO *after* the settle. Sampled at FRAME_COUNT 0 it
 		 * always reads 0x11111210 ("all lanes starved"), which is a

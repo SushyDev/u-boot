@@ -162,9 +162,79 @@
 			no-map;
 		};
 
-		/* TRIED AND DISPROVEN 2026-08-22 (b360): advertising ABL's
-		 * continuous-splash framebuffer here does NOT stop ABL
-		 * blanking the panel before handover.
+		/* ABL's continuous-splash framebuffer.
+		 *
+		 * THE NODE NAME IS THE WHOLE POINT: it must be exactly
+		 * "splash_region", with NO unit address. ABL looks it up by
+		 * path -- its own LinuxLoader binary contains the literal
+		 * string "/reserved-memory/splash_region" alongside
+		 * "ERROR: Could not find the splash reg property" and
+		 * "ERROR: Could not update splash mem info".
+		 *
+		 * That is also why the b360 attempt failed and was wrongly
+		 * written off: it created splash_region@b8000000, whose path
+		 * is /reserved-memory/splash_region@b8000000, which never
+		 * matches. The dtc label and the __symbols__ node were never
+		 * the mechanism at all -- and chasing them cost a broken
+		 * build (see CONFIG_OF_LIBFDT_OVERLAY in the defconfig).
+		 *
+		 * reg copied from the stock DTB (dtbo.img entry 0,
+		 * fragment@49), which has no unit address either:
+		 *
+		 *     splash_region {
+		 *             label = "cont_splash_region";
+		 *             reg = <0x00 0xb8000000 0x00 0x2b00000>;
+		 *     };
+		 *
+		 * dtc warns that a node with reg has no unit address. That is
+		 * expected and must not be "fixed" -- the stock DTB does the
+		 * same, and adding one breaks the lookup.
+		 */
+		/* DISABLED, and the reason is the interesting part.
+		 *
+		 * Enabling this node WORKS -- ABL finds it, stops blanking,
+		 * and hands over a LIVE, STREAMING panel. The Xiaomi logo
+		 * visibly stays up longer. That is the black gap actually
+		 * shrinking, and it is the only thing that has ever moved it.
+		 *
+		 * But it breaks OUR bring-up (b375/b376): no picture, no
+		 * backlight. Measured, with the panel read as the instrument:
+		 *
+		 *   pm_pre_val=00  the DDIC does not answer even BEFORE we
+		 *                  touch it (a slept handover reads 0x08)
+		 *   pm_val=00      and never answers after a full init
+		 *   blregs=..9f    ABL left LCD bias fully enabled
+		 *   gdsc 0x5022    MDSS in a different state at collapse
+		 *
+		 * NOT a discharge problem: retried with the original 1080ms
+		 * window (panel pwr cycle=1129ms) and it made no difference.
+		 *
+		 * The cause is structural. sheng_mdss_probe() collapses the
+		 * GDSC and pulses the MDSS core reset as its FIRST act, which
+		 * kills ABL's live stream mid-frame and wedges the DDIC.
+		 * Harmless when ABL handed over an already-slept panel;
+		 * fatal when it is still scanning.
+		 *
+		 * TO ENABLE THIS PROPERLY the probe must gracefully sleep the
+		 * panel (Display Off + Sleep In) over ABL's STILL-RUNNING DSI
+		 * host, before touching the GDSC -- i.e. reorder the probe,
+		 * not tune a delay. That is the same reordering a real
+		 * continuous-splash handoff needs anyway.
+		 *
+		 *	splash_region {
+		 *		label = "cont_splash_region";
+		 *		reg = <0x0 0xb8000000 0x0 0x2b00000>;
+		 *		no-map;
+		 *	};
+		 */
+
+		/* Historical note, kept so the earlier attempt is not repeated:
+		 *
+		 * b360 tried advertising this region as
+		 * splash_region@b8000000 with a "cont_splash" dtc label and
+		 * __symbols__ emitted, on the strength of upstream's
+		 * doc/board/qualcomm/phones.rst. ABL blanked anyway -- because
+		 * of the path mismatch above, not because the idea was wrong.
 		 *
 		 * The stock DTB (dtbo.img entry 0, fragment@49) has exactly:
 		 *
@@ -173,21 +243,15 @@
 		 *             reg = <0x00 0xb8000000 0x00 0x2b00000>;
 		 *     };
 		 *
-		 * That was reproduced here field-for-field, with BOTH naming
-		 * conventions (dtc label "cont_splash" per upstream's
-		 * doc/board/qualcomm/phones.rst, and the label property
-		 * "cont_splash_region" per this device's firmware) and with
-		 * __symbols__ emitted so the label was resolvable. ABL blanked
-		 * anyway. So ABL's decision is not driven by this node.
+		 * The reg and the label property were right; the NODE NAME was
+		 * not, and neither the dtc label nor __symbols__ was ever
+		 * needed. Enabling CONFIG_OF_LIBFDT_OVERLAY to get
+		 * __symbols__ also broke rendering outright -- see the comment
+		 * in configs/sm8550_defconfig. Do not reach for it again.
 		 *
-		 * Removed because enabling CONFIG_OF_LIBFDT_OVERLAY to get
-		 * __symbols__ broke rendering outright -- see the comment in
-		 * configs/sm8550_defconfig.
-		 *
-		 * Kept here as a record so nobody spends another round on it.
-		 * The real splash framebuffer address is 0xb8000000; note the
-		 * framebuffer-region@fb800000 node above matches nothing in
-		 * the stock DTB and is likely wrong.
+		 * Note the framebuffer-region@fb800000 node above matches
+		 * nothing in the stock DTB and its 402MB size is implausible;
+		 * it is probably wrong, but removing it is a separate change.
 		 */
 
 		xbl_ramdump_mem: xbl-ramdump-region@81200000 {
@@ -670,6 +734,31 @@
 };
 
 &ufs_mem_hc {
+	/* Silence two harmless boot errors, by not asking a question that
+	 * cannot be answered:
+	 *
+	 *   qcom-ufshcd ufshc@1d84000: uclass_get_device_by_ofnode failed: -19
+	 *   qcom-ufshcd ufshc@1d84000: error finding src node
+	 *
+	 * sm8550.dtsi gives this node interconnects = <&aggre1_noc ...>, but
+	 * U-Boot has NO SM8550 interconnect driver -- drivers/interconnect/qcom
+	 * ships sm8650 only, and the defconfig enables that one because it is
+	 * the only one there. So the phandles resolve to a provider that was
+	 * never registered, icc_get() fails, and the uclass prints an error
+	 * per path on every boot. It is cosmetic: UFS enumerates and we boot
+	 * the rootfs off it.
+	 *
+	 * icc_get() returns NULL early when the property is absent, so
+	 * deleting it removes the errors without changing behaviour -- the
+	 * request was already failing. Revisit if an SM8550 interconnect
+	 * driver ever lands; then this should be dropped, not kept.
+	 *
+	 * NB the display driver does its own BCM voting directly
+	 * (sheng_mdss_bcm_vote), so it does not depend on this either.
+	 */
+	/delete-property/ interconnects;
+	/delete-property/ interconnect-names;
+
 	reset-gpios = <&tlmm 210 GPIO_ACTIVE_LOW>;
 	vcc-supply = <&vreg_l17b_2p5>;
 	vcc-max-microamp = <1300000>;

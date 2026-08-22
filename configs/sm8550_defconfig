@@ -130,6 +130,10 @@ CONFIG_DM_KEYBOARD=y
 CONFIG_BUTTON_KEYBOARD=y
 CONFIG_BUTTON_QCOM_PMIC=y
 CONFIG_CMD_BOOTMENU=y
+# CONFIG_CMD_BCB is not set -- the Android BCB/misc handshake does NOT
+# make this SoC boot to fastboot (measured, b372: the write succeeds and
+# ABL ignores it). The "Reboot to fastboot" entry writes the IMEM
+# restart-reason cookie with mw instead; see board/qualcomm/sheng.env.
 # The boot menu clears the screen, positions the cursor and uses reverse
 # video for the selected entry, so it needs ANSI. A non-ANSI vidconsole
 # prints the escapes as raw control characters instead.
@@ -206,6 +210,19 @@ CONFIG_QCOM_COMMAND_DB=y
 CONFIG_QCOM_RPMH=y
 CONFIG_SPMI_MSM=y
 CONFIG_SYSRESET_QCOM_PSHOLD=y
+# PSCI SYSTEM_RESET, and it must be available for "Reboot to fastboot" to
+# work at all.
+#
+# MEASURED: writing the IMEM restart-reason cookie (0x146aa65c =
+# 0x77665500) and resetting from LINUX lands in ABL's fastboot. The same
+# cookie written from U-Boot did NOT -- the board just reboots normally.
+# The cookie is not the problem; the reset path is. Linux resets via PSCI
+# (sysrq-b -> psci_sys_reset), whereas qcom_pshold writes 0 to PS_HOLD,
+# which does not preserve the reason across the reset.
+#
+# Both drivers stay enabled: sysreset_walk() tries each in turn, so
+# PSHOLD remains the fallback if the PSCI call is ever unavailable.
+CONFIG_SYSRESET_PSCI=y
 CONFIG_UFS=y
 CONFIG_UFS_QCOM=y
 # arm64 "Image" header parsing, needed for booti to size/relocate the
