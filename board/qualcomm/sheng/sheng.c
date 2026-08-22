@@ -25,6 +25,7 @@
 #include <linux/delay.h>
 #include <linux/kconfig.h>
 #include <linux/sizes.h>
+#include <power/pmic.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -806,6 +807,77 @@ static int sheng_xbl_log_scrape(char *out, int outlen)
 	return n + 1;
 }
 
+/* PON (power-on) register dump, for working out WHY the board booted.
+ *
+ * Plugging in a charger boots this device, because ABL has an
+ * offline-charging path we do not implement -- its own binary carries
+ * "PON Reason is %d cold_boot:%d charger path: %d" and
+ * "androidboot.mode=charger". To do the same, U-Boot has to distinguish
+ * a power-key boot from a cable-insert boot, then shut down on the
+ * latter.
+ *
+ * This is the MEASUREMENT step, deliberately separated from any fix.
+ * The PON reason register offsets differ between PON generations, and
+ * this is a GEN3 part (qcom,pmk8350-pon). Writing a shutdown sequence
+ * based on a guessed offset is how "boots when you plug in" becomes
+ * "reboot-loops when you plug in", which is strictly worse and needs
+ * fastboot to escape. So: dump both PON peripherals read-only, compare a
+ * key boot against a charger boot, and only then write code.
+ *
+ * pmk8550 is pmic@0 (usid 0). U-Boot's qcom PMIC addresses registers as
+ * (PID << 8) | offset, so pon@1300's HLOS half is PID 0x13 and the PBS
+ * half at 0x800 is PID 0x08 -- the reason registers live in one of them.
+ *
+ * READ-ONLY. Nothing here writes to the PMIC.
+ */
+static int sheng_pon_dump(char *out, int outlen)
+{
+	struct udevice *pmic;
+	ofnode node;
+	int n = 0, i, ret;
+
+	node = ofnode_path("/soc@0/spmi@c400000/pmic@0");
+	if (!ofnode_valid(node))
+		node = ofnode_path("/spmi@c400000/pmic@0");
+	if (!ofnode_valid(node))
+		return 0;
+
+	ret = uclass_get_device_by_ofnode(UCLASS_PMIC, node, &pmic);
+	if (ret)
+		return snprintf(out, outlen, "pmic_err=%d", ret) + 1;
+
+	n += snprintf(out + n, outlen - n, "hlos@13xx:");
+	for (i = 0; i < 0x20 && n < outlen - 8; i++) {
+		int v = pmic_reg_read(pmic, (0x13 << 8) | i);
+
+		n += snprintf(out + n, outlen - n, " %02x", v < 0 ? 0xff : v & 0xff);
+	}
+	n += snprintf(out + n, outlen - n, " pbs@08xx:");
+	for (i = 0; i < 0x20 && n < outlen - 8; i++) {
+		int v = pmic_reg_read(pmic, (0x08 << 8) | i);
+
+		n += snprintf(out + n, outlen - n, " %02x", v < 0 ? 0xff : v & 0xff);
+	}
+
+	/* PON reset-control window. PON_PS_HOLD_RESET_CTL is documented at
+	 * PON base + 0x5A and RESET_CTL2 at 0x5B -- the pair that selects
+	 * SHUTDOWN vs WARM_RESET when PS_HOLD is dropped. Dumped read-only
+	 * because the charger-boot fix has to WRITE them, and getting that
+	 * wrong turns "boots when you plug in" into "reboot-loops when you
+	 * plug in", which needs fastboot to escape.
+	 *
+	 * Want to see: a plausible type field at 0x5a (1 = warm reset,
+	 * 4 = shutdown, 7 = hard reset) rather than 0x00/0xff, which would
+	 * mean the register is not where the documentation says. */
+	n += snprintf(out + n, outlen - n, " rst@135x:");
+	for (i = 0x50; i < 0x60 && n < outlen - 8; i++) {
+		int v = pmic_reg_read(pmic, (0x13 << 8) | i);
+
+		n += snprintf(out + n, outlen - n, " %02x", v < 0 ? 0xff : v & 0xff);
+	}
+	return n + 1;
+}
+
 int ft_board_setup(void *blob, struct bd_info *bd)
 {
 	/* Relay the driver's side channels into /chosen, readable from
@@ -896,6 +968,13 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 				if (n > 0)
 					fdt_setprop(blob, nodeoff,
 						    "sheng,xbl-log", xbl, n);
+
+				/* PON register dump -- read-only, for the
+				 * charger-boot investigation. */
+				n = sheng_pon_dump(xbl, sizeof(xbl));
+				if (n > 0)
+					fdt_setprop(blob, nodeoff,
+						    "sheng,pon", xbl, n);
 
 				/* ABL's own log, if it lives in the ramdump
 				 * region past our pre-console buffer. */

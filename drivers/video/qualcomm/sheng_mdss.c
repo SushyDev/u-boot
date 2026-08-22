@@ -122,6 +122,7 @@ extern long long sheng_mdss_gdsc_probe_result(void);
 extern unsigned int sheng_mdss_gdsc_collapse_us(void);
 extern long long sheng_mdss_dsi_read_power_mode_single(unsigned long dsi0_base,
 						       unsigned long dma_scratch);
+extern long long sheng_mdss_dsi_init_fail_info(void);
 
 /* What the DDIC says it is doing, read by U-Boot at end of probe. */
 static long long sheng_panel_pm;
@@ -196,7 +197,8 @@ int sheng_mdss_diag_fmt(char *buf, int len)
 			" status0=%08x fifo=%08x fifo_late=%08x lane=%08x"
 			" ackerr=%08x timeout=%08x pll_l=%08x"
 			" frames=%u->%u pm=%012llx pm_val=%02x"
-			" pm_pre=%012llx pm_pre_val=%02x",
+			" pm_pre=%012llx pm_pre_val=%02x"
+			" dsi[retries=%u failidx=%d failrc=%d]",
 			sheng_fastpath, sheng_probe_count, sheng_panel_init_ret_first,
 			sheng_panel_init_ret,
 			(unsigned long long)sheng_mdss_gdsc_probe_result(),
@@ -207,7 +209,10 @@ int sheng_mdss_diag_fmt(char *buf, int len)
 			(unsigned long long)sheng_panel_pm,
 			(unsigned int)(sheng_panel_pm & 0xff),
 			(unsigned long long)sheng_panel_pm_pre,
-			(unsigned int)(sheng_panel_pm_pre & 0xff)) + 1;
+			(unsigned int)(sheng_panel_pm_pre & 0xff),
+			(unsigned int)(sheng_mdss_dsi_init_fail_info() >> 32),
+			(int)(short)((sheng_mdss_dsi_init_fail_info() >> 16) & 0xffff),
+			(int)(short)(sheng_mdss_dsi_init_fail_info() & 0xffff)) + 1;
 }
 
 static void sheng_tmark(const char *name)

@@ -2264,6 +2264,23 @@ fn dsiCmdDmaWait(dsi_base: usize) c_int {
 /// replicates the real driver's trigger-both-then-wait-both ordering.
 var g_dma_retries: u32 = 0;
 
+/// Transport error and table index of the first init-table command that
+/// failed outright, i.e. after dsiCmdDmaTxDual()'s four attempts.
+var g_init_fail_rc: c_int = 0;
+var g_init_fail_idx: i32 = -1;
+
+/// Packed for the diag relay: retries<<32 | (idx<<16) | (rc & 0xffff).
+///
+/// g_dma_retries counts transfers that needed a retry but eventually
+/// succeeded -- a leading indicator nothing has ever surfaced. If it is
+/// nonzero on boots that look fine, the DSI transport is marginal well
+/// before anything fails.
+export fn sheng_mdss_dsi_init_fail_info() callconv(.c) i64 {
+    return (@as(i64, g_dma_retries) << 32) |
+        (@as(i64, @as(u16, @bitCast(@as(i16, @truncate(g_init_fail_idx))))) << 16) |
+        @as(i64, @as(u16, @bitCast(@as(i16, @truncate(g_init_fail_rc)))));
+}
+
 /// Number of command-DMA retries that were needed across the whole
 /// panel init. 0 means every command went out first time.
 export fn sheng_mdss_dsi_retry_count() callconv(.c) u32 {
@@ -2735,7 +2752,16 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
     var idx: i32 = 0;
     for (nt36532e_init_sequence) |entry| {
         const ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, entry.cmd, entry.args);
-        if (ret != 0) return -(10000 + idx);
+        if (ret != 0) {
+            // Keep WHY, not just where. -(10000+idx) names the command;
+            // this names the transport error under it. Worth having
+            // because dsiCmdDmaTxDual() already retries four times, so
+            // a failure here means four consecutive failures of the
+            // same transfer -- not a transient.
+            g_init_fail_rc = ret;
+            g_init_fail_idx = idx;
+            return -(10000 + idx);
+        }
         udelay(if (entry.cmd == DCS_PAGE_SELECT) PAGE_SWITCH_PACING_US else INIT_CMD_PACING_US);
         idx += 1;
     }
@@ -2767,9 +2793,21 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
         // (qcom,mdss-dsi-panel-framerate = 0x78), i.e. exactly the
         // branch that ships 0x91/0x40.
         //
-        // TESTED ON HARDWARE 2026-08-22 (b397): sending 0x91/0x40 at
-        // 144Hz gives a BLACK PANEL WITH NO BACKLIGHT. The inference
-        // above is correct and the vendor value is mode-specific.
+        // Tried on hardware 2026-08-22 (b397): with 0x91/0x40 the boot
+        // came up BLACK WITH NO BACKLIGHT, which was initially recorded
+        // as proof that these values are wrong at 144Hz.
+        //
+        // THAT ATTRIBUTION WAS TOO STRONG. The soak captured
+        // panel_init_first=-10084 on that build -- the init aborted at
+        // table index 84 (the 0x3b timing command), three commands
+        // BEFORE 0xb2/0xb3 were ever sent. So the black panel is
+        // explained by that abort, not necessarily by these values.
+        //
+        // The values still stand on the documented reasoning: the vendor
+        // node shipping 0x91/0x40 is the 120Hz timing
+        // (qcom,mdss-dsi-panel-framerate = 0x78), i.e. exactly the
+        // 120/60 branch. What is NOT established is that 0x91/0x40 is
+        // harmful at 144Hz -- it has never had a clean test.
         //
         // See VENDOR-PANEL-REFERENCE.md for the other vendor deltas and
         // which of them are genuine.
