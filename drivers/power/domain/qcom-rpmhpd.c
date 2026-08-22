@@ -59,6 +59,22 @@ static struct rpmhpd mmcx_ao = {
 	.res_name = "mmcx.lvl",
 };
 
+/* CX, the SoC core rail. Requested by devices in sm8550.dtsi (UFS among
+ * them) as power-domains = <&rpmhpd RPMHPD_CX>, which is index 0 -- so
+ * without an entry here every such request logged
+ *
+ *     Power domain id (0) not supported
+ *
+ * and silently did nothing. Harmless by design (the driver returns 0 for
+ * undefined domains) but it means nobody ever voted CX. */
+static struct rpmhpd cx = {
+	.res_name = "cx.lvl",
+};
+
+static struct rpmhpd cx_ao = {
+	.res_name = "cx.lvl",
+};
+
 /* SA8775P RPMH power domains */
 static struct rpmhpd *sa8775p_rpmhpds[] = {
 	[SA8775P_MMCX] = &mmcx,
@@ -71,15 +87,18 @@ static const struct rpmhpd_desc sa8775p_desc = {
 };
 
 /*
- * SM8550 RPMH power domains -- only MMCX is wired up here, since that's
- * the one the sheng_mdss DPU driver needs (mdss_mdp@ae01000's
- * power-domains = <&rpmhpd RPMHPD_MMCX> in sm8550.dtsi -- the DPU core
+ * SM8550 RPMH power domains. Indices are from
+ * dt-bindings/power/qcom,rpmhpd.h: CX/_AO = 0/1, MMCX/_AO = 6/7.
+ *
+ * MMCX is what the sheng_mdss DPU driver needs (mdss_mdp@ae01000's
+ * power-domains = <&rpmhpd RPMHPD_MMCX> in sm8550.dtsi). The DPU core
  * sits on a separate RPMh-voted rail from the MDSS_GDSC-gated wrapper/
  * DISPCC/DSI, and without this vote any register access to the DPU
- * block hangs the AHB bus indefinitely since the slave never acks).
- * RPMHPD_MMCX/_AO = 6/7 from dt-bindings/power/qcom,rpmhpd.h.
+ * block hangs the AHB bus indefinitely since the slave never acks.
  */
 static struct rpmhpd *sm8550_rpmhpds[] = {
+	[RPMHPD_CX] = &cx,
+	[RPMHPD_CX_AO] = &cx_ao,
 	[RPMHPD_MMCX] = &mmcx,
 	[RPMHPD_MMCX_AO] = &mmcx_ao,
 };

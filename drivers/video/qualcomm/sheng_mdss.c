@@ -584,12 +584,21 @@ static int sheng_mdss_probe(struct udevice *dev)
 
 				/* Keep U-Boot's allocator off the live scanout
 				 * buffer: board_late_init() runs nine
-				 * lmb_alloc() calls after this. */
+				 * lmb_alloc() calls after this.
+				 *
+				 * -EEXIST is the EXPECTED, GOOD outcome: the
+				 * splash_region reserved-memory node already
+				 * covers this range, so lmb refuses to hand it
+				 * out again -- which is precisely what we
+				 * wanted. It was being reported as
+				 * "ABL fb not reserved (-17)", i.e. success
+				 * printed as a warning. Only a different error
+				 * means the buffer is genuinely unprotected. */
 				{
 					phys_addr_t a = SHENG_ABL_FB_ADDR;
 					int lret = lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &a,
 								 plat->size, LMB_NONE);
-					if (lret)
+					if (lret && lret != -EEXIST)
 						log_warning("sheng_mdss: ABL fb not reserved (%d)\n",
 							    lret);
 				}

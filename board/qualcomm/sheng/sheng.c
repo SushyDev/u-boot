@@ -960,7 +960,7 @@ static void sheng_charger_boot_poweroff(void)
 	 * that actually matters -- plugging in a charger no longer drags the
 	 * whole OS up.
 	 */
-	printf("\nsheng: charger-insert power-on (PON reason 0x%02x).\n", reason);
+	log_debug("sheng: charger-insert power-on (PON reason 0x%02x)\n", reason);
 	printf("sheng: charging. Press POWER to boot.\n");
 
 	for (i = 0; ; i++) {
@@ -968,8 +968,6 @@ static void sheng_charger_boot_poweroff(void)
 					(SHENG_PON_HLOS_PID << 8) | SHENG_PON_INT_RT_STS);
 
 		if (sts > 0 && (sts & SHENG_PON_GEN3_KPDPWR)) {
-			printf("sheng: POWER pressed, booting.\n");
-
 			/* WAIT FOR RELEASE before returning, or the same
 			 * press is still down when the boot menu starts
 			 * polling stdin and instantly selects entry 0.
@@ -1125,7 +1123,9 @@ void qcom_late_init(void)
 
 	sheng_ktz8866_backlight_init();
 	sheng_backlight_us = timer_get_us();
-	printf("sheng: backlight lit at %lu ms (%lu ms in late_init)\n",
+	/* Boot-timing chatter: useful while working on boot time, noise
+	 * otherwise. log_debug() compiles out unless DEBUG is defined. */
+	log_debug("sheng: backlight lit at %lu ms (%lu ms in late_init)\n",
 	       sheng_backlight_us / 1000,
 	       (sheng_backlight_us - t_entry) / 1000);
 
@@ -1147,7 +1147,7 @@ void qcom_late_init(void)
 	}
 
 	sheng_ktz8866_bias_readback();
-	printf("sheng: late_init done at %lu ms\n", timer_get_us() / 1000);
+	log_debug("sheng: late_init done at %lu ms\n", timer_get_us() / 1000);
 
 	/* Last thing in late_init, deliberately: the display and console are
 	 * up by now, so the countdown and its escape hatch are actually
