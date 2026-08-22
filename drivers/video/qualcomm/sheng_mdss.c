@@ -22,6 +22,8 @@
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+#include <time.h>
+#include <vsprintf.h>
 
 #include "sheng_mdss_debug.h"
 #include "sheng_mdss_regs.h"
@@ -71,6 +73,161 @@ void sheng_mdss_stage_init(void)
 
 	for (i = 0; i < SHENG_MDSS_STATUS_COUNT; i++)
 		sheng_mdss_stage_record(i, SHENG_MDSS_STATUS_NOT_REACHED);
+}
+
+/* Boot timing.
+ *
+ * There is no console during probe, so marks are only collected here
+ * and printed as one block at the end. CONFIG_PRE_CONSOLE_BUFFER holds
+ * that block until the console binds, which replays it onto the panel
+ * with the rest of the startup log.
+ *
+ * timer_get_us() reads the ARM generic counter, which U-Boot does not
+ * reset. The absolute value on the first mark therefore also measures
+ * everything BEFORE us -- XBL, ABL, and U-Boot's own pre-video initcalls
+ * -- which is the part no amount of trimming in this file can touch.
+ *
+ * Always compiled in, unlike SHENG_DBG_*: it is a handful of stores and
+ * one printf, and the numbers are worth having on every boot.
+ */
+/* 32, not 16: the probe can run MORE THAN ONCE (see sheng_probe_count).
+ * At 16 the second run's marks silently truncated the record, which is
+ * how the retry went unnoticed in the first place. */
+#define SHENG_TMARK_MAX 32
+static unsigned long sheng_tmark_us[SHENG_TMARK_MAX];
+static const char *sheng_tmark_name[SHENG_TMARK_MAX];
+static unsigned int sheng_tmark_n;
+
+/* Per-boot display signature, for chasing the intermittent glitched
+ * boot.
+ *
+ * The glitch is NOT caused by anything in the boot-time timing work --
+ * proven 2026-08-22 by flashing the pristine pre-existing tree (b362),
+ * which glitches identically. It is the long-standing intermittent
+ * panel init.
+ *
+ * A glitched boot reports success everywhere the existing instruments
+ * look: all 11 stage codes read 0, panel_init returns 0, and the probe
+ * completes. So the stage array cannot distinguish good from bad, and
+ * neither can soak.sh. These registers might: they are sampled at the
+ * end of probe, once the pipeline is actually streaming, and relayed to
+ * Linux so a boot can be classified without a camera.
+ *
+ * FRAME_COUNT is read twice with a gap: it is the one value that proves
+ * the timing engine is genuinely running rather than merely configured.
+ */
+/* Declared here as well as further down: the diag formatter below uses
+ * them and sits above that block. */
+extern long long sheng_mdss_gdsc_probe_result(void);
+extern unsigned int sheng_mdss_gdsc_collapse_us(void);
+extern long long sheng_mdss_dsi_read_power_mode_single(unsigned long dsi0_base,
+						       unsigned long dma_scratch);
+
+/* What the DDIC says it is doing, read by U-Boot at end of probe. */
+static long long sheng_panel_pm;
+
+#define SHENG_DIAG_N 9
+static u32 sheng_diag[SHENG_DIAG_N];
+static int sheng_panel_init_ret;
+
+/* THE PROBE CAN RUN TWICE, and that is the intermittent-glitch bug.
+ *
+ * qcom_late_init() force-probes the video device with
+ * uclass_get_device(). stdio_add_devices() already probed it at initcall
+ * 729. Normally DM returns the cached, activated device and the second
+ * call is free -- but if probe #1 FAILED, the device was never
+ * activated, so that call runs the ENTIRE probe again: second GDSC
+ * collapse, second MDSS core reset, second panel power-cycle, second
+ * 94-command init, on a DDIC left mid-bring-up by the first attempt.
+ *
+ * The retry then overwrites all 11 stage codes with 0 and panel_init
+ * with its own success, which is why every existing instrument reported
+ * a clean boot -- including soak.sh, which called 6/6 boots good while
+ * the panel was visibly corrupt.
+ *
+ * Keep the FIRST attempt's result separately; it is the one that says
+ * why the panel is broken.
+ */
+static unsigned int sheng_probe_count;
+static int sheng_panel_init_ret_first = 0x7fffffff;
+
+int sheng_mdss_diag_fmt(char *buf, int len)
+{
+	return snprintf(buf, len,
+			"probes=%u panel_init_first=%d panel_init=%d"
+			" gdsc[%012llx] collapse_us=%d"
+			" status0=%08x fifo=%08x fifo_late=%08x lane=%08x"
+			" ackerr=%08x timeout=%08x pll_l=%08x"
+			" frames=%u->%u pm=%012llx pm_val=%02x",
+			sheng_probe_count, sheng_panel_init_ret_first,
+			sheng_panel_init_ret,
+			(unsigned long long)sheng_mdss_gdsc_probe_result(),
+			(int)sheng_mdss_gdsc_collapse_us(),
+			sheng_diag[0], sheng_diag[1], sheng_diag[8],
+			sheng_diag[2], sheng_diag[3], sheng_diag[4],
+			sheng_diag[5], sheng_diag[6], sheng_diag[7],
+			(unsigned long long)sheng_panel_pm,
+			(unsigned int)(sheng_panel_pm & 0xff)) + 1;
+}
+
+static void sheng_tmark(const char *name)
+{
+	if (sheng_tmark_n >= SHENG_TMARK_MAX)
+		return;
+
+	sheng_tmark_name[sheng_tmark_n] = name;
+	sheng_tmark_us[sheng_tmark_n] = timer_get_us();
+	sheng_tmark_n++;
+}
+
+/* Same marks, formatted for the /chosen relay in ft_board_setup().
+ *
+ * The printed block only ever reaches the panel -- serial is absent and
+ * the pre-console buffer sits in a no-map reserved region, so Linux
+ * reading /dev/mem at CONFIG_PRE_CON_BUF_ADDR gets EFAULT (measured).
+ * Going through the FDT instead makes the numbers readable over SSH at
+ * /proc/device-tree/chosen/sheng,boot-timing on every boot, with no
+ * camera in the loop.
+ *
+ * Returns bytes written including the NUL, which is what fdt_setprop()
+ * wants for a string property.
+ */
+int sheng_mdss_timing_fmt(char *buf, int len)
+{
+	unsigned int i;
+	int n = 0;
+
+	if (!sheng_tmark_n)
+		return 0;
+
+	n += snprintf(buf + n, len - n, "entry=%lums", sheng_tmark_us[0] / 1000);
+
+	for (i = 1; i < sheng_tmark_n && n < len; i++)
+		n += snprintf(buf + n, len - n, " %s=%lums", sheng_tmark_name[i],
+			      (sheng_tmark_us[i] - sheng_tmark_us[i - 1]) / 1000);
+
+	if (n < len)
+		n += snprintf(buf + n, len - n, " total=%lums",
+			      (sheng_tmark_us[sheng_tmark_n - 1] -
+			       sheng_tmark_us[0]) / 1000);
+
+	return (n < len ? n : len - 1) + 1;
+}
+
+static void sheng_tmark_report(void)
+{
+	unsigned int i;
+
+	printf("sheng: probe entered at %lu ms since power-on\n",
+	       sheng_tmark_us[0] / 1000);
+
+	for (i = 1; i < sheng_tmark_n; i++)
+		printf("sheng:  %-18s %6lu ms\n", sheng_tmark_name[i],
+		       (sheng_tmark_us[i] - sheng_tmark_us[i - 1]) / 1000);
+
+	printf("sheng: probe total %lu ms, done at %lu ms\n",
+	       (sheng_tmark_us[sheng_tmark_n - 1] - sheng_tmark_us[0]) / 1000,
+	       sheng_tmark_us[sheng_tmark_n - 1] / 1000);
 }
 
 /* Panel bias: KTZ8866 over I2C plus GPIOs 30/31. The DDIC needs it
@@ -348,6 +505,8 @@ static int sheng_mdss_probe(struct udevice *dev)
 	SHENG_DBG_PIN("abl avee", TLMM_PANEL_AVEE_GPIO);
 
 	sheng_mdss_stage_init();
+	sheng_probe_count++;
+	sheng_tmark("entry");
 
 	priv->mdss_base = dev_read_addr(dev);
 	SHENG_DBG_START();
@@ -399,6 +558,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * its arguments and the clock would never be enabled. */
 	axi_cbcr = sheng_gcc_disp_hf_axi_enable();
 	SHENG_DBG_LOG(SHENG_LOG_GCC_HF_AXI_READBACK, axi_cbcr);
+	sheng_tmark("gdsc+reset");
 
 	ret = sheng_mdss_dispcc_init(SM8550_DISPCC_BASE);
 	BBS("dispcc_init_ret", ret);
@@ -409,6 +569,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * dispcc_init() wipes it -- see sheng_mdss_ubwc_init()'s comment.
 	 * Must precede any DSI/DPU programming, matching msm_mdss_enable(). */
 	sheng_mdss_ubwc_init(SM8550_MDSS_BASE);
+	sheng_tmark("dispcc+ubwc");
 	SHENG_DBG_ENV("sheng_mdss_dispcc", (unsigned long)ret);
 	if (ret)
 		return ret;
@@ -437,6 +598,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	ret = sheng_mdss_regulator_vote("smpg3", 600);
 	BBS("regulator_votes_ret", ret);
 	sheng_mdss_phy144_mark(2, SM8550_MDSS_DSI0_PHY_BASE);
+	sheng_tmark("regulators");
 	SHENG_DBG_ENV("sheng_mdss_vreg_s3g", (unsigned long)ret);
 
 	/* Dual-DSI split-link panel: DSI0 is master (drives its own PLL),
@@ -473,6 +635,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	BBR("PHY0 STATUS", SM8550_MDSS_DSI0_PHY_BASE, 0x140);
 	BBR("PHY1 STATUS", SM8550_MDSS_DSI1_PHY_BASE, 0x140);
 	sheng_mdss_phy144_mark(4, SM8550_MDSS_DSI0_PHY_BASE);
+	sheng_tmark("dsi phys");
 	if (ret)
 		return ret;
 
@@ -483,6 +646,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	ret = sheng_mdss_dispcc_dsi_clks_init(SM8550_DISPCC_BASE);
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI_LINK_CLKS, ret);
 	sheng_mdss_phy144_mark(5, SM8550_MDSS_DSI0_PHY_BASE);
+	sheng_tmark("link clks");
 	SHENG_DBG_ENV("sheng_mdss_dsi_clks", (unsigned long)ret);
 	if (ret)
 		return ret;
@@ -506,6 +670,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	sheng_mdss_dsi_panel_sleep(SM8550_MDSS_DSI0_BASE,
 				    SM8550_MDSS_DSI1_BASE,
 				    SHENG_MDSS_DSI_DMA_SCRATCH);
+	sheng_tmark("host+abl sleep");
 
 	/* Power-cycle in teardown order: reset, then avee, then avdd. */
 	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, false);
@@ -519,17 +684,34 @@ static int sheng_mdss_probe(struct udevice *dev)
 	bias_ret = sheng_ktz8866_set_bias(0);
 	BBS("bias OFF over i2c", bias_ret);
 
-	/* The rails need a long off window to discharge. Shorter than ~1s
-	 * and the DDIC keeps its state across the power cycle. Sampled
-	 * twice on the way: both must read 0. */
-	mdelay(20);
-	SHENG_DBG_PIN("avdd during off", TLMM_PANEL_AVDD_GPIO);
-	SHENG_DBG_PIN("avee during off", TLMM_PANEL_AVEE_GPIO);
-	mdelay(60);
-	SHENG_DBG_PIN("avdd late in off", TLMM_PANEL_AVDD_GPIO);
-	SHENG_DBG_PIN("avee late in off", TLMM_PANEL_AVEE_GPIO);
-	mdelay(1000);
+	/* The rails need an off window long enough to discharge, or the DDIC
+	 * keeps its state across the power cycle. Sampled twice on the way:
+	 * both must read 0.
+	 *
+	 * BIGGEST BOOT-TIME KNOB IN THE DRIVER, and the one most worth
+	 * distrusting. The old 1080ms total was tuned in the era when
+	 * LCD_BIAS_EN was still latched over I2C, so the rails never
+	 * collapsed at all and NO window would have worked -- "shorter than
+	 * ~1s fails" was measuring the latch, not a discharge time. Now that
+	 * sheng_ktz8866_set_bias(0) genuinely drops them, what is left is an
+	 * actual RC discharge, which is far shorter.
+	 *
+	 * 200ms is a guess with margin, not a measurement. Soak it
+	 * (soak.sh) before trusting it, and if panel init goes intermittent
+	 * raise this before touching either pacing knob. */
+	{
+		const unsigned int discharge_ms = 200;
+
+		mdelay(20);
+		SHENG_DBG_PIN("avdd during off", TLMM_PANEL_AVDD_GPIO);
+		SHENG_DBG_PIN("avee during off", TLMM_PANEL_AVEE_GPIO);
+		mdelay(60);
+		SHENG_DBG_PIN("avdd late in off", TLMM_PANEL_AVDD_GPIO);
+		SHENG_DBG_PIN("avee late in off", TLMM_PANEL_AVEE_GPIO);
+		mdelay(discharge_ms - 80);
+	}
 	sheng_mdss_panel_power_and_reset();
+	sheng_tmark("panel pwr cycle");
 	BBM("panel powered + reset pulsed");
 	sheng_mdss_phy144_mark(6, SM8550_MDSS_DSI0_PHY_BASE);
 
@@ -556,6 +738,10 @@ static int sheng_mdss_probe(struct udevice *dev)
 
 	ret = sheng_mdss_dsi_panel_init(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
 					 SHENG_MDSS_DSI_DMA_SCRATCH, true);
+	sheng_tmark("panel DCS init");
+	sheng_panel_init_ret = ret;
+	if (sheng_panel_init_ret_first == 0x7fffffff)
+		sheng_panel_init_ret_first = ret;
 	BBS("panel_init_ret", ret);
 	BBR("DSI0 CTRL", SM8550_MDSS_DSI0_BASE, 0x000);
 	BBR("DSI0 STATUS0", SM8550_MDSS_DSI0_BASE, 0x004);
@@ -602,6 +788,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 			    (((unsigned long)fb[0]) << 32) |
 			    (unsigned long)fb[fb_words - 1]);
 	}
+	sheng_tmark("fb clear");
 
 	ret = sheng_mdss_dpu_start(SM8550_MDSS_DPU_BASE,
 				    SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
@@ -614,6 +801,38 @@ static int sheng_mdss_probe(struct udevice *dev)
 				    SHENG_PANEL_VBACK_PORCH,
 				    SHENG_PANEL_VSYNC_WIDTH,
 				    true /* DSC */);
+	sheng_tmark("dpu start");
+
+	/* Sample the signature while the pipeline is live. The 40ms gap is
+	 * ~6 frames at 144Hz, so a running timing engine must advance
+	 * FRAME_COUNT; a stalled one will not. */
+	{
+		const uintptr_t d0 = SM8550_MDSS_DSI0_BASE;
+		const uintptr_t intf = SM8550_MDSS_DPU_BASE + 0x35000;
+
+		sheng_diag[0] = readl((void __iomem *)(uintptr_t)(d0 + 0x004));
+		sheng_diag[1] = readl((void __iomem *)(uintptr_t)(d0 + 0x008));
+		sheng_diag[2] = readl((void __iomem *)(uintptr_t)(d0 + 0x0a4));
+		sheng_diag[3] = readl((void __iomem *)(uintptr_t)(d0 + 0x068));
+		sheng_diag[4] = readl((void __iomem *)(uintptr_t)(d0 + 0x0bc));
+		sheng_diag[5] = readl((void __iomem *)(uintptr_t)(SM8550_DISPCC_BASE + 0x010));
+		sheng_diag[6] = readl((void __iomem *)(uintptr_t)(intf + 0x0ac));
+		mdelay(40);
+		sheng_diag[7] = readl((void __iomem *)(uintptr_t)(intf + 0x0ac));
+		/* Re-read FIFO *after* the settle. Sampled at FRAME_COUNT 0 it
+		 * always reads 0x11111210 ("all lanes starved"), which is a
+		 * known artifact of the pre-first-frame window and says
+		 * nothing -- a healthy late sample is 0x00001210. Only this
+		 * second read can distinguish a genuinely starved link. */
+		sheng_diag[8] = readl((void __iomem *)(uintptr_t)(d0 + 0x008));
+	}
+
+	/* Ask the panel itself. Expect pm_val=9c; 08 means the init did not
+	 * take. This is the classifier the host registers cannot provide --
+	 * they read identical on a clean boot and a corrupted one. */
+	sheng_panel_pm = sheng_mdss_dsi_read_power_mode_single(
+				SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH);
+
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DPU, ret);
 	SHENG_DBG_ENV("sheng_mdss_dpu_start", (unsigned long)ret);
 	BBM("dpu_start done");
@@ -699,6 +918,9 @@ static int sheng_mdss_probe(struct udevice *dev)
 	video_set_flush_dcache(dev, true);
 
 	SHENG_DBG_FINAL_DUMP();
+
+	sheng_tmark("handoff");
+	sheng_tmark_report();
 
 	/* Reached the framebuffer handoff. Any other value in this slot
 	 * means an early return above and therefore no picture. */

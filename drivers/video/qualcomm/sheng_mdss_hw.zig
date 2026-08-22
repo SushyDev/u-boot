@@ -585,11 +585,45 @@ export fn sheng_mdss_gdsc_probe_result() callconv(.c) i64 {
         @as(i64, g_gdsc_probe[2] >> 16);
 }
 
+/// Microseconds the GDSC took to actually drop PWR_ON, or 0xffffffff if
+/// it NEVER collapsed. Read out via sheng_mdss_gdsc_collapse_us().
+var g_gdsc_collapse_us: u32 = 0xffffffff;
+
+export fn sheng_mdss_gdsc_collapse_us() callconv(.c) u32 {
+    return g_gdsc_collapse_us;
+}
+
+const GDSC_PWR_ON: u32 = 1 << 31;
+const GDSC_COLLAPSE_TIMEOUT_US: u32 = 20000;
+
 export fn sheng_mdss_gdsc_disable(dispcc_base: usize) callconv(.c) void {
     mmioClearBits32(dispcc_base, MDSS_GDSC_OFFSET, HW_CONTROL_MASK);
     udelay(1);
     mmioSetBits32(dispcc_base, MDSS_GDSC_OFFSET, SW_COLLAPSE_MASK);
-    udelay(200); // settle: let the power rail genuinely collapse
+
+    // WAIT FOR IT, do not assume it. The old code asserted SW_COLLAPSE
+    // and slept a flat 200us with no check, which is the difference
+    // between a real cold start and a no-op: a GDSC still held up by
+    // another subsystem's vote stays on, ABL's controller state
+    // survives underneath the whole bring-up, and the result is the
+    // intermittent glitched/black boot.
+    //
+    // Poll PWR_ON (GDSCR bit 31) instead, and record how long it took
+    // so a marginal collapse is distinguishable from a healthy one and
+    // from one that never happened at all.
+    var waited: u32 = 0;
+    while (waited < GDSC_COLLAPSE_TIMEOUT_US) : (waited += 1) {
+        if ((mmioRead32(dispcc_base, MDSS_GDSC_OFFSET) & GDSC_PWR_ON) == 0) {
+            g_gdsc_collapse_us = waited;
+            break;
+        }
+        udelay(1);
+    } else {
+        g_gdsc_collapse_us = 0xffffffff;
+    }
+
+    // Settle after the rail is genuinely down, not instead of checking.
+    udelay(200);
 }
 
 // --- disp_cc_pll0 (Lucid OLE alpha PLL), from clk_alpha_pll_regs[
@@ -2401,6 +2435,91 @@ export fn sheng_mdss_dsi_timeout_diag() callconv(.c) i64 {
 /// teardown below removes the panel's ability to receive commands at
 /// all. Best-effort: DSI is being torn down regardless, so a failure
 /// here doesn't abort the rest of the teardown.
+/// Ask the DDIC what mode it is actually in (DCS 0x0A, Get Power Mode).
+///
+/// THE ONLY VALID INSTRUMENT for this question. Do not judge the panel
+/// from Linux -- Linux's own DSI/PHY bring-up wedges it, which is what
+/// made a whole earlier round of conclusions invalid. U-Boot must read
+/// it itself, at the end of its own probe.
+///
+/// Restored from cbd53976^ after the Zig cleanup deleted it, minus the
+/// blackbox logging and the BTA-timeout calibration that were scaffolding
+/// for an investigation that has since concluded. The mechanics that
+/// matter are kept exactly:
+///
+///   * Set Maximum Return Packet Size (0x37) first, master only.
+///   * Hold CMD_MODE_EN across the WHOLE read, not per-DMA: the panel
+///     turns the bus around ~milliseconds after our packet goes out, and
+///     a per-DMA restore drops back to video mode before the reply
+///     arrives.
+///   * Trigger BOTH hosts but prepare only DSI0, matching the
+///     xfer_prepare the kernel skips for a read. A stitched panel
+///     expects synchronised SOT across both links.
+///
+/// Return value packs the state the read ran in, because the raw
+/// register alone is ambiguous:
+///   63:32  RDBK_DATA0 raw. Bytes are REVERSED vs the register: 31:24 is
+///          data_id, 23:16 the payload. A good reply is 0x219C0000 --
+///          reporting `resp & 0xff` alone shows 0, indistinguishable
+///          from a silent panel. That trap cost real time before.
+///   31:16  DSI_CTRL low half during the read. 0x01F7 = CMD_MODE_EN was
+///          asserted and the BTA genuinely issued; 0x01F3 = it was not,
+///          and the result says nothing about the panel.
+///   15:8   TIMEOUT_STATUS low byte.
+///    7:0   decoded payload. **0x9C on a correctly initialised panel**
+///          (DISPLAY_ON | NORMAL_MODE | SLEEP_OUT); 0x08 is sleep-in,
+///          display-off, i.e. an init that did not take.
+export fn sheng_mdss_dsi_read_power_mode_single(dsi0_base: usize, dma_scratch: usize) callconv(.c) i64 {
+    const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
+
+    const ctrl_restore = mmioRead32(dsi0_base, DSI_CTRL);
+    mmioWrite32(dsi0_base, DSI_CTRL, ctrl_restore | CTRL_CMD_MODE_EN | CTRL_ENABLE);
+    defer mmioWrite32(dsi0_base, DSI_CTRL, ctrl_restore);
+
+    // Set Maximum Return Packet Size = 1, master only.
+    dst[0] = 1;
+    dst[1] = 0;
+    dst[2] = 0x37;
+    dst[3] = 0x80;
+    var ret = dsiCmdDmaTxOne(dsi0_base, dma_scratch, 4);
+    if (ret != 0) return -1;
+
+    mmioWrite32(dsi0_base, DSI_RDBK_DATA_CTRL, RDBK_DATA_CTRL_CLR);
+    mmioWrite32(dsi0_base, DSI_RDBK_DATA_CTRL, 0);
+
+    // DCS read (0x06), cmd 0x0A Get Power Mode, BTA expected.
+    dst[0] = 0x0a;
+    dst[1] = 0x00;
+    dst[2] = 0x06;
+    dst[3] = 0x80 | 0x20; // BIT5 = read
+
+    const dsi1_base: usize = 0x0ae96004; // SM8550_MDSS_DSI1_BASE + shift
+    dsiCmdDmaTrigger(dsi1_base, dma_scratch, 4);
+    dsiCmdDmaTrigger(dsi0_base, dma_scratch, 4);
+    _ = dsiCmdDmaWait(dsi1_base);
+    ret = dsiCmdDmaWait(dsi0_base);
+    if (ret != 0) return -2;
+
+    // Wait for the turnaround. Polling the whole window matters: sampling
+    // BTA_DONE at CMD_DMA_DONE time is structurally too early -- that is
+    // the instant our packet finished going OUT, before the panel could
+    // have replied -- and reading 0 there means nothing.
+    var waited: u32 = 0;
+    while (waited < 20000) : (waited += 20) {
+        if ((mmioRead32(dsi0_base, DSI_INTR_CTRL) & (1 << 20)) != 0) break;
+        udelay(20);
+    }
+
+    const resp = mmioRead32(dsi0_base, DSI_RDBK_DATA0);
+    const ctrl_during = mmioRead32(dsi0_base, DSI_CTRL);
+    const tmo = mmioRead32(dsi0_base, DSI_TIMEOUT_STATUS);
+
+    return (@as(i64, resp) << 32) |
+        (@as(i64, ctrl_during & 0xffff) << 16) |
+        (@as(i64, tmo & 0xff) << 8) |
+        @as(i64, (resp >> 16) & 0xff);
+}
+
 export fn sheng_mdss_dsi_panel_sleep(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize) callconv(.c) void {
     _ = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x28, &[_]u8{});
     udelay(20000); // datasheet-typical gap between display-off and sleep-in
@@ -2530,22 +2649,42 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
         udelay(1000);
     }
 
-    udelay(250000); // bumped 100ms -> 250ms brute-force test (SPEC.md task #5 log)
+    // Settle after the ENABLE re-latch, before the first DCS byte.
+    //
+    // DO NOT LOWER. Measured on hardware 2026-08-22 (b355): at 100ms the
+    // panel comes up visibly glitched -- on and scanning, content
+    // corrupted. Only 250ms is known good.
+    //
+    // It looks like a leftover "bump it and see" test from the era when
+    // the panel would not init at all (SPEC.md task #5 log), and it was
+    // 100ms before that bump, so lowering it back looked free. It is
+    // not: whatever this settles for is real. Worth 150ms of a 6.9s
+    // boot, which is not worth another attempt at a middle value --
+    // see the boot-time breakdown, 81% of the boot is ABL and not ours.
+    const ENABLE_SETTLE_US: c_ulong = 250000;
+    udelay(ENABLE_SETTLE_US);
 
-    // Pace the init to the kernel's rate, ~2ms per command.
+    // Pace the init table.
     //
-    // That 2ms is not a deliberate delay in the panel driver, it is the
-    // cost of the kernel's per-transfer path: mutex, per-transfer link
-    // clock enable/disable, IRQ completion wait. Here a command is a DMA
-    // trigger plus a busy-poll that clears in microseconds, so without
-    // pacing the whole sequence goes out roughly 80x faster than the
-    // panel has ever received it.
+    // The kernel emits these ~2ms apart, but that 2ms is not a
+    // deliberate delay in the panel driver -- it is the cost of its
+    // per-transfer path: mutex, per-transfer link clock
+    // enable/disable, IRQ completion wait. Here a command is a DMA
+    // trigger plus a busy-poll that clears in microseconds.
     //
-    // A DDIC that needs settling time between register writes -- above
-    // all across the 0xff page switches, which change which bank later
-    // writes land in -- drops most of them while every command still
-    // reports success.
-    const INIT_CMD_PACING_US: c_ulong = 2000;
+    // What actually needs settling time is the 0xff PAGE SWITCH: it
+    // changes which register bank every following write lands in, and a
+    // DDIC that has not finished switching drops them while every
+    // command still reports success. So keep the full 2ms after a page
+    // switch and pace the other 81 commands, which are plain writes
+    // within an already-selected bank, far tighter.
+    //
+    // BOOT-TIME KNOB: 87 x 2ms = 174ms becomes ~52ms. If init goes
+    // intermittent, put PAGE_SWITCH_PACING_US's value back into
+    // INIT_CMD_PACING_US to restore the old uniform behaviour.
+    const INIT_CMD_PACING_US: c_ulong = 500;
+    const PAGE_SWITCH_PACING_US: c_ulong = 2000;
+    const DCS_PAGE_SELECT: u8 = 0xff;
 
     // Failures encode WHERE, not just what: -(10000 + index) inside the
     // table loop, -(20000 + stage) for the named stages after it. There
@@ -2554,7 +2693,7 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
     for (nt36532e_init_sequence) |entry| {
         const ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, entry.cmd, entry.args);
         if (ret != 0) return -(10000 + idx);
-        udelay(INIT_CMD_PACING_US);
+        udelay(if (entry.cmd == DCS_PAGE_SELECT) PAGE_SWITCH_PACING_US else INIT_CMD_PACING_US);
         idx += 1;
     }
 

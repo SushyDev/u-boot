@@ -15,6 +15,7 @@
 #include <fdt_support.h>
 #include <i2c.h>
 #include <log.h>
+#include <time.h>
 #include <video.h>
 #include <asm/global_data.h>
 #include <asm/io.h>
@@ -28,6 +29,15 @@
 DECLARE_GLOBAL_DATA_PTR;
 
 extern void sheng_mdss_teardown(void);
+extern int sheng_mdss_timing_fmt(char *buf, int len);
+extern int sheng_mdss_diag_fmt(char *buf, int len);
+extern unsigned long sheng_uboot_entry_us;
+extern unsigned long sheng_board_init_us;
+
+/* Time the backlight actually came on, microseconds since power-on.
+ * Recorded in qcom_late_init() and relayed in ft_board_setup(), which
+ * runs later still (at booti time). */
+static unsigned long sheng_backlight_us;
 
 #define SHENG_KTZ8866_BRIGHTNESS		1500u
 #define SHENG_KTZ8866_STATUS_ADDR	(CONFIG_PRE_CON_BUF_ADDR + 0x3400)
@@ -76,6 +86,51 @@ static u32 sheng_backlight_gpio_set(int high)
 static u32 sheng_backlight_gpio_enable(void)
 {
 	return sheng_backlight_gpio_set(1);
+}
+
+/* What state ABL left the display in, sampled at board_init() -- before
+ * anything of ours has touched it.
+ *
+ * This decides where the black gap between the Xiaomi logo and U-Boot's
+ * log actually begins. If the backlight EN and the panel rails are still
+ * high here, ABL handed over a lit panel and the gap starts ~20ms later
+ * when our probe collapses the MDSS GDSC. If they are already low, ABL
+ * blanked on its way out and the gap additionally covers U-Boot's whole
+ * pre-video init, which no amount of trimming inside the probe can
+ * recover.
+ *
+ * Read-only MMIO on TLMM, which is always clocked, so this is safe this
+ * early -- MDSS registers would not be. bit0 of each is the actual pin
+ * level, bit1 the driven value.
+ *
+ * Duplicated GPIO numbers rather than including sheng_mdss_regs.h: this
+ * file must still build with CONFIG_VIDEO_SHENG_MDSS off.
+ */
+#define SHENG_PANEL_AVDD_GPIO	30
+#define SHENG_PANEL_AVEE_GPIO	31
+#define SHENG_PANEL_RESET_GPIO	133
+
+static u32 sheng_handover_bl, sheng_handover_avdd;
+static u32 sheng_handover_avee, sheng_handover_rst;
+
+static u32 sheng_tlmm_io_read(unsigned int gpio)
+{
+	return *(volatile u32 *)(uintptr_t)
+		(SHENG_TLMM_BASE + 0x4 + SHENG_TLMM_GPIO_REG_SIZE * gpio);
+}
+
+void qcom_board_init(void)
+{
+	sheng_handover_bl = sheng_tlmm_io_read(SHENG_BACKLIGHT_GPIO);
+	sheng_handover_avdd = sheng_tlmm_io_read(SHENG_PANEL_AVDD_GPIO);
+	sheng_handover_avee = sheng_tlmm_io_read(SHENG_PANEL_AVEE_GPIO);
+	sheng_handover_rst = sheng_tlmm_io_read(SHENG_PANEL_RESET_GPIO);
+
+	/* ANSWERED 2026-08-22 (b359): the panel is ALREADY BLACK during a
+	 * 3s hold here, with backlight EN and both rails still reading
+	 * high. ABL does not cut power -- it blanks and hands over dark.
+	 * Which is why the fix is the "cont_splash" label in the DTB, not
+	 * anything in this file. */
 }
 
 /* Raw MMIO breadcrumb, same pattern (and same reason) as sheng_mdss.c's
@@ -434,6 +489,46 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 			fdt_setprop(blob, nodeoff, "sheng,ktz8866-status",
 				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3400),
 				    8);
+
+			/* Boot timing, as a plain string. The same block is
+			 * printed to the panel during probe, but that is
+			 * the only place it goes -- serial is absent and
+			 * the pre-console buffer is unreadable from Linux
+			 * (no-map region, /dev/mem gives EFAULT). Here it
+			 * lands in /proc/device-tree/chosen/sheng,boot-timing
+			 * where a normal SSH session can cat it. */
+			{
+				char t[640];
+				int n = sheng_mdss_timing_fmt(t, sizeof(t) - 32);
+
+				if (n > 0) {
+					n--; /* drop the NUL, append below */
+					n += snprintf(t + n, sizeof(t) - n,
+						      " abl=%lums relocdone=%lums"
+						      " backlight=%lums"
+						      " handover[bl=%x avdd=%x"
+						      " avee=%x rst=%x]",
+						      sheng_uboot_entry_us / 1000,
+						      sheng_board_init_us / 1000,
+						      sheng_backlight_us / 1000,
+						      sheng_handover_bl,
+						      sheng_handover_avdd,
+						      sheng_handover_avee,
+						      sheng_handover_rst);
+					fdt_setprop(blob, nodeoff,
+						    "sheng,boot-timing", t, n + 1);
+				}
+
+				/* Display signature, for classifying a
+				 * glitched boot from data instead of by
+				 * eye. Separate property so a boot that
+				 * never reached the video probe still
+				 * relays its timing. */
+				n = sheng_mdss_diag_fmt(t, sizeof(t));
+				if (n > 0)
+					fdt_setprop(blob, nodeoff,
+						    "sheng,display-diag", t, n);
+			}
 		}
 	}
 
@@ -452,7 +547,15 @@ int ft_board_setup(void *blob, struct bd_info *bd)
  */
 void qcom_late_init(void)
 {
+	/* Same clock as the driver's marks: microseconds since power-on,
+	 * so these line up with the "sheng: probe ..." block. */
+	unsigned long t_entry = timer_get_us();
+
 	sheng_ktz8866_backlight_init();
+	sheng_backlight_us = timer_get_us();
+	printf("sheng: backlight lit at %lu ms (%lu ms in late_init)\n",
+	       sheng_backlight_us / 1000,
+	       (sheng_backlight_us - t_entry) / 1000);
 
 	/* CONFIG_VIDEO only BINDS video devices during early boot. Nothing
 	 * in this board's flow probes one -- no splash, and CONSOLE_MUX /
@@ -472,6 +575,7 @@ void qcom_late_init(void)
 	}
 
 	sheng_ktz8866_bias_readback();
+	printf("sheng: late_init done at %lu ms\n", timer_get_us() / 1000);
 }
 
 /*

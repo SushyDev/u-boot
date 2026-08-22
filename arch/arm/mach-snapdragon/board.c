@@ -55,8 +55,27 @@ static struct {
 	phys_size_t size;
 } prevbl_ddr_banks[CONFIG_NR_DRAM_BANKS] __section(".data") = { 0 };
 
+/* Boot timing. Microseconds since power-on, from the ARM generic
+ * counter, which nothing in the boot chain resets.
+ *
+ * These two split the ~5.9s that elapses before the display probe into
+ * the part that is not ours (XBL + ABL, everything up to U-Boot entry)
+ * and the part that is (U-Boot's own pre-video initcalls). Relayed to
+ * Linux alongside the driver's own marks -- see sheng_mdss_timing_fmt().
+ *
+ * .data, not .bss: dram_init() runs BEFORE relocation, and .bss is
+ * zeroed when the relocated image starts, which would discard the
+ * value. Same reason prevbl_ddr_banks above is placed there.
+ */
+unsigned long sheng_uboot_entry_us __section(".data") = 0;
+unsigned long sheng_board_init_us __section(".data") = 0;
+
 int dram_init(void)
 {
+	/* Earliest point with a working timer: init_sequence_f runs
+	 * timer_init() a few initcalls before dram_init(). */
+	sheng_uboot_entry_us = timer_get_us();
+
 	/*
 	 * gd->ram_base / ram_size have been setup already
 	 * in qcom_parse_memory().
@@ -335,6 +354,10 @@ void __weak qcom_board_init(void)
 
 int board_init(void)
 {
+	/* First hook after relocation, so the gap from
+	 * sheng_uboot_entry_us is board_init_f + relocation. */
+	sheng_board_init_us = timer_get_us();
+
 	show_psci_version();
 	qcom_board_init();
 	return 0;
