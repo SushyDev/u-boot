@@ -161,6 +161,14 @@ the DPU pipeline, SMMU setup and teardown. It is built to a freestanding
 aarch64 object and linked in; it calls back into U-Boot only for
 `udelay`, `flush_dcache_range` and `timer_get_us`.
 
+`sheng_mdss_diag.zig` holds the register sweeps and audits, built only
+under `CONFIG_VIDEO_SHENG_MDSS_DEBUG`. It is ~20KB of reference tables
+that a normal boot has no use for, and the Zig object is compiled
+unconditionally, so leaving them in `sheng_mdss_hw.zig` put them in
+every image. It duplicates the constants it needs rather than importing
+them: Zig compiles each file to its own object, and importing would
+emit `sheng_mdss_hw.zig`'s exports twice.
+
 Building it needs `zig` on PATH.
 
 ## Edits to generic U-Boot
@@ -209,6 +217,20 @@ plus `flush_dcache_range`, never MMIO — and look at the panel.
 
 ## Things that will bite you
 
+- **Anything at a fixed DRAM address must be reserved in LMB.** This
+  driver allocates its framebuffer at `0xa3200000` rather than through
+  `video_reserve()`, so nothing else knows the region is in use.
+  `board_late_init()` (INITCALL 758) makes nine `lmb_alloc()` calls and
+  `memcpy()`s the FDT into one of them, well after the panel starts
+  scanning out at INITCALL 729. Without an explicit reservation LMB
+  hands out the framebuffer and the display fills with garbage.
+
+  It fails *intermittently*: the addresses LMB returns depend on how
+  much memory U-Boot has already used, so a build that changes the
+  image size by a few KB can move an allocation onto the framebuffer
+  with no other change. The framebuffer, the DSI DMA scratch and the
+  debug blackbox are all reserved for this reason. Add a reservation
+  for any new fixed-address region.
 - **Never read DPU/MDSS registers from generic U-Boot code.** Once the
   display is down the MDSS is unclocked and the read wedges the AHB
   bus. Recovery is fastboot, not a reboot.
