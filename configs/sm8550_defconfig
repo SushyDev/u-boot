@@ -305,3 +305,4 @@ CONFIG_UFS_QCOM=y
 # arm64 "Image" header parsing, needed for booti to size/relocate the
 # kernel correctly.
 CONFIG_LINUX_KERNEL_IMAGE_HEADER=y
+CONFIG_VIDEO_SHENG_MDSS_DEBUG=y

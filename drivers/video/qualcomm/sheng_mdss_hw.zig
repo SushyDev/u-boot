@@ -1438,36 +1438,22 @@ export fn sheng_mdss_dsi_phy_init(dsi_phy_base: usize, is_master: bool) callconv
     // full-rate mode (dphy, not cphy)
     mmioWrite32(dsi_phy_base, CMN_CTRL_2, 0x40);
 
-    // REAL GAP FOUND (SPEC.md task #5 log): CMN_CLK_CFG0 holds the
-    // PHY's two output dividers -- dsi_pll_7nm_restore_state() writes
-    // it as `bit_clk_div | (pix_clk_div << 4)` -- and this driver
-    // declared the register but never wrote it, leaving both dividers
-    // at their hardware reset default. Byte clock was therefore right
-    // (it comes straight off the PLL, whose VCO rate was measured live
-    // and matches) while the PIXEL clock ran at the wrong divisor, so
-    // the DPU fed the DSI link several times faster than it could
-    // transmit.
+    // CMN_CLK_CFG0 holds the PHY's two output dividers,
+    // bit_clk_div | (pix_clk_div << 4). Leaving it at reset default
+    // gives a correct byte clock -- that comes straight off the PLL --
+    // and a pixel clock at the wrong divisor, so the DPU feeds the link
+    // faster than it can transmit. FIFO_STATUS reads 0xdddd1211: MDP
+    // FIFO overflow plus all four data lanes overflowing AND
+    // underflowing at once.
     //
-    // Measured consequence, with everything else already verified
-    // correct: DSI0 FIFO_STATUS = 0xdddd1211 while streaming --
-    // VIDEO_MDP_FIFO_OVERFLOW (bit0) set, and all four data lanes
-    // (DLN0-3) simultaneously OVERFLOW *and* UNDERFLOW, i.e. the lane
-    // FIFOs thrashing between full and empty. Classic rate mismatch,
-    // not a configuration error: STATUS0 confirmed both hosts had
-    // VIDEO_MODE_ENGINE_BUSY asserted and the whole DPU datapath read
-    // back correct.
+    // 0x61: pix_clk_div = 6, i.e. bitclk/6 = 198,453,024 Hz, which is
+    // both dsi_get_pclk_rate()'s answer for this DSC bonded mode and
+    // the plain bpp/lanes = 24/4 ratio.
     //
-    // 0x61 is Linux's own live value on BOTH PHYs (read via devmem on
-    // this exact panel while DRM was driving it), and the arithmetic
-    // independently agrees: pix_clk_div = 6 gives bitclk/6 =
-    // 1,190,718,144/6 = 198,453,024 Hz, exactly dsi_get_pclk_rate()'s
-    // result for this DSC-compressed bonded-DSI mode, and exactly the
-    // standard bpp/lanes = 24/4 = 6 ratio.
-    // MASTER ONLY (SPEC.md task #5 log, PHY write trace): the working
-    // kernel writes CMN_CLK_CFG0 on PHY0 and NEVER on PHY1. The slave takes
-    // the master's bit clock via CLK_CFG1.BITCLK_SEL, and DISPCC's pclk1/
-    // byte1 source from DSI0's PHY PLL (src_sel 1/2, verified live), so the
-    // slave's own dividers feed nothing.
+    // MASTER ONLY. The kernel writes this on PHY0 and never PHY1: the
+    // slave takes the master's bit clock via CLK_CFG1.BITCLK_SEL, and
+    // DISPCC's pclk1/byte1 source from DSI0's PLL, so the slave's own
+    // dividers feed nothing.
     if (is_master) mmioWrite32(dsi_phy_base, CMN_CLK_CFG0, CMN_CLK_CFG0_VALUE);
 
     // dsi_7nm_set_usecase(): BITCLK_SEL=0 (internal PLL) for master
@@ -1717,36 +1703,20 @@ const ACTIVE_VSYNC_HPOS_VALUE: u32 = 0x00000000; // re-stolen post-shift-fix
 const ACTIVE_VSYNC_VPOS_VALUE: u32 = 0x00020000; // re-stolen post-shift-fix
 const TRIG_CTRL_VALUE: u32 = 0x80001004; // re-stolen post-shift-fix
 
-/// TRIG_CTRL for the panel-INIT phase only (SPEC.md task #5 log).
+/// TRIG_CTRL for the panel-init phase only. Software trigger, nothing
+/// else: no TE dependency, no frame-window wait.
 ///
-/// TRIG_CTRL_VALUE above is a faithful copy of Linux's live register:
-/// TE(31) | BLOCK_DMA_WITHIN_FRAME(12) | DMA_TRIGGER(SW). Faithful --
-/// and, in U-Boot's context, self-defeating. dsi_host.c's own comment
-/// at msm_dsi_host_xfer_prepare() spells out what bit12 does:
+/// TRIG_CTRL_VALUE above is Linux's live value, TE(31) |
+/// BLOCK_DMA_WITHIN_FRAME(12) | DMA_TRIGGER(SW), and copying it here
+/// deadlocks. Bit 12 is a hardware interlock that makes the command DMA
+/// wait until the MDP is idle; bit 31 points it at a tear-effect pulse.
+/// Both hold in Linux because its DPU is already streaming when it
+/// sends panel commands.
 ///
-///   "Since DSI6G v1.2.0, we can set DSI_TRIG_CTRL.BLOCK_DMA_WITHIN_
-///    FRAME to ask H/W to wait until cmd mdp is idle. S/W wait is not
-///    needed."
-///
-/// It is a HARDWARE INTERLOCK gating the command DMA engine on the
-/// MDP/DPU pixel path's frame state. Linux may set it because by the
-/// time it sends panel commands the DPU is fully up and streaming, so
-/// the inter-frame window it waits for opens continuously. In this
-/// driver the DPU has never been started when panel init runs --
-/// dpu_start() is called only AFTER sheng_mdss_dsi_panel_init()
-/// returns. Nothing is generating frames, so the window never opens.
-/// Likewise TE(31) ("always assume dedicated TE pin") points the block
-/// at a tear-effect signal an uninitialised panel is not pulsing.
-///
-/// A DMA engine told to wait for a frame boundary nobody is producing
-/// asserts CMD_MODE_DMA_BUSY and holds it forever -- which is exactly
-/// and only the symptom seen on every boot of this driver. Every
-/// register-content theory chased so far compared our values against
-/// Linux's and found them identical; the bug was never a wrong value,
-/// it was a right value copied into a context where its precondition
-/// (a live MDP) does not hold.
-///
-/// Software-trigger-only: no TE dependency, no frame-window wait.
+/// Panel init runs BEFORE dpu_start(), so nothing generates frames, the
+/// window never opens, and the engine asserts CMD_MODE_DMA_BUSY
+/// forever. A correct value in a context where its precondition does
+/// not hold.
 const TRIG_CTRL_CMD_INIT_VALUE: u32 = TRIG_CTRL_DMA_TRIGGER_SW;
 
 const CTRL_ENABLE: u32 = 1 << 0;
@@ -1756,9 +1726,10 @@ const CTRL_CLK_EN: u32 = 1 << 8;
 const STATUS0_CMD_MODE_DMA_BUSY: u32 = 1 << 1;
 const STATUS0_VIDEO_MODE_ENGINE_BUSY: u32 = 1 << 3;
 
-/// dsi_wait4video_eng_busy() -- NEVER IMPLEMENTED HERE (SPEC.md task #5).
-///
-/// The kernel calls this before EVERY command, from dsi_cmd_dma_tx():
+/// dsi_wait4video_eng_busy(): when the video engine is transmitting,
+/// wait for the frame to finish and then sit 4ms inside the blanking
+/// period before issuing a command. The kernel does this before EVERY
+/// command:
 ///
 ///     if (!(mode_flags & MIPI_DSI_MODE_VIDEO)) return;
 ///     data = dsi_read(REG_DSI_STATUS0);
@@ -1768,32 +1739,17 @@ const STATUS0_VIDEO_MODE_ENGINE_BUSY: u32 = 1 << 3;
 ///             mdelay(4);       /* delay 4 ms to skip BLLP */
 ///     }
 ///
-/// i.e. when the video engine is transmitting, wait for the frame to
-/// finish and then sit 4ms inside the blanking period before issuing the
-/// command. This driver has never done it -- we trigger the DMA whenever
-/// we feel like it.
+/// Without it, DCS packets are injected into a link that is actively
+/// transmitting video. The DMA still runs and still reports done, but
+/// the packet collides with the video stream on the wire and the DDIC
+/// never sees a well-formed command -- right bytes, wrong timing, and
+/// nothing a register comparison can show.
 ///
-/// This panel is MIPI_DSI_MODE_VIDEO and our host is in video mode during
-/// init (matching the kernel's measured ordering), and sheng.vrb1 shows
-/// STATUS0 bit3 VIDEO_MODE_ENGINE_BUSY SET. So we have been injecting DCS
-/// packets into a link that is actively transmitting video, with no
-/// blanking-window synchronisation at all. The command DMA still runs and
-/// still reports done -- which is exactly what we measure -- but the
-/// packet collides with the video stream on the wire and the DDIC never
-/// sees a well-formed command.
+/// VIDEO_DONE lives in INTR_CTRL, 0x10c.
 ///
-/// That is the one behavioural difference left that no register
-/// comparison could ever show, and it explains why our bytes are perfect
-/// and the panel is deaf: the bytes are right, the timing on the link is
-/// not.
-/// VIDEO_DONE lives in INTR_CTRL (already declared above as 0x10c, matching
-/// dsi.xml's `<reg32 offset="0x0010c" name="INTR_CTRL" type="DSI_IRQ"/>`).
-///
-/// Note for anyone tempted to "correct" that offset: the DSI_6G_REG_SHIFT
-/// is carried entirely by SM8550_MDSS_DSI0_BASE (0x0ae94000 + 4), NOT by
-/// the per-register offsets. dsi.xml gives CTRL=0x000, STATUS0=0x004,
-/// FIFO_STATUS=0x008 -- byte-identical to this file's constants -- so
-/// offsets are used as-is against the shifted base.
+/// Do NOT "correct" these offsets for the DSI6G shift. It is carried
+/// entirely by SM8550_MDSS_DSI0_BASE; per-register offsets are used
+/// as-is against the shifted base.
 const INTR_VIDEO_DONE: u32 = 1 << 16;
 const INTR_MASK_VIDEO_DONE: u32 = 1 << 17;
 /// Status bits in INTR_CTRL are write-1-to-clear and the mask bits live in
@@ -1898,32 +1854,23 @@ const DMA_BUSY_POLL_TIMEOUT_US: u32 = 20000; // 200ms, matching wait_for_complet
 const CTRL_ALL_LANES: u32 = 0xf << 4;
 
 fn dsiHostBringUp(dsi_base: usize) void {
-    // EXACT KERNEL ORDER (SPEC.md task #5 log).
+    // ORDER MATTERS, and the end state does not show it. Program the
+    // whole timing block BEFORE the software reset and before the
+    // controller is enabled. Enabling a DSI controller that has no
+    // active-window or compression configuration yet is a real
+    // sequencing error, and the final register values are identical
+    // either way -- no register comparison can catch it.
     //
-    // Rewritten to follow the sequence traced from every dsi_write() the
-    // working kernel makes, in order:
+    // The kernel's order, from its own writes:
     //
-    //   0x29c compression, 0x020/024/028/02c/030/034 timing   <- dsi_timing_setup()
+    //   0x29c compression, 0x020..0x034 timing   <- dsi_timing_setup()
     //   0x118 CLK_CTRL
-    //   0x114 RESET 1 -> 0                                    <- dsi_sw_reset()
+    //   0x114 RESET 1 -> 0                       <- dsi_sw_reset()
     //   0x00c VID_CFG0, 0x01c VID_CFG1, 0x038 CMD_DMA_CTRL,
     //   0x080 TRIG_CTRL, 0x0c0 CLKOUT, 0x0c8 EOT,
     //   0x108 ERR_INT_MASK0, 0x10c INTR_CTRL, 0x118 CLK_CTRL,
-    //   0x0ac LANE_SWAP                                       <- dsi_ctrl_enable()
-    //   0x000 CTRL = 0x1f1  then  0x1f3
-    //
-    // This driver previously enabled the controller (CTRL = 0x1f1, which
-    // sets DSI_CTRL_ENABLE) and only programmed the timing registers
-    // afterwards, in a separate switch-to-video step. The kernel programs
-    // the entire timing block BEFORE the software reset and before the
-    // controller is ever enabled -- dsi_timing_setup() is called from
-    // msm_dsi_host_power_on() ahead of dsi_sw_reset() and dsi_ctrl_enable().
-    //
-    // Enabling a DSI controller before its active-window/compression
-    // configuration exists is a real sequencing error, and it is invisible
-    // to every audit we have: the final register values are identical
-    // either way, which is exactly why this survived 39 builds of
-    // register-by-register comparison.
+    //   0x0ac LANE_SWAP                          <- dsi_ctrl_enable()
+    //   0x000 CTRL = 0x1f1 then 0x1f3
 
     // --- dsi_timing_setup(): compression descriptor first, then timing.
     mmioWrite32(dsi_base, DSI_VIDEO_COMPRESSION_MODE_CTRL, VIDEO_COMPRESSION_MODE_CTRL_VALUE);
@@ -2023,44 +1970,22 @@ fn buildMsmCmdPacket(buf: []u8, cmd: u8, args: []const u8) usize {
 /// waits for CMD_MODE_DMA_BUSY to clear -- msm_dsi_host_cmd_xfer_commit()
 /// + dsi_cmd_dma_tx()'s completion wait, polled instead of IRQ-driven.
 ///
-/// REAL GAP FOUND (SPEC.md task #5 log): every caller writes the DCS
-/// packet into dma_scratch via plain CPU stores (through a `volatile`
-/// pointer, which only stops the compiler from eliding/reordering the
-/// writes -- it does nothing for the CPU's actual data cache), then
-/// this function immediately triggers the DSI DMA engine, which reads
-/// directly from physical DRAM and is NOT cache-coherent with the CPU.
-/// sheng_mdss.c's own framebuffer fill already calls
-/// flush_dcache_range() before the SSPP's DMA fetch for exactly this
-/// reason -- the identical requirement was simply never applied to the
-/// DSI command DMA path. Without it, the DSI engine can transmit
-/// whatever stale/garbage bytes happen to physically be in DRAM,
-/// compute a valid CRC over that garbage, and send a well-formed-but-
-/// meaningless packet -- explaining a panel that silently drops every
-/// command (matches the zero-byte BTA result) while every register
-/// configuration checks out correct, because the packet content itself
-/// was never valid to begin with. __asm_flush_dcache_range() ends with
-/// its own dsb internally (see arch/arm/cpu/armv8/cache_v8.c), so no
-/// separate barrier call is needed here.
-/// REAL BUG FOUND (SPEC.md task #5 log): this function never did the
-/// msm_dsi_host_xfer_prepare() CMD_MODE_EN|ENABLE OR-in that
-/// dsiCmdDmaTxDualOnce() does. That was harmless while the whole init
-/// ran in command mode. It is NOT harmless now: the host is switched to
-/// VIDEO mode before panel init (matching the kernel's measured
-/// ordering), so by the time its only caller --
-/// sheng_mdss_dsi_read_power_mode_single(), our one two-way liveness
-/// test -- runs, CMD_MODE_EN is clear.
+/// FLUSH THE PACKET FIRST. Callers build it with plain CPU stores --
+/// `volatile` constrains the compiler, not the data cache -- and this
+/// engine reads physical DRAM with no coherency with the CPU. Skip the
+/// flush and it transmits whatever stale bytes are in DRAM, computes a
+/// valid CRC over them, and sends a well-formed meaningless packet: the
+/// panel drops every command while every register reads correct.
+/// flush_dcache_range() ends in its own dsb, so no extra barrier here.
 ///
-/// Measured this boot: sheng.vrb1 = 0x1F3_00000008, i.e. DSI0 CTRL =
-/// 0x000001F3 (VID_MODE_EN set, CMD_MODE_EN CLEAR) with the video engine
-/// busy. Every "read" this driver has ever issued went out with the
-/// controller not in command mode.
+/// OR IN CMD_MODE_EN|ENABLE, as msm_dsi_host_xfer_prepare() does. The
+/// host is in VIDEO mode by the time this runs, so without it a read
+/// goes out with CMD_MODE_EN clear and no bus turnaround is ever
+/// attempted.
 ///
-/// That predicts the exact result pair we have always seen and never
-/// explained: sheng.rd1 = 0 (RDBK_DATA_CTRL COUNT = 0, no bytes) AND
-/// sheng.errst = 0 (TIMEOUT_STATUS = 0, no BTA timeout). A BTA that is
-/// genuinely attempted and gets no answer should time out. Zero bytes
-/// AND zero timeout means no bus turnaround was ever attempted -- our
-/// bug, not evidence about the panel.
+/// That failure is silent in a specific, misleading way: zero bytes
+/// read AND zero timeout. A BTA that is genuinely attempted and gets no
+/// answer times out. Both zero means we never asked.
 fn dsiCmdDmaTxOne(dsi_base: usize, dma_addr: usize, len: usize) c_int {
     const restore = mmioRead32(dsi_base, DSI_CTRL);
     mmioWrite32(dsi_base, DSI_CTRL, restore | CTRL_CMD_MODE_EN | CTRL_ENABLE);
@@ -2468,88 +2393,33 @@ fn dsiCmdDmaTxDual(dsi0_base: usize, dsi1_base: usize, dma_addr: usize, len: usi
     return dsiCmdDmaTxDualOnce(dsi0_base, dsi1_base, dma_addr, len);
 }
 
-/// Real DCS READ (Get Power Mode, 0x0A) with genuine BTA (bus
-/// turnaround) -- every DCS command sent by this driver up to now,
-/// including the panel init sequence and the test patch, has been a
-/// plain write with no BTA/ACK (dsi_host.c's own comment: "no BTA/ACK
-/// is required for a plain DCS write, so a completely unresponsive
-/// panel looks identical to a working one from the DSI host's point
-/// of view"). This is the first command in this driver that actually
-/// requires the panel to respond -- a definitive test of whether
-/// anything is reaching the panel at the physical layer at all,
-/// separate from whether the DPU/video pipeline is configured
-/// correctly. Mirrors msm_dsi_host_cmd_rx()'s real sequence: Set
-/// Maximum Return Packet Size (type 0x37) first, clear RDBK_DATA_CTRL,
-/// then the actual read command (data type 0x06 = DCS_READ, MSM
-/// packet flags BIT(5) = read/BTA-expected, from dsi_cmd_dma_add()'s
-/// `if (msg->rx_buf && msg->rx_len) data[3] |= BIT(5)`), then read the
-/// response back from RDBK_DATA0. DSI0 (master) only, matching the
-/// real driver's rx path (single host). Returns ((count << 8) |
-/// data_byte) on success, where `count` is RDBK_DATA_CTRL's own COUNT
-/// field (bits 16-23) -- the number of bytes the hardware actually
-/// captured over BTA. This disambiguates a genuine "panel responded
-/// with 0x00" from "panel never responded at all": RDBK_DATA_CTRL is
-/// explicitly cleared right before the read, so DATA0 alone reads 0 in
-/// BOTH cases -- only COUNT being nonzero proves real bytes came back
-/// over the wire. Negative return = DMA-level error/timeout.
+/// DCS read (Get Power Mode, 0x0A) with a real bus turnaround.
 ///
-/// BUG FIXED (SPEC.md task #5 log): the first version of this function
-/// only triggered DSI0's DMA. msm_dsi_manager_cmd_xfer_trigger() in the
-/// real driver shows that for sync-dual-dsi, EVERY command commit
-/// mirrors to both DSI0 and DSI1 together (DSI1 committed first, then
-/// DSI0) -- including whatever becomes a read/BTA from DSI0's own
-/// context. dsiSendDcs() already does this correctly for every other
-/// command in this driver; this function didn't, for the trigger step
-/// (RX-side register reads are correctly DSI0-only, matching the real
-/// driver's single-host rx path -- only the trigger was wrong). If
-/// this panel's dual-link stitching needs coordinated activity on both
-/// links to respond to LP/BTA traffic at all, a DSI0-only trigger
-/// could look malformed to the panel and explain a zero response on
-/// its own, independent of the base driver (which never had this bug).
-/// SINGLE-HOST DCS read (SPEC.md task #5 log).
+/// Every other command this driver sends is a plain write with no
+/// BTA/ACK, so "success" only ever means the DMA engine shipped bytes --
+/// an unresponsive panel looks identical to a working one. A read is the
+/// one operation that requires the panel to drive data back.
 ///
-/// This is the one test that would POSITIVELY prove the panel is alive:
-/// a read requires the panel to turn the bus around and drive data
-/// back. Everything else we have is one-way -- "success" has only ever
-/// meant our DMA engine shipped bytes. The two liveness tests tried so
-/// far were both invalid: ALL_PIXELS_ON is implementation-defined on a
-/// RAM-less video-mode panel, and DCS 0x51 cannot move the backlight
-/// because the KTZ8866 is in I2C-brightness mode (the visible soft-start
-/// ramp is driven over I2C, not by the panel's PWM).
+/// Sequence, from msm_dsi_host_cmd_rx(): Set Maximum Return Packet Size
+/// (0x37), clear RDBK_DATA_CTRL, then the read itself (data type 0x06,
+/// MSM packet flag BIT(5) marks it read/BTA-expected), then read
+/// RDBK_DATA0.
 ///
-/// The existing read path issues the read on BOTH hosts at once via
-/// dsiCmdDmaTxDual(). On a bonded panel each host has its own physical
-/// link, and msm's rx path is explicitly single-host, so this function
-/// was written to do the read on DSI0 alone.
+/// Returns a packed result; see the decode note at the return site for
+/// the field layout and the two traps in reading it. Negative means a
+/// DMA error or timeout.
 ///
-/// CORRECTION (SPEC.md task #5 log): "single-host" is only half true, and
-/// the half it gets wrong is the half that matters. Reading dsi_manager.c
-/// directly:
+/// TRIGGERING, which is easy to get wrong in both directions. In
+/// dsi_manager.c:
 ///
 ///   msm_dsi_manager_cmd_xfer():         need_sync = IS_SYNC_NEEDED() && !is_read
 ///   msm_dsi_manager_cmd_xfer_trigger(): no is_read check at all
 ///
-/// So for a read the kernel skips only the DSI1 xfer_prepare/restore --
-/// the DMA TRIGGER still fires on DSI1 and then DSI0, off the same
-/// dma_base, exactly as for a write. Only the RDBK read-back is DSI0-only.
-/// The kernel therefore does neither what this function does (trigger DSI0
-/// alone) nor what dsiCmdDmaTxDual() does (prepare AND trigger both); it
-/// sits precisely between them. On a stitched panel that expects
-/// synchronised SOT across both links, a command arriving on one link only
-/// is a plausible reason for the DDIC to ignore it entirely.
-///
-/// Both variants are therefore reported side by side this boot --
-/// sheng.rd1 from here (DSI0-only trigger) and sheng.pm from
-/// sheng_mdss_dsi_read_power_mode() (both triggered) -- which brackets the
-/// kernel's actual behaviour without guessing which half matters.
-///
-///   non-zero data_id/payload -> the panel RECEIVES, DECODES and RESPONDS.
-///     Everything upstream is proven good and the fault is confined to
-///     the video path.
-///   still zero on BOTH -> two-way communication genuinely fails on a link
-///     whose every register matches working silicon.
-///   zero on one, data on the other -> the trigger pattern itself is the
-///     difference, and it applies to every command we have ever sent.
+/// So a read skips only DSI1's xfer_prepare/restore. The DMA trigger
+/// still fires on DSI1 then DSI0 off the same dma_base, exactly as for a
+/// write, and only the RDBK read-back is DSI0-only. Triggering DSI0
+/// alone is as wrong as preparing both -- a stitched panel expects
+/// synchronised SOT across both links.
 export fn sheng_mdss_dsi_read_power_mode_single(dsi0_base: usize, dma_scratch: usize) callconv(.c) i64 {
     const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
 
@@ -2699,49 +2569,33 @@ export fn sheng_mdss_dsi_read_power_mode_single(dsi0_base: usize, dma_scratch: u
 
     mmioWrite32(dsi0_base, DSI_LP_TIMER_CTRL, lp_timer_saved);
 
-    // SELF-DIAGNOSING ENCODING (SPEC.md task #5 log). The old return was
-    // (RDBK_DATA_CTRL << 32) | RDBK_DATA0, so an all-zero result -- which
-    // is what this test has returned for its entire history -- could not
-    // distinguish "the panel did not answer" from "we never asked
-    // properly". That ambiguity is exactly what hid the missing
-    // xfer_prepare (see dsiCmdDmaTxOne()'s comment) for so long.
+    // Report the WHOLE of RDBK_DATA0, plus the state the read ran in.
     //
-    // DECODE BUG FOUND (SPEC.md task #5 log). The previous encoding put
-    // RDBK_DATA_CTRL in the high half and `resp & 0xff` in the low byte.
-    // BOTH halves were wrong, and together they could make a SUCCESSFUL
-    // read look exactly like a dead link:
+    // Two decoding traps make a SUCCESSFUL read look like a dead link:
     //
-    //   * RDBK_DATA_CTRL has no readable COUNT field. dsi_host.c only ever
-    //     WRITES it (CLR then 0, in msm_dsi_host_cmd_rx) and never reads it
-    //     back for anything. Treating a zero there as "0 bytes captured"
-    //     was an invention; it reads 0 regardless.
+    //   * RDBK_DATA_CTRL has no readable COUNT field. dsi_host.c only
+    //     ever writes it. It reads 0 regardless, so a zero there is not
+    //     evidence of anything.
+    //   * dsi_cmd_dma_rx() does ntohl() then indexes bytes, so on this
+    //     little-endian CPU the response bytes sit REVERSED relative to
+    //     the raw register: data_id is bits 31:24 and the payload is
+    //     23:16. The low byte is the tail of the packet, legitimately
+    //     0x00 on a good short read.
     //
-    //   * dsi_cmd_dma_rx() does `*temp++ = ntohl(data)` and then indexes
-    //     the result as bytes, so on this little-endian CPU the response
-    //     byte order within RDBK_DATA0 is REVERSED relative to the raw
-    //     register. buf[0] (the data_id) is bits 31:24, and
-    //     dsi_short_read1_resp() takes the actual payload from buf[1] --
-    //     bits 23:16. The low byte this driver was reporting is the tail
-    //     of the packet, which is legitimately 0x00 on a good short read.
+    // A real reply of data_id 0x21 / payload 0x9C therefore reads
+    // 0x219C0000, and reporting `resp & 0xff` alone shows 0 -- identical
+    // to a silent panel.
     //
-    // So a real reply of data_id 0x21 / payload 0x9C lands in RDBK_DATA0 as
-    // 0x219C0000: RDBK_DATA_CTRL = 0 and `resp & 0xff` = 0 -- byte-for-byte
-    // the "sheng.rd1 = 0x01F7_0000, panel is silent" result this project
-    // has been treating as its central piece of evidence. Report the WHOLE
-    // register instead so the answer is unambiguous.
-    //
-    //   63:32  RDBK_DATA0 RAW, all 32 bits. Decode per the kernel:
-    //          31:24 = data_id (0x21/0x1A DCS short read 1-byte response,
-    //          0x22/0x1C = 2-byte, 0x02 = ack+error report), 23:16 =
-    //          payload. Any nonzero value here means the panel ANSWERED.
+    //   63:32  RDBK_DATA0 raw. 31:24 data_id (0x21/0x1A short read
+    //          1-byte, 0x22/0x1C 2-byte, 0x02 ack+error), 23:16 payload.
+    //          Nonzero here means the panel ANSWERED.
     //   31:16  DSI_CTRL low half AS IT STOOD DURING THE READ. 0x01F7
-    //          means CMD_MODE_EN(bit2) was genuinely asserted, i.e. the
-    //          BTA was properly issued. 0x01F3 means CMD_MODE_EN was clear
-    //          and the result says nothing about the panel at all.
+    //          means CMD_MODE_EN was asserted and the BTA was genuinely
+    //          issued; 0x01F3 means it was clear and the result says
+    //          nothing about the panel.
     //   15:8   TIMEOUT_STATUS low byte.
-    //   7:0    the decoded Get Power Mode payload (bits 23:16 of RDBK_DATA0)
-    //          -- expect bit2 DISPLAY_ON | bit3 NORMAL_MODE | bit4 SLEEP_OUT,
-    //          i.e. 0x9C on a live, initialised NT36532E.
+    //   7:0    decoded Get Power Mode payload. Expect 0x9C on a live
+    //          initialised panel: DISPLAY_ON | NORMAL_MODE | SLEEP_OUT.
     const resp = mmioRead32(dsi0_base, DSI_RDBK_DATA0);
     const ctrl_during = mmioRead32(dsi0_base, DSI_CTRL);
     const tmo = mmioRead32(dsi0_base, DSI_TIMEOUT_STATUS);
@@ -2848,26 +2702,13 @@ export fn sheng_mdss_dsi_panel_sleep(dsi0_base: usize, dsi1_base: usize, dma_scr
     udelay(5000);
 }
 
-/// INTER-COMMAND GAP (b109).
+/// Gap between init commands.
 ///
-/// Everything else is now excluded. b108 handed the panel over with a
-/// clean init (panel_init_ret=0, no timeouts), a link byte-identical to a
-/// rendering Linux, a transport proven working in both directions (b105
-/// got the first-ever DCS reply 0x08 and BTA_DONE=1), and NO video at all
-/// (lanact=0, fdel=0) -- and Linux still read the DDIC as unconfigured.
-/// Meanwhile the identical 94 bytes replayed from Linux drive this exact
-/// panel to 0x9c. Content, ordering, framing, rails, reset and link state
-/// are all verified the same. The one measured difference left is RATE:
-///
-///   Linux  ~2ms per command   (init_seq 184ms for ~94 commands; a single
-///                              isolated command spans 12.8ms of SHENG_W)
-///   U-Boot ~24us per command  (from the per-command trace)
-///
-/// We transmit roughly 80x faster than the working driver, back to back
-/// with no gap. A DDIC that needs time to consume each command would
-/// accept the early ones, fall behind, and end up unconfigured -- which is
-/// exactly what we observe, and why replaying the same bytes through
-/// Linux's much slower path succeeds.
+/// The DDIC needs time to consume each one. Linux paces its init at
+/// roughly 2ms per command; sending them back to back at ~24us each is
+/// about 80x faster, and the panel accepts the early commands, falls
+/// behind, and ends up unconfigured -- with correct bytes, correct
+/// framing and no error anywhere.
 ///
 /// Tunable on purpose: if 1ms fixes it, bisect down to find the real
 /// requirement rather than leaving a guess in the boot path.
@@ -2949,60 +2790,36 @@ export fn sheng_mdss_dsi_host_video_prepare(dsi0_base: usize, dsi1_base: usize) 
 
 
 export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, enable_dsc: bool) callconv(.c) c_int {
-    // REAL GAP FOUND (SPEC.md task #5 log): smmuBypassMdssStream() was
-    // only ever called inside sheng_mdss_dpu_start(), which runs AFTER
-    // this entire panel init sequence -- meaning it was never actually
-    // in effect for the DSI host's OWN command-mode DMA fetches
-    // (dma_scratch), only for the DPU's later SSPP video fetch. Command
-    // #0's DMA read has been hitting an unbypassed SMMU stream this
-    // whole time. Moved here, before any DSI command traffic at all.
+    // Must run before ANY DSI command traffic, not just before the
+    // DPU's video fetch: the host's own command-mode DMA reads
+    // dma_scratch through the same stream, so command #0 hits an
+    // unbypassed SMMU otherwise.
     smmuBypassMdssStream();
 
-    // Host bring-up + video-mode switch now run in
+    // Host bring-up and the video-mode switch run earlier, in
     // sheng_mdss_dsi_host_video_prepare(), before the panel is powered
-    // and reset -- matching the kernel's measured timeline.
+    // and reset -- matching the kernel's timeline.
+    //
+    // Do NOT move the video-mode switch here to match the panel
+    // driver's prepare_prev_first flag. Tried: DSI CTRL diverges and the
+    // DSC encoder drops from OUT_STATUS 0x18xxxx to 0, INT_STAT 0x7b0 to
+    // 0x180, and it stays that way even with the xfer_prepare/restore
+    // that video-mode commands need. The switch belongs in dpu_start().
 
-    // ORDERING EXPERIMENT REVERTED (SPEC.md task #5 log): switching to
-    // video mode HERE (before the DCS sequence, matching the panel
-    // driver's prepare_prev_first flag) measurably regressed things --
-    // sheng.verify bit0 (DSI CTRL) mismatched and the DSC encoder went
-    // from OUT_STATUS 0x18xxxx back to 0, INT_STAT 0x7b0 back to 0x180
-    // -- and it stayed regressed even after implementing the
-    // xfer_prepare/restore that video-mode commands require. The
-    // measurement beats the reading of prepare_prev_first; the switch
-    // stays in dpu_start(). The xfer_prepare/restore is KEPT, since
-    // Linux does it unconditionally regardless of link mode.
-
-    // LP-11 settle test (SPEC.md task #5 log): U-Boot runs linearly and
-    // near-instantly compared to Linux's mutex/scheduler-laden power-on
-    // path -- if the panel's physical LP receiver needs the lines held
-    // in LP-11 (both HIGH) for a minimum analog settle time before it
-    // will accept a Start-of-Transmission burst, firing the first DCS
-    // command microseconds after lane enable could look like line
-    // noise to the panel rather than a real command. Brute-force test:
-    // hold here before any command traffic.
-    // ENABLE-LATCH CYCLE (SPEC.md task #5 log).
+    // Force a clean ENABLE latch before the first DCS byte: drop
+    // ENABLE, settle, set it again.
     //
-    // Hypothesis: this controller samples its configuration registers on
-    // the DSI_CTRL ENABLE 0->1 edge into the active datapath. Config
-    // written while ENABLE is already set lands in the register file --
-    // so a later readback returns the right value and every audit diffs
-    // clean -- but never reaches the datapath. Correct values, wrong
-    // datapath. That fits every observation: registers match, packets are
-    // byte-perfect in DRAM, DMA completes, and the panel receives nothing.
-    //
-    // Circumstantial support: dsi_sw_reset() in the kernel explicitly
-    // reads DSI_CTRL, clears ENABLE if set, resets, then restores it --
-    // mainline goes out of its way never to reconfigure a running
-    // controller. The latch semantics themselves are not publicly
-    // documented, so this is inference, not proof.
-    //
-    // b39 already reordered bring-up so all config precedes the ENABLE
-    // write. But several things still touch config AFTER that: the
+    // This controller appears to sample its configuration into the
+    // active datapath on the DSI_CTRL ENABLE 0->1 edge. Config written
+    // while ENABLE is already set reaches the register file -- so every
+    // readback and audit diffs clean -- without reaching the datapath.
+    // Several things do write config after the initial enable: the
     // video-mode switch in dpu_start(), the TRIG_CTRL restore, and the
-    // per-command CMD_MODE_EN OR-in. So force a clean latch immediately
-    // before the first DCS byte: drop ENABLE, let it settle, set it again.
-    // If the mechanism is real, this alone should change the outcome.
+    // per-command CMD_MODE_EN OR-in.
+    //
+    // Inference, not documented. Supporting it: dsi_sw_reset() reads
+    // DSI_CTRL, clears ENABLE, resets, then restores it -- mainline goes
+    // out of its way never to reconfigure a running controller.
     {
         const c0 = mmioRead32(dsi0_base, DSI_CTRL);
         const c1 = mmioRead32(dsi1_base, DSI_CTRL);
@@ -3018,40 +2835,20 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
 
     udelay(250000); // bumped 100ms -> 250ms brute-force test (SPEC.md task #5 log)
 
-    // COMMAND PACING (SPEC.md task #5 log).
+    // Pace the init to the kernel's rate, ~2ms per command.
     //
-    // Everything about WHAT we send is now verified identical to the
-    // working kernel: the 87-command table diffs 87/87, the transmitted
-    // packets are byte-identical including the 132-byte PPS, the bytes are
-    // confirmed correct in DRAM at fetch time, the ordering matches, the
-    // host state at command time matches, the panel is powered and the
-    // reset line physically toggles. Yet the handoff test proved our init
-    // does not configure the DDIC.
+    // That 2ms is not a deliberate delay in the panel driver, it is the
+    // cost of the kernel's per-transfer path: mutex, per-transfer link
+    // clock enable/disable, IRQ completion wait. Here a command is a DMA
+    // trigger plus a busy-poll that clears in microseconds, so without
+    // pacing the whole sequence goes out roughly 80x faster than the
+    // panel has ever received it.
     //
-    // So the remaining variable is not content but RATE. Measured from the
-    // kernel's own ktime trace: init_seq enter 668.875ms, exit 856.742ms
-    // -- 187.9ms for ~95 commands, i.e. about 2ms per command. That is not
-    // a deliberate delay in the panel driver; it is the natural cost of
-    // the kernel's per-transfer path (mutex, per-transfer link clock
-    // enable/disable, IRQ completion wait).
-    //
-    // This driver has none of that. Each command is a DMA trigger plus a
-    // busy-poll that clears in microseconds, so we blast the entire
-    // sequence in a small fraction of the time the panel has ever been
-    // given. A DDIC that needs settling time between register writes --
-    // especially across the 0xff page switches, which reconfigure which
-    // register bank subsequent writes land in -- would silently drop most
-    // of them while every command still reports success.
-    //
-    // Pace to match the kernel's measured rate.
+    // A DDIC that needs settling time between register writes -- above
+    // all across the 0xff page switches, which change which bank later
+    // writes land in -- drops most of them while every command still
+    // reports success.
     const INIT_CMD_PACING_US: c_ulong = 2000;
-
-    // See the tail-only block below. ANSWERED: still black, so our commands
-    // do not land at all, table or not -- the 87-command table is ruled out
-    // as the cause. Restored to the faithful full sequence, which is also
-    // what makes a Get Power Mode reply interpretable (0x9C = sleep-out,
-    // normal mode, display on) rather than reflecting a half-configured
-    // DDIC.
     const SKIP_INIT_TABLE_TEST: bool = false;
 
     // DIAGNOSTIC (SPEC.md task #5 log): a new, genuine DMA timeout
@@ -3241,35 +3038,27 @@ export fn sheng_mdss_dsi_test_patch(dsi0_base: usize, dsi1_base: usize, dma_scra
 // ---------------------------------------------------------------------
 // DPU pixel pipeline (task #5)
 //
-// Topology confirmed from live DPU debugfs state (see SPEC.md): a
-// single SSPP (sspp_8 = SSPP_DMA0, DMA-type pipe, catalog base
-// +0x24000) using multirect -- rect_0 is the left half of the
-// framebuffer, rect_1 the right half -- feeding two independent
-// LM -> PINGPONG -> DSC -> INTF chains, one per DSI half:
+// One SSPP (sspp_8 = SSPP_DMA0, a DMA-type pipe at +0x24000) in
+// multirect mode -- rect_0 the left half of the framebuffer, rect_1 the
+// right -- feeding two independent LM -> PINGPONG -> DSC -> INTF
+// chains, one per DSI half:
 //
 //   sspp_8 rect_0 (left  1524x2032+0+0)    -> LM_0 -> PP_0 -> DSC_0 -> INTF_1 -> DSI0 (master)
 //   sspp_8 rect_1 (right 1524x2032+1524+0) -> LM_1 -> PP_1 -> DSC_1 -> INTF_2 -> DSI1 (slave)
 //   CTL_0 orchestrates + flushes all of the above atomically.
 //
-// INTF_0 (base +0x34000) is type INTF_DP on this catalog (dpu_9_0_sm8550.h)
-// -- NOT usable for DSI. The two DSI-capable interfaces are INTF_1
-// (+0x35000, controller_id 0 == DSI0) and INTF_2 (+0x36000, controller_id
-// 1 == DSI1). This corrects an earlier (wrong) assumption in SPEC.md's
-// continuation guide that used INTF_0/INTF_1.
+// INTF_0 (+0x34000) is type INTF_DP on this catalog and CANNOT drive
+// DSI. The DSI-capable interfaces are INTF_1 (+0x35000, controller_id 0
+// = DSI0) and INTF_2 (+0x36000, controller_id 1 = DSI1).
 //
-// All register offsets/sequencing below are ported directly from
-// dpu_hw_sspp.c, dpu_hw_lm.c, dpu_hw_pingpong.c, dpu_hw_dsc_1_2.c (the
-// hard-slice DSC variant -- catalog/dpu_rm.c selects this over the
-// plain dpu_hw_dsc.c whenever core_major_ver >= 7, which sm8550 (9.0)
-// is), dpu_hw_intf.c and dpu_hw_ctl.c in the mainline kernel checkout,
-// specialized to our fixed single-plane XRGB8888 / single-blendstage /
-// dual-hard-slice-DSC / video-mode-DSI case -- not a general port of
-// the DPU driver object model.
+// Offsets and sequencing come from dpu_hw_{sspp,lm,pingpong,intf,ctl}.c
+// and dpu_hw_dsc_1_2.c -- the hard-slice DSC variant, which dpu_rm.c
+// selects for core_major_ver >= 7. Specialised to this one case: single
+// plane XRGB8888, one blend stage, dual hard-slice DSC, video-mode DSI.
+// Not a general port of the DPU object model.
 //
-// Panel is confirmed MIPI_DSI_MODE_VIDEO (panel-novatek-nt36532e.c),
-// not command mode, so the INTF timing engine drives DSI continuously;
-// there's no tearing-effect/vsync wiring here since we only need one
-// static frame to appear.
+// The panel is video mode, so the INTF timing engine drives DSI
+// continuously and there is no TE/vsync wiring here.
 
 const SSPP_SRC_SIZE: usize = 0x00;
 const SSPP_SRC_XY: usize = 0x08;
@@ -3291,37 +3080,31 @@ const SSPP_SRC_UNPACK_PATTERN_REC1: usize = 0x178;
 const SSPP_SRC_OP_MODE_REC1: usize = 0x17c;
 
 // ===================================================================
-// SSPP registers found by the DPU write trace (SPEC.md task #5 log).
+// SSPP pixel extension, clock gate and QoS.
 //
-// Hooking dpu_reg_write() on the working kernel and diffing the SSPP
-// offsets it writes against ours found NINE registers this driver has
-// never written. The important one is the pixel-extension block:
+// The pixel-extension block is the one that bites:
 //
 //   SW_PIX_EXT_C0_REQ_PIXELS  (0x108) = 0x07F005F4
 //   SW_PIX_EXT_C1C2_REQ_PIXELS(0x118) = 0x07F005F4
 //   SW_PIX_EXT_C3_REQ_PIXELS  (0x128) = 0x07F005F4
 //
-// 0x07F005F4 is (2032 << 16) | 1524 -- the same height/width as
-// SSPP_SRC_SIZE. dpu_hw_sspp_setup_pe_config() programs how many pixels
-// the pipe actually REQUESTS per plane. Left at zero, the fetch is
-// configured, the format is right, the address is right, the pipe is
-// marked fetch-active -- and it asks the bus for nothing. Everything
-// downstream then faithfully compresses and transmits a black frame,
-// which is exactly this driver's symptom, with every audit passing.
+// 0x07F005F4 is (2032 << 16) | 1524, the same geometry as
+// SSPP_SRC_SIZE. It sets how many pixels the pipe REQUESTS per plane.
+// Left at zero the fetch is configured, the format and address are
+// right, the pipe reads as fetch-active -- and it asks the bus for
+// nothing. Everything downstream compresses and transmits a black frame
+// with every audit passing.
 //
-// Also written by the kernel and never by us:
-//   0x330 clk_ctrl -- an SSPP CLOCK GATE, same shape as DSC_CLK_CTRL
-//                     (traced 0x4 then 0x5; 0x5 is the settled value)
+// The rest the kernel programs here:
+//   0x330 clk_ctrl -- SSPP clock gate, settles at 0x5
 //   0x138 / 0x1c8 ubwc_error = 0x80000000 (rect0 / rect1)
 //   0x134 / 0x13c = 0x00000009
 //   0x01c / 0x020 SRC2/SRC3_ADDR = 0, 0x028 YSTRIDE1 = 0
 //   0x060/0x064/0x06c/0x074/0x078 danger/safe/QoS-ctrl/creq LUTs
 //
-// NOTE on the QoS LUTs: an earlier pass wrote these alone and measured a
-// REGRESSION, so they were reverted. That measurement was taken without
-// the pixel-extension and clock-gate writes above, i.e. on a pipe that
-// could never fetch anyway. They are part of what the kernel programs,
-// so they go back in together rather than being cherry-picked.
+// Write the QoS LUTs together with the rest, not on their own. Writing
+// them alone measures as a regression, but that is on a pipe with no
+// pixel extension and no clock gate, which could never fetch anyway.
 const SSPP_SW_PIX_EXT_C0_LR: usize = 0x100;
 const SSPP_SW_PIX_EXT_C0_TB: usize = 0x104;
 const SSPP_SW_PIX_EXT_C0_REQ_PIXELS: usize = 0x108;
@@ -3883,54 +3666,29 @@ fn dscConfigureInstance(dce_base: usize, enc_off: usize, ctl_off: usize, pp_idx:
     dpuHwWrite(dce_base, ctl_off, DSC_CLK_CTRL, DSC_CLK_CTRL_VALUE);
 }
 
-// THE REAL ANSWER for why U-Boot's own render never showed pixels
-// (SPEC.md task #5 log): live devmem read of the apps_smmu's SCR0
-// (global config, base 0x15000000) showed USFCFG=1 (bit 8) --
-// unidentified/unmatched IOMMU streams FAULT rather than bypass by
-// default on this hardware. The display subsystem's real stream ID
-// (mdss's `iommus = <&apps_smmu 0x1c00 0x2>` in sm8550.dtsi) has a
-// pre-existing, firmware-provisioned SMR entry (found by scanning all
-// 105 stream-match-register groups: SMR[3] = 0x80021c00, VALID=1,
-// MASK=0x2, ID=0x1c00 -- matching the devicetree exactly, at a fixed
-// slot index, not something any OS driver dynamically allocates).
-// Every raw physical-address SSPP fetch we ever did was almost
-// certainly silently aborted by the SMMU -- explaining precisely why
-// frame/line counters increment fine (pure INTF timing, no memory
-// access needed) while zero real pixel content ever arrived, with no
-// visible hang (the fault interrupt is enabled in SCR0 too, but
-// nothing in U-Boot services it, so it just sits pending harmlessly).
-// Fix: force this exact stream's S2CR entry to BYPASS (TYPE=1) before
-// ever touching the framebuffer -- no page tables needed, physical
-// addresses pass straight through as IOVAs. Whatever S2CR[3] held
-// during U-Boot's actual prior runs can't be observed anymore (Linux's
-// own SMMU driver reprograms it to real translated/context-bank mode
-// during its own probe), so don't guess: just set it ourselves.
-// REAL GAP FOUND (SPEC.md task #5 log, kernel pr_info trace comparison):
-// a real, working Linux boot's msm_dsi_host_cmd_xfer_commit() NEVER
-// passes a raw physical DRAM address into DMA_BASE -- every single
-// command DMA this session's traced kernel captured used dma_base=
-// 0x1000, a tiny SMMU-translated IOVA, proving the real driver
-// genuinely relies on stage-1 translation for this stream, not
-// passthrough. U-Boot's own in-tree ARM SMMU-500 driver
-// (drivers/iommu/qcom-hyp-smmu.c, configure_smr_s2cr()'s comment,
-// verbatim): "WARNING: Don't change this to use S2CR_TYPE_BYPASS!
-// Some Qualcomm boards have angry hypervisor firmware that converts
-// S2CR type BYPASS to type FAULT on write." smmuBypassMdssStream()
-// did exactly the thing that comment warns against -- forcing
-// S2CR[3] to TYPE_BYPASS(1) -- which, if SM8550 is one of those
-// boards, means every DSI command DMA fetch has been silently
-// FAULTED at the SMMU/interconnect boundary this entire session:
-// the bus master's read never reaches the DSI PHY at all, so
-// CMD_MODE_DMA_BUSY never clears and DLN0_PHY_ERR stays zero --
-// exactly this session's unchanging failure signature. Replaced
-// with that same driver's own proven workaround: S2CR_TYPE_TRANS
-// pointing at a context bank whose stage-1 MMU is left disabled
-// (SCTLR.M unset, TCR/TTBR/MAIR all zero) -- physical addresses
-// still pass straight through untranslated, but the word "BYPASS"
-// never appears in the S2CR write the hypervisor is watching for.
-// Must match SHENG_MDSS_DSI_DMA_SCRATCH in sheng_mdss.c exactly -- the
-// one physical buffer every DSI command DMA this driver ever sends
-// uses, now moved to the high DRAM bank (see that constant's comment).
+// The MDSS stream must be pointed at a context bank, NOT set to BYPASS.
+//
+// apps_smmu's SCR0 has USFCFG set, so unmatched streams FAULT rather
+// than bypass. The display's stream ID has a firmware-provisioned match
+// entry (SMR[3] = 0x80021c00, VALID, MASK 0x2, ID 0x1c00), so raw
+// physical SSPP fetches get aborted silently -- frame and line counters
+// still increment, because INTF timing needs no memory access, while no
+// pixel content ever arrives. The fault interrupt is enabled but
+// nothing in U-Boot services it, so it sits pending harmlessly.
+//
+// DO NOT write S2CR_TYPE_BYPASS. From U-Boot's own qcom-hyp-smmu.c:
+// "Don't change this to use S2CR_TYPE_BYPASS! Some Qualcomm boards have
+// angry hypervisor firmware that converts S2CR type BYPASS to type
+// FAULT on write." That turns every DSI command DMA into a silent fault
+// -- CMD_MODE_DMA_BUSY never clears, DLN0_PHY_ERR stays zero.
+//
+// Use that driver's workaround instead: S2CR_TYPE_TRANS pointing at a
+// context bank with stage-1 left disabled (SCTLR.M clear, TCR/TTBR/MAIR
+// zero). Physical addresses pass through untranslated and the word
+// BYPASS never appears in the write the hypervisor watches.
+
+// Must match SHENG_MDSS_DSI_DMA_SCRATCH in sheng_mdss.c -- the one
+// physical buffer every DSI command DMA uses.
 const SHENG_MDSS_DSI_DMA_SCRATCH_PHYS: u64 = 0xa3100000;
 const APPS_SMMU_BASE: usize = 0x15000000;
 const SMMU_GR0_ID0: usize = 0x20;
@@ -3946,37 +3704,25 @@ const SMMU_SCTLR_CFIE: u32 = 1 << 6;
 const SMMU_SCTLR_CFRE: u32 = 1 << 5;
 const SMMU_VMID_UNUSED: u32 = 0xff;
 
-// Live-captured off the currently-running, genuinely-rendering Linux
-// system's own MDSS context bank (python /dev/mem walk, SPEC.md task
-// #5 log): SCTLR=0x67, TCR=0x80351c, confirming 4KB granule / T0SZ=28
-// (36-bit input address size, start_level=1 for a 4KB-granule 3-level
-// walk -- so a level-1 descriptor is a valid 1GB block).
+// Read off a rendering Linux's own MDSS context bank. TCR 0x80351c is
+// a 4KB granule with T0SZ=28: 36-bit input, start_level=1, so an L1
+// descriptor is a valid 1GB block.
 const SMMU_TCR_LIVE_LINUX_VALUE: u32 = 0x80351c;
 const SMMU_SCTLR_LIVE_LINUX_VALUE: u32 = 0x67;
-// MAIR0 byte 0 (AttrIndx=0): Normal memory, Inner/Outer Write-Back,
-// Read/Write-Allocate (0xFF, the standard ARMv8 encoding) -- our own
-// choice, not required to match Linux's own index assignment since
-// this is a separate table or this driver's own context bank.
+// MAIR0 byte 0 (AttrIndx=0): Normal, Inner/Outer Write-Back,
+// Read/Write-Allocate. Our own choice -- this is our context bank, so
+// it need not match Linux's index assignment.
 const SMMU_MAIR0_NORMAL_WB: u32 = 0xff;
 
-// REAL GAP FOUND (SPEC.md task #5 log): a live LPAE walk of the exact
-// context bank the WORKING Linux system is using right now (strict-
-// devmem temporarily disabled to allow the /dev/mem read) resolved
-// Linux's own dma_base=0x1000 IOVA to physical 0x887368000 -- deep in
-// the HIGH DRAM bank (0x880000000+), nowhere near the low <4GB bank
-// this driver's scratch buffer has always lived in. A 1GB *block*
-// descriptor can't express an independent IOVA->PA mapping (the
-// low-order bits of input and output address must match at block
-// granularity) -- reaching an arbitrary high-bank physical target
-// from a small, 32-bit-representable IOVA (required since DMA_BASE
-// is a plain reg32) needs genuine page-level (4KB) translation: a
-// full 3-level walk, exactly mirroring Linux's own IOVA choice
-// (0x1000) so this exact IOVA value, already proven to work on this
-// silicon/firmware, is reused rather than picking a new untested one.
-// Set equal to SHENG_MDSS_DSI_DMA_SCRATCH_PHYS so the IOVA computed in
-// dsiCmdDmaTrigger() comes out identity (iova == dma_addr), resolved by
-// the SSPP-validated identity block rather than the 3-level walk. See
-// SHENG_MDSS_DSI_DMA_SCRATCH's comment in sheng_mdss.c.
+// Equal to the DMA scratch address, so the IOVA computed in
+// dsiCmdDmaTrigger() comes out identity and resolves through the
+// SSPP-validated 1GB identity block rather than a 3-level walk.
+//
+// DMA_BASE is a plain 32-bit register, so the IOVA has to be
+// 32-bit-representable. Linux instead maps a small IOVA (0x1000) to a
+// high-bank physical address, which a 1GB block descriptor cannot
+// express -- block granularity forces the low bits of input and output
+// to match -- and so needs real 4KB page-level translation.
 const SMMU_MAPPED_IOVA: usize = 0xa3100000;
 // Table/page descriptor bit layout, shared by all 3 levels here:
 // valid(bit0)=1, table-or-page(bit1)=1 (both L1/L2 "table" descriptors
@@ -4666,13 +4412,8 @@ export fn sheng_mdss_dpu_start(
     return 0;
 }
 
-/// Post-start datapath readback (SPEC.md task #5 log). The panel is
-/// lit, DSI commands all succeed, INTF1's frame counter advances
-/// (~28 frames/500ms) and the SMMU reports zero faults -- so timing,
-/// link and translation are all proven good and the black screen has
-/// to be a datapath-config problem between the framebuffer and the
-/// mixer output. Rather than keep inspecting write-side code that
-/// "looks right", read the pipeline back after it has been running.
+/// Read the datapath back after it has been running, rather than
+/// inspecting write-side code that looks right.
 ///
 /// diag1 = CTL_FLUSH  << 32 | CTL_START
 ///   CTL_FLUSH bits are cleared BY HARDWARE as each block's config is
@@ -4686,15 +4427,12 @@ export fn sheng_mdss_dpu_start(
 /// diag3 = LM0 OUT_SIZE << 32 | LM0 blend-stage0 OP
 ///   The mixer's own view: output size and whether stage 0 is actually
 ///   blending the pipe in rather than emitting border colour (black).
-/// DSI-side readback while the DPU is supposedly streaming video.
+/// DSI-side readback while the DPU is streaming.
 ///
-/// The single most informative bit here is STATUS0's
-/// VIDEO_MODE_ENGINE_BUSY (bit3, per dsi.xml). If the DSI host is
-/// genuinely transmitting a video stream it is ~always asserted; if it
-/// reads 0 while INTF1's frame counter is advancing, then the DPU is
-/// clocking out timing into a DSI host that is not actually sending
-/// anything, and the black panel is explained without any of the
-/// SSPP/LM/DSC config being at fault (all of which read back correct).
+/// STATUS0's VIDEO_MODE_ENGINE_BUSY (bit 3) carries most of the
+/// information: a host genuinely transmitting keeps it asserted. Zero
+/// here while INTF1's frame counter advances means the DPU is clocking
+/// timing into a host that sends nothing.
 ///
 /// diag5 = DSI0 CTRL << 32 | DSI0 STATUS0
 ///   CTRL confirms the command->video mode switch actually stuck
@@ -4706,35 +4444,24 @@ export fn sheng_mdss_dpu_start(
 ///   bits that cracked the AXI clock bug. DSI1's STATUS0 checks the
 ///   slave half of the bonded link is in the same state as the master.
 
-/// PHYSICAL LANE STATE (SPEC.md task #5 log).
+/// Physical lane state -- the closest thing to a scope available in
+/// software.
 ///
-/// The closest thing to a scope that exists in software here, and never
-/// read in this project. dsi.xml's LANE_STATUS (logical 0x0a4):
+///   DLN0-3_STOPSTATE        bits 0-3   } parked in LP-11, idle
+///   CLKLN_STOPSTATE         bit  4     }
+///   DLN0-3_ULPS_ACTIVE_NOT  bits 8-11  } NOT in ultra-low-power state
+///   CLKLN_ULPS_ACTIVE_NOT   bit  12    }
 ///
-///   DLN0-3_STOPSTATE   bits 0-3   } lane is parked in LP-11 (idle)
-///   CLKLN_STOPSTATE    bit  4     }
-///   DLN0-3_ULPS_ACTIVE_NOT bits 8-11  } NOT in ultra-low-power state
-///   CLKLN_ULPS_ACTIVE_NOT  bit  12    }
+/// Live reference: DSI0 0x00001F00 (all STOPSTATE clear, lanes driven),
+/// DSI1 0x00001F1F (parked at the sampling instant, normal on a burst
+/// link between bursts).
 ///
-/// Read off this device while Linux drove the panel:
-///   DSI0 = 0x00001F00  -- ULPS_ACTIVE_NOT all set, ALL STOPSTATE CLEAR,
-///                         i.e. the lanes are genuinely being driven.
-///   DSI1 = 0x00001F1F  -- same, but parked at the sampling instant
-///                         (expected on a burst-mode link between bursts).
+/// STOPSTATE stuck set on both links while streaming means the lanes
+/// never leave LP-11 and nothing is physically transmitted -- which
+/// covers commands and BTA too, with every register still correct.
 ///
-/// This is the discriminator we have been missing between the only two
-/// remaining explanations:
-///
-///   STOPSTATE bits CLEAR (like live DSI0) while we stream
-///     -> the PHY really is driving the lanes. Everything on the SoC side
-///        is doing its job and the fault is at or inside the panel.
-///   STOPSTATE bits STUCK SET on both links
-///     -> the lanes never leave LP-11. Nothing is physically transmitted,
-///        which explains the panel ignoring commands on LP and HS alike
-///        and never answering a BTA, with every register still correct.
-///
-/// Sampled while the DPU has been streaming, so a link that is genuinely
-/// transmitting cannot read as permanently parked.
+/// Must be sampled with the DPU streaming, or a healthy link reads as
+/// parked.
 ///
 /// Returns DSI0 LANE_STATUS << 32 | DSI1 LANE_STATUS.
 const DSI_LANE_STATUS: usize = 0x0a4;
@@ -6108,39 +5835,29 @@ export fn sheng_mdss_phy_lanepll_sweep(phy_base: usize) callconv(.c) i64 {
     return (@as(i64, first) << 32) | @as(i64, count);
 }
 
-/// FULL SLAVE-PHY (DSI1) CMN SWEEP (SPEC.md task #5 log).
+/// Full CMN sweep of the SLAVE PHY (DSI1).
 ///
-/// THE LARGEST UNVERIFIED SURFACE IN THE WHOLE DRIVER. Both existing
-/// sweeps -- cmn_sweep_table (124 regs) and lanepll_sweep_table (412) --
-/// are only ever run against SM8550_MDSS_DSI0_PHY_BASE. PHY1 has never
-/// been swept even once. Its only coverage was phy_audit_table, which is
-/// 31 entries AND deliberately skips 0x010, 0x03c, 0x140 and everything
-/// >= 0x500 on the slave as "don't care".
+/// The other two sweeps only ever run against DSI0, and the slave's only
+/// other coverage skips 0x010, 0x03c, 0x140 and everything >= 0x500 as
+/// "don't care". That model is wrong: Linux never WRITES those slave
+/// registers, but they hold values inherited from ABL that the slave
+/// link still runs on. PHY1 CMN_CLK_CFG0 reads 0x000000F1 on a rendering
+/// Linux and appears nowhere in its PHY write trace -- ABL put it there
+/// and Linux leaves it alone.
 ///
-/// "Don't care" is the wrong model. Linux never WRITES those slave
-/// registers, but they are not therefore irrelevant -- they hold values
-/// inherited from ABL that the slave link still runs on. Confirmed live
-/// on a rendering Linux: PHY1 CMN_CLK_CFG0 (0x010) reads 0x000000F1 and
-/// appears nowhere in the kernel's own PHY write trace. Nothing in Linux
-/// put it there; ABL did, and Linux simply does not disturb it.
+/// This driver does not leave it alone: it pulses a PHY reset, which
+/// "silently changes its PLL registers to reset status". Linux repairs
+/// that with msm_dsi_phy_pll_restore_state(), but only when
+/// `phy->usecase != MSM_DSI_PHY_SLAVE` -- so on the slave nothing
+/// restores it.
 ///
-/// This driver DOES disturb it: it pulses a DSI PHY reset. dsi_phy.c's own
-/// comment says "Resetting DSI PHY silently changes its PLL registers to
-/// reset status", and Linux compensates with
-/// msm_dsi_phy_pll_restore_state() -- which it runs only when
-/// `phy->usecase != MSM_DSI_PHY_SLAVE`. So on the slave, nobody restores
-/// anything, and whatever our reset destroyed stays destroyed.
+/// On a bonded panel a broken slave is a whole-link failure, not half an
+/// image: the DDIC needs synchronised SOT on both links and rejects
+/// every transaction, commands included, while the master host reports
+/// flawless transmission because its own side is fine.
 ///
-/// On a bonded panel that is a whole-link failure, not a half-image: the
-/// DDIC needs synchronised SOT on both links, so a broken slave makes it
-/// reject EVERY transaction -- including commands. That matches every
-/// symptom we have: black screen, no BTA response on either trigger
-/// pattern, and a host that reports flawless transmission because its own
-/// side really is fine.
-///
-/// Expectations captured register-by-register from THIS device via devmem
-/// while Linux was rendering, at explicit offsets only (never a blind
-/// range read -- those wedge this hardware's bus).
+/// Expectations captured from this device at explicit offsets only.
+/// Never sweep a blind range -- that wedges the bus.
 ///
 /// Same encoding as the other sweeps: (first mismatching offset << 32) |
 /// count. A count of 0 clears the slave PHY and closes the last large
@@ -6465,155 +6182,66 @@ export fn sheng_mdss_phy1_lane_sweep(phy_base: usize) callconv(.c) i64 {
 
 /// Raw readout of the PHY status region on BOTH PHYs.
 ///
-/// phy1_cmn_sweep came back with exactly one mismatch, at CMN offset
-/// 0x144 -- a register that does not exist in the kernel's own register
-/// XML (which defines 0x140 PHY_STATUS, 0x148 LANE_STATUS0, 0x14c
-/// LANE_STATUS1, and nothing at 0x144). It reads 0x58 on BOTH PHYs under
-/// a rendering Linux, and PHY0 reads 0x58 under U-Boot too -- only our
-/// SLAVE differs. An undocumented register wedged between status
-/// registers is almost certainly itself status, so this is a symptom of
-/// the slave PHY sitting in a different internal state, not a config
-/// value we forgot to write.
+/// CMN 0x144 is undocumented -- the register XML defines 0x140
+/// PHY_STATUS, 0x148 LANE_STATUS0, 0x14c LANE_STATUS1 and nothing at
+/// 0x144 -- but it behaves as status, not configuration:
 ///
-/// The sweep only reports "first mismatching offset + count", never the
-/// value, so the actual number has never been seen. Report the whole
-/// status region raw, both PHYs, so it can be read directly:
-///   63:48 PHY0 0x140   47:32 PHY0 0x144
-///   31:16 PHY1 0x140   15:0  PHY1 0x144
-/// Expected from live Linux: PHY0 0x140=0x1F, PHY1 0x140=0x19, both
-/// 0x144=0x58. A PHY1 0x144 of 0x00 would suggest the slave block is not
-/// fully powered/ready; anything else narrows what state it is stuck in.
-/// BRING-UP BISECT ON THE ONE DIVERGENT PHY BIT (SPEC.md task #5 log).
+///   0x00  PHY off, both PHYs read this with the display blanked
+///   0x58  PHY up and streaming
 ///
-/// After sweeping both PHYs completely (PHY0 CMN 124 + lane/PLL 412, PHY1
-/// CMN 124 + lane 160) exactly ONE register disagrees with a rendering
-/// Linux: CMN 0x144, which reads 0x59 under U-Boot and 0x58 under Linux.
-/// That register is not in the kernel's register XML at all -- the CMN
-/// domain defines 0x140 PHY_STATUS, 0x148 LANE_STATUS0, 0x14c
-/// LANE_STATUS1, and nothing at 0x144.
+/// Sampled at eight ordered points through bring-up, one raw byte per
+/// slot, so the first slot that diverges names the step responsible.
+/// Slot 0 is the low byte, read right after the GDSC comes up and before
+/// this driver touches the PHY, which also says whether ABL hands it
+/// over already in that state.
 ///
-/// Two live experiments on the device established what it means:
-///   * Blanking the display (fb0/blank) drops 0x144 to 0x00 on both PHYs,
-///     alongside PHY_STATUS going 0x1F/0x19 -> 0x00. Unblanking restores
-///     0x58. So 0x58 is the "PHY up and streaming" value and 0x00 is
-///     "PHY off" -- our 0x59 is the healthy value PLUS one extra bit, not
-///     a not-ready state.
-///   * Sampling it 300 times in a row on a rendering Linux returned
-///     0x58 every single time. Bit 0 never sets there, so our persistent
-///     0x59 is a stable divergence, not a transient sampled at the wrong
-///     moment.
-///
-/// Rather than reverse-engineer an undocumented bit from the outside, use
-/// it as the instrument it already is. Sample 0x144 at eight ordered
-/// points through our own bring-up and pack the raw byte from each into
-/// one value; the first slot where it turns 0x59 is the step that causes
-/// the divergence. Slot 0 is read immediately after the GDSC comes up,
-/// before this driver has touched the PHY at all, so it also answers a
-/// question we have never asked: whether ABL hands the PHY over already
-/// in this state, or whether we put it there.
-///
-/// Slot 0 is the LOW byte. Reading PHY registers needs the GDSC and AHB
-/// clock up, which is why no slot is placed earlier than that.
+/// No slot can sit earlier: reading PHY registers needs the GDSC and the
+/// AHB clock up.
 var g_phy144_marks: [8]u8 = .{0} ** 8;
 
-/// DID THE HOST ACTUALLY SHIFT BYTES OUT? (SPEC.md task #5 log)
+/// Did the host actually shift bytes onto the wire?
 ///
-/// Everything comparable now matches or is proven benign: both PHYs
-/// completely (PHY0 CMN 124 + lane/PLL 412, PHY1 CMN 124 + lane 160), the
-/// DSI host 176/176, DPU/DISPCC/VBIF/MDSS by write-trace diff, clocks
-/// (INTF runs 146fps against a 144Hz panel), both power rails exonerated
-/// by break-Linux probes, and the last outlier -- CMN 0x144 bit 0 -- shown
-/// harmless when a rendering Linux was caught answering a DCS read at
-/// 0x59, the same value we have.
+/// "DMA completed, no error" cannot tell two failures apart:
 ///
-/// And yet our transmit provably does not reach the DDIC. That leaves two
-/// fundamentally different failure shapes, which every diagnostic so far
-/// is blind to because both end with "DMA completed, no error":
+///   A. the DMA never delivered the right bytes to the host -- address,
+///      translation or cache
+///   B. the host framed them correctly but the PHY never drove the pads
 ///
-///   A. The DMA never delivered the right bytes to the host (address,
-///      translation or cache problem). The command FIFO would then have
-///      been fed garbage or nothing.
-///   B. The host received the bytes and framed them correctly, but the
-///      PHY never drove them onto the pads.
+/// FIFO_STATUS and LANE_STATUS separate them: they report fill/empty per
+/// lane and whether the lanes ever left stop state, rather than whether
+/// a busy bit cleared.
 ///
-/// FIFO_STATUS distinguishes them. It reports the command/video FIFO
-/// fill and empty flags per lane, so it shows whether bytes actually
-/// moved through the transmit path rather than merely whether the DMA
-/// engine's busy bit cleared. This register already earned its keep once
-/// on this project: it read 0xdddd1211 -- all four lanes simultaneously
-/// overflowing AND underflowing -- which is what exposed the pixel-clock
-/// divider bug. It has not been looked at since that was fixed.
+/// MUST be sampled with the DPU streaming. Half the bits in both
+/// registers describe whether traffic is flowing, so reading an idle
+/// link and comparing against a mid-stream Linux compares nothing.
+/// Report both at full width -- the ULPS bits live in the high half of
+/// LANE_STATUS.
 ///
-/// Sampled immediately after the DCS read attempt, so it describes the
-/// transmit path at the exact moment we know the panel did not answer.
-///   63:32  FIFO_STATUS
-///   31:16  STATUS0 low half
-///   15:8   DLN0_PHY_ERR low byte (lane-level PHY errors)
-///   7:0    LANE_STATUS low byte (stopstate/HS per lane -- if the lanes
-///          never leave stop state, the PHY never transmitted and this is
-///          case B)
-/// CORRECTED (SPEC.md task #5 log). The first version of this sampled
-/// before sheng_mdss_dpu_start(), i.e. with the link IDLE, and was then
-/// compared against a live Linux that was mid-stream. That comparison is
-/// meaningless: half the bits in both registers describe whether traffic
-/// is currently flowing.
+///   63:32  FIFO_STATUS   Linux, streaming: 0x00001210
+///   31:0   LANE_STATUS   Linux, streaming: 0x00001F00
+///          bits 0-4 per-lane STOPSTATE, bits 8-12 ULPS_ACTIVE_NOT
 ///
-/// Measured that way it "found" two differences that were pure artefacts
-/// of the sampling point -- FIFO_STATUS 0x11111210 vs Linux 0x00001210,
-/// and LANE_STATUS low byte 0x1F (all five lanes in STOPSTATE, correct
-/// for an idle link) vs Linux 0x00 with 0x1F00 set (all five lanes out of
-/// ULPS and actively transmitting). DLN0_PHY_ERR read 0x88 on BOTH sides,
-/// so the apparent "lane 0 PHY error" was nothing -- Linux reads
-/// 0x00088888 there too, making it a config/timer register rather than an
-/// error latch.
+/// STOPSTATE still set while the DPU streams means the lanes are not
+/// transmitting despite a running timing engine: case B.
+/// Sample LANE_STATUS repeatedly and report the distribution.
 ///
-/// Sample after the DPU is started and has been streaming, which is the
-/// same state Linux is in when read via devmem, and report both registers
-/// at FULL width rather than truncating -- the ULPS bits live in the high
-/// half of LANE_STATUS and were being thrown away.
+/// A single sample is worthless here. This panel is
+/// MIPI_DSI_MODE_VIDEO_BURST with MIPI_DSI_CLOCK_NON_CONTINUOUS, so the
+/// data lanes legitimately drop to LP between bursts: a rendering Linux
+/// sampled 200 times reads 0x00001F00 (transmitting) 191 times but
+/// 0x00001F0F (data lanes stopped) 3 times. A one-shot read that catches
+/// the 1.5% case looks exactly like a dead link.
 ///
-///   63:32  FIFO_STATUS   -- Linux, streaming: 0x00001210
-///   31:0   LANE_STATUS   -- Linux, streaming: 0x00001F00
-///          (bits 0-4 = per-lane STOPSTATE, bits 8-12 = ULPS_ACTIVE_NOT)
-///
-/// If ours still shows STOPSTATE set while the DPU is streaming 146fps
-/// into it, the lanes are not transmitting despite a running timing
-/// engine -- which is exactly the "case B" signature: host framed the
-/// bytes, PHY never drove the pads.
-/// LANE ACTIVITY DISTRIBUTION -- a single sample of LANE_STATUS is
-/// worthless, measured (SPEC.md task #5 log).
-///
-/// b62 sampled LANE_STATUS once with the DPU streaming and got
-/// 0x00001F0F on both hosts: all four DATA lanes in STOPSTATE with the
-/// CLOCK lane running. That looked like the whole answer -- host frames
-/// bytes, data lanes never drive, panel hears nothing.
-///
-/// It is not, and the check that saved it was sampling a RENDERING Linux
-/// 200 times at the same register:
-///     191x 0x00001F00   data lanes transmitting
-///       6x 0x00001F1F   everything in stop state
-///       3x 0x00001F0F   data lanes in stop state, clock running
-/// Our exact "smoking gun" value occurs 1.5% of the time on a working
-/// link. This panel is MIPI_DSI_MODE_VIDEO_BURST with
-/// MIPI_DSI_CLOCK_NON_CONTINUOUS, so data lanes legitimately drop to LP
-/// between bursts and a one-shot read mostly measures luck.
-///
-/// The DISTRIBUTION is the real discriminator: Linux drives the data
-/// lanes in ~95% of samples. So sample repeatedly here and report counts.
-///
-/// Spacing matters as much as count. 256 back-to-back MMIO reads span
-/// well under one 6.9ms frame period and could all land inside a single
-/// blanking interval, reproducing the same artefact with more samples.
-/// 100us between samples spreads 256 reads over ~25ms, roughly 3.7 frames
-/// at 144Hz, so every phase of the frame is covered.
+/// Spacing matters as much as count. 256 back-to-back reads span well
+/// under one 6.9ms frame and can all land inside one blanking interval.
+/// 100us apart spreads them over ~25ms, about 3.7 frames at 144Hz.
 ///
 ///   63:32  samples (of 256) with all four data lanes OUT of stopstate
 ///   31:0   samples (of 256) with the clock lane OUT of stopstate
 ///
-/// Linux reference: ~244/256 data-active. A result of 0 means the data
-/// lanes NEVER transmit and the failure is localised to the lanes. A
-/// result near 244 means they do transmit and the fault is in WHAT is on
-/// the wire, not whether anything is.
+/// Linux reference is ~244/256 data-active. Zero means the data lanes
+/// never transmit; near 244 means they do, and the fault is in WHAT is
+/// on the wire.
 export fn sheng_mdss_dsi_lane_activity(dsi_base: usize) callconv(.c) i64 {
     var data_active: u32 = 0;
     var clk_active: u32 = 0;
