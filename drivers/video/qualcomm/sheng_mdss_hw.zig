@@ -1309,28 +1309,19 @@ fn dsiPhyLaneSettings(phy_base: usize) void {
     }
 }
 
-/// Bring up the DSI PHY (voltage swing, PLL lock) for the given DSI
-/// instance. `dsi_phy_base` is qcom,sm8550-dsi-phy-4nm reg base.
-/// `is_master` selects DSI0 (true, drives its own internal PLL) vs
-/// DSI1 (false, sources its bit clock from DSI0's PLL over the
-/// qcom,sync-dual-dsi link) -- see dsi_7nm_set_usecase() /
-/// MSM_DSI_PHY_MASTER/SLAVE. Our panel is dual-DSI split-link, so
-/// this must be called for both DSI0 (is_master=true) and DSI1
-/// (is_master=false).
-/// REAL GAP FOUND (SPEC.md task #5 log): dsi_mgr_phy_enable() in the
-/// real driver (dsi_manager.c) calls msm_dsi_host_reset_phy() on BOTH
-/// hosts before either PHY is enabled, for bonded/dual-DSI setups
-/// specifically -- its own comment: "some registers in PHY1 have been
-/// programmed during PLL0 clock's set_rate. The PHY1 reset called by
-/// host1 here will silently reset those PHY1 registers. Therefore we
-/// need to reset and enable both PHYs before any PLL clock
-/// operation." msm_dsi_host_reset_phy() itself is trivial: pulse
-/// DSI_PHY_RESET (offset 0x128, in the DSI HOST's own register block,
-/// not the PHY's -- confirmed via dsi.xml, distinct from DSI_RESET at
-/// 0x114 which resets the host's own logic) high for ~1ms then low.
-/// This driver never wrote this register at all, on either host, ever
-/// -- a genuine, sourced, dual-DSI-specific gap. Must run before
-/// sheng_mdss_dsi_phy_init() is called for either PHY.
+/// Pulse DSI_PHY_RESET on BOTH hosts before either PHY is enabled.
+///
+/// dsi_mgr_phy_enable() does this for bonded setups specifically: "some
+/// registers in PHY1 have been programmed during PLL0 clock's set_rate.
+/// The PHY1 reset called by host1 here will silently reset those PHY1
+/// registers. Therefore we need to reset and enable both PHYs before
+/// any PLL clock operation."
+///
+/// DSI_PHY_RESET (0x128) lives in the DSI HOST's register block and
+/// resets the connected PHY -- distinct from DSI_RESET (0x114), which
+/// resets the host's own logic.
+///
+/// Must run before sheng_mdss_dsi_phy_init() for either PHY.
 export fn sheng_mdss_dsi_reset_both_phys(dsi0_base: usize, dsi1_base: usize) callconv(.c) void {
     mmioWrite32(dsi0_base, DSI_PHY_RESET, 1);
     mmioWrite32(dsi1_base, DSI_PHY_RESET, 1);
@@ -1370,6 +1361,12 @@ fn dsiPhyPllRecommit() void {
         mmioWrite32(g_phy1_base + PLL_BASE_OFFSET, PLL_PERF_OPTIMIZE, 0x22);
 }
 
+/// Bring one DSI PHY up: voltage swing, D-PHY timings, lane settings,
+/// and on the master the PLL rate configuration.
+///
+/// is_master selects DSI0, which drives its own PLL. DSI1 is the slave
+/// and takes its bit clock from DSI0 over the sync-dual-dsi link. Call
+/// this for both, then sheng_mdss_dsi_phy_start_dual() once.
 export fn sheng_mdss_dsi_phy_init(dsi_phy_base: usize, is_master: bool) callconv(.c) c_int {
     if (is_master) g_phy0_base = dsi_phy_base else g_phy1_base = dsi_phy_base;
     // Request REFGEN READY (DSI_PHY_7NM_QUIRK_V5_2 path).
@@ -1533,18 +1530,6 @@ const DSI_VID_CFG1: usize = 0x01c;
 ///   PKT_PER_LINE(7:6)  = 0
 ///   EOL_BYTE_NUM(5:4)  = 0
 ///   EN(0)              = 1
-/// The host's built-in test pattern generator: video is generated
-/// internally and driven down the lanes with the entire DPU bypassed --
-/// no framebuffer, SMMU, SSPP, mixer, DSC encoder or INTF.
-///
-/// Splits "does anything reach the panel" cleanly. Any visible change
-/// means the link is good and the fault is upstream in the DPU path;
-/// pure black means nothing transmitted reaches the display.
-///
-/// With the panel in DSC mode the TPG's uncompressed RGB will not
-/// decode cleanly -- noise or garbage IS the positive result. Only pure
-/// black is negative.
-const DSI_TEST_PATTERN_GEN_VIDEO_INIT_VAL: usize = 0x160;
 /// CHECKERED_RECTANGLE_PATTERN (bit8)
 /// BPP = VIDEO_CONFIG_24BPP (1) | RGB (bit2)
 /// VIDEO_PATTERN_SEL = VID_MDSS_GENERAL_PATTERN (3) at bits[5:4], EN bit0
@@ -2659,31 +2644,6 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
     return 0;
 }
 
-/// DPU-bypass proof-of-concept (SPEC.md task #5): pushes a small solid-
-/// color RGB888 patch directly to the panel over the already-proven
-/// command-mode DSI DMA engine, entirely without touching the DPU
-/// (0xae01000+, where every write has hung this session). Caller must
-/// have called sheng_mdss_dsi_panel_init(..., enable_dsc=false) first --
-/// DSC must stay off, or the panel will try to DSC-decode this raw data.
-/// Sets a 16x16 pixel column/page address window (MIPI DCS 0x2A/0x2B),
-/// then a write_memory_start (0x2C) DCS long write with 16*16=256 solid
-/// red RGB888 pixels (768 bytes) as its payload. The write_memory_start
-/// packet is built directly in the DMA scratch buffer rather than going
-/// through dsiSendDcs() (whose internal buffer is only 16 bytes, far
-/// too small here) -- same MSM command-packet framing
-/// buildMsmCmdPacket() uses for its own long-write path:
-/// [len_lo,len_hi,0x39,0x80|0x40][cmd byte][payload...], padded to a
-/// 4-byte boundary with 0xff.
-// Bumped from 16x16 (easy to miss entirely) to 300x300 -- still
-// comfortably under the ~1MB gap between SHENG_MDSS_DSI_DMA_SCRATCH
-// and SHENG_MDSS_FB_ADDR (270005 bytes total packet size), but large
-// enough to be unmistakable on a 3048x2032 panel. The end-coordinate
-// bytes below were also fixed: the old single-byte encoding
-// (TEST_PATCH_W - 1 truncated to u8) only worked by accident for
-// sizes <= 256; a real 4-byte MIPI DCS column/page address set needs
-// the full 16-bit end value split into hi/lo bytes.
-const TEST_PATCH_W: usize = 200;
-const TEST_PATCH_H: usize = 200;
 
 
 // ---------------------------------------------------------------------
@@ -3483,36 +3443,15 @@ fn smmuBypassMdssStream() void {
     mmioWrite32(cbx_base, 0x38, SMMU_MAIR0_NORMAL_WB); // S1_MAIR0: index0 = Normal WB RW-Alloc
     mmioWrite32(cbx_base, 0x3c, 0); // S1_MAIR1
     mmioWrite32(cbx_base, 0x30, SMMU_TCR_LIVE_LINUX_VALUE); // TCR -- copied from Linux's own live CB
-    // b105: THE CODE AND ITS OWN COMMENT DISAGREE.
-    //
-    // The block comment above smmuBypassMdssStream() describes the chosen
-    // workaround as "a context bank whose stage-1 MMU is left DISABLED
-    // (SCTLR.M unset, TCR/TTBR/MAIR all zero) -- physical addresses still
-    // pass straight through untranslated, but the word BYPASS never
-    // appears in the S2CR write the hypervisor is watching for."
-    //
-    // The code does the opposite: it programs real TTBR0/TCR/MAIR and sets
-    // SCTLR.M, so every DSI command DMA is TRANSLATED through page tables
-    // this driver builds by hand. Copying Linux's SCTLR "exactly" is the
-    // wrong target -- Linux translates because it hands the engine an IOVA
-    // (0x1000, seen live); we hand it a physical address (0xa3100000) and
-    // then rely on a hand-built identity map to undo that.
-    //
-    // Everything else is now excluded: the 94-command table is proven
-    // correct (replayed from Linux it drives the panel 0x08 -> 0x9c), the
-    // rails genuinely power-cycle, the reset pulse physically asserts, the
-    // lane state at command time matches a Linux that transmits fine, and
-    // every register block is byte-identical. The one thing never verified
-    // is that the DSI engine's DMA fetch actually returns the bytes we put
-    // in DRAM -- the CPU readback proves only what the CPU sees.
-    //
-    // So do what the comment says: leave stage-1 disabled. Transactions
-    // pass through untranslated, physical addresses are used as-is, and the
-    // entire page-table question disappears. S2CR still reads TYPE_TRANS,
-    // so the hypervisor never sees a BYPASS write.
     // Stage-1 passthrough: clear SCTLR.M so the context bank does no
-    // translation at all. S2CR still reads TYPE_TRANS, so the hypervisor
-    // never sees a BYPASS write.
+    // translation at all. Physical addresses pass through as-is and the
+    // page tables above go unused. S2CR still reads TYPE_TRANS, so the
+    // hypervisor never sees a BYPASS write.
+    //
+    // Do NOT "match Linux" by setting SCTLR.M. Linux translates because
+    // it hands the engine an IOVA (0x1000); this driver hands it a
+    // physical address, so enabling translation only means a hand-built
+    // identity map has to undo it.
     const sctlr: u32 = SMMU_SCTLR_LIVE_LINUX_VALUE & ~@as(u32, 1);
     mmioWrite32(cbx_base, 0x0, sctlr);
     g_smmu_sctlr = sctlr;
@@ -3989,38 +3928,6 @@ export fn sheng_mdss_dpu_start(
     return 0;
 }
 
-/// Read the datapath back after it has been running, rather than
-/// inspecting write-side code that looks right.
-///
-/// diag1 = CTL_FLUSH  << 32 | CTL_START
-///   CTL_FLUSH bits are cleared BY HARDWARE as each block's config is
-///   latched. Non-zero here, hundreds of frames after CTL_START, means
-///   the commit never completed and none of the SSPP/LM/DSC config
-///   below ever took effect -- INTF would then happily stream timing
-///   with nothing behind it, which is exactly the symptom.
-/// diag2 = SSPP_SRC0_ADDR << 32 | SSPP_SRC_FORMAT
-///   Confirms the fetch address and pixel format survived the commit
-///   (0 => the block was reset/never latched).
-/// diag3 = LM0 OUT_SIZE << 32 | LM0 blend-stage0 OP
-///   The mixer's own view: output size and whether stage 0 is actually
-///   blending the pipe in rather than emitting border colour (black).
-/// DSI-side readback while the DPU is streaming.
-///
-/// STATUS0's VIDEO_MODE_ENGINE_BUSY (bit 3) carries most of the
-/// information: a host genuinely transmitting keeps it asserted. Zero
-/// here while INTF1's frame counter advances means the DPU is clocking
-/// timing into a host that sends nothing.
-///
-/// diag5 = DSI0 CTRL << 32 | DSI0 STATUS0
-///   CTRL confirms the command->video mode switch actually stuck
-///   (VID_MODE_EN bit1 set, CMD_MODE_EN bit2 clear).
-/// diag6 = DSI0 FIFO_STATUS << 32 | DSI1 STATUS0
-///   FIFO_STATUS shows video-path underflow (VIDEO_MDP_FIFO_UNDERFLOW
-///   bit3 / OVERFLOW bit0) -- i.e. the DSI host starving or drowning
-///   on pixel data from the DPU, distinct from the command-DMA FIFO
-///   bits that cracked the AXI clock bug. DSI1's STATUS0 checks the
-///   slave half of the bonded link is in the same state as the master.
-
 /// Physical lane state -- the closest thing to a scope available in
 /// software.
 ///
@@ -4034,13 +3941,8 @@ export fn sheng_mdss_dpu_start(
 /// link between bursts).
 ///
 /// STOPSTATE stuck set on both links while streaming means the lanes
-/// never leave LP-11 and nothing is physically transmitted -- which
-/// covers commands and BTA too, with every register still correct.
-///
-/// Must be sampled with the DPU streaming, or a healthy link reads as
-/// parked.
-///
-/// Returns DSI0 LANE_STATUS << 32 | DSI1 LANE_STATUS.
+/// never leave LP-11 and nothing is physically transmitted. Must be
+/// sampled with the DPU streaming, or a healthy link reads as parked.
 const DSI_LANE_STATUS: usize = 0x0a4;
 
 export fn sheng_mdss_lane_status(dsi0_base: usize, dsi1_base: usize) callconv(.c) i64 {
@@ -4059,6 +3961,13 @@ export fn sheng_mdss_phy_err_both(dsi0_base: usize, dsi1_base: usize) callconv(.
         @as(i64, mmioRead32(dsi1_base, DSI_DLN0_PHY_ERR));
 }
 
+/// DSI0 CTRL << 32 | DSI0 STATUS0.
+///
+/// CTRL confirms the command-to-video mode switch stuck: VID_MODE_EN
+/// set, CMD_MODE_EN clear. STATUS0's VIDEO_MODE_ENGINE_BUSY (bit 3)
+/// stays asserted on a host that is genuinely transmitting -- zero
+/// while INTF1's frame counter advances means the DPU is clocking
+/// timing into a host that sends nothing.
 export fn sheng_mdss_dsi_video_readback1(dsi0_base: usize) callconv(.c) i64 {
     return (@as(i64, mmioRead32(dsi0_base, DSI_CTRL)) << 32) |
         @as(i64, mmioRead32(dsi0_base, DSI_STATUS0));
@@ -4099,6 +4008,12 @@ export fn sheng_mdss_dsc_status2(dpu_base: usize) callconv(.c) i64 {
     return (@as(i64, mmioRead32(enc0, 0x0c)) << 32) | @as(i64, mmioRead32(enc0, 0x10));
 }
 
+/// CTL_FLUSH << 32 | CTL_START.
+///
+/// Hardware clears CTL_FLUSH bits as each block's config latches.
+/// Nonzero here, hundreds of frames after CTL_START, means the commit
+/// never completed and none of the SSPP/LM/DSC config took effect --
+/// INTF then streams timing with nothing behind it.
 export fn sheng_mdss_dpu_readback1(dpu_base: usize) callconv(.c) i64 {
     const ctl_base = dpu_base + 0x15000;
     return (@as(i64, mmioRead32(ctl_base, CTL_FLUSH)) << 32) |

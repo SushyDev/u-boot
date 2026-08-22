@@ -9,6 +9,8 @@
  */
 
 #include <env.h>
+#include <lmb.h>
+#include <log.h>
 #include <vsprintf.h>
 #include <asm/global_data.h>
 #include <asm/io.h>
@@ -29,6 +31,10 @@ DECLARE_GLOBAL_DATA_PTR;
 #define SHENG_MDSS_STATUS_ADDR		(CONFIG_PRE_CON_BUF_ADDR + 0x3000)
 #define SHENG_MDSS_LOG_ADDR		(CONFIG_PRE_CON_BUF_ADDR + 0x3100)
 #define SHENG_MDSS_LOG_MAX		64
+
+/* Must match BB_BASE / BB_HDR + BB_CAP in sheng_mdss_hw.zig. */
+#define SHENG_BB_BASE			0xa5000000
+#define SHENG_BB_SIZE			(16 + 512 * 1024)
 
 /* D-cache is on. A breadcrumb left dirty in a cache line never reaches
  * DRAM if the next instruction hangs the CPU -- which is the case this
@@ -98,6 +104,16 @@ void sheng_mdss_debug_start(void)
 
 	for (i = 0; i < SHENG_MDSS_STATUS_COUNT; i++)
 		sheng_mdss_debug_stage(i, SHENG_MDSS_STATUS_NOT_REACHED);
+
+	/* Reserve the blackbox for the same reason the driver reserves its
+	 * framebuffer: it is a fixed address that U-Boot's allocator knows
+	 * nothing about, and board_late_init() allocates after this runs. */
+	{
+		phys_addr_t bb = SHENG_BB_BASE;
+
+		if (lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &bb, SHENG_BB_SIZE, LMB_NONE))
+			log_warning("sheng_mdss: blackbox not reserved\n");
+	}
 
 	sheng_bb_init();
 }
