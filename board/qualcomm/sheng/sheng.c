@@ -147,6 +147,10 @@ static u32 sheng_tlmm_io_read(unsigned int gpio)
 static u32 sheng_handover_blregs = 0xffffffff;
 static int sheng_handover_blret;
 
+/* Set in qcom_board_init() from the I2C read above; consumed by
+ * sheng_mdss_probe() to decide inherit vs cold bring-up. */
+int sheng_abl_splash_live;
+
 static int sheng_ktz8866_read_handover(const char *path)
 {
 	struct udevice *bus, *chip;
@@ -184,6 +188,46 @@ void qcom_board_init(void)
 	sheng_handover_rst = sheng_tlmm_io_read(SHENG_PANEL_RESET_GPIO);
 	sheng_handover_blret =
 		sheng_ktz8866_read_handover("/soc@0/geniqup@ac0000/i2c@a84000");
+
+	/* DID ABL HAND OVER A LIVE DISPLAY? Decided HERE, over I2C, and
+	 * never by reading an MDSS register.
+	 *
+	 * The display driver needs this to choose between inheriting ABL's
+	 * running pipeline and doing a cold bring-up. The obvious test --
+	 * ask the DPU or the DSI host whether it is streaming -- is a trap:
+	 * those blocks need clocks that are only running WHEN ABL IS
+	 * STREAMING, so the probe answers correctly in the live case and
+	 * WEDGES THE AHB BUS in the case it exists to detect. That cost
+	 * three fastboot recoveries (b386/b387 on DPU registers, b392 on
+	 * DSI0 CLK_STATUS, which is no safer despite being a DSI register).
+	 *
+	 * The KTZ8866 is on I2C, independent of MDSS, and always readable.
+	 * LCD_BIAS_CFG1 differs measurably between the two handovers:
+	 *
+	 *     0x9f  ABL left the panel live and scanning (splash_region
+	 *           advertised, ABL did not blank)
+	 *     0x98  ABL blanked before handover
+	 *
+	 * ...except it does NOT work: LCD_BIAS_CFG1 reflects whoever last
+	 * programmed the chip, and on a warm reboot that is LINUX's own
+	 * ktz8866 driver, not ABL. Measured 0x9f with the splash live and
+	 * 0x98 without, but only across a single pair of boots; with the
+	 * splash disabled and Linux having run first it still read 0x9f and
+	 * the driver wrongly inherited a dead pipeline (b395: U-Boot black,
+	 * Linux fine). Kept in the diag as information, not used as a test.
+	 *
+	 * ASK OUR OWN DTB INSTEAD. Whether ABL keeps the display alive is
+	 * decided by whether we advertise /reserved-memory/splash_region --
+	 * that is the contract, and we control both sides of it. Reading our
+	 * own device tree is pure memory access: no MDSS, no I2C, nothing
+	 * that can wedge a bus or depend on who booted last.
+	 *
+	 * Failure modes stay survivable. If ABL ever ignores the node we
+	 * inherit a dead pipeline and U-Boot shows a dark panel -- Linux
+	 * still boots, and no fastboot recovery is needed.
+	 */
+	sheng_abl_splash_live =
+		ofnode_valid(ofnode_path("/reserved-memory/splash_region"));
 
 	/* Measured 2026-08-22: WITHOUT /reserved-memory/splash_region, a 3s
 	 * hold here shows an already-black panel with backlight EN and both

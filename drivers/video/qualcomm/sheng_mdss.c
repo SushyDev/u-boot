@@ -182,6 +182,9 @@ static int sheng_panel_init_ret;
  * handover to Linux in board_preboot_os(). */
 int sheng_inherited;
 
+/* Decided in qcom_board_init() over I2C -- see its comment. */
+extern int sheng_abl_splash_live;
+
 static unsigned int sheng_probe_count;
 static int sheng_panel_init_ret_first = 0x7fffffff;
 
@@ -533,23 +536,22 @@ static int sheng_mdss_probe(struct udevice *dev)
 			 * stream mid-frame and wedges the DDIC beyond
 			 * recovery.
 			 *
-			 * NO DPU REGISTER ACCESS HERE, DELIBERATELY.
+			 * NO MDSS REGISTER MAY BE READ TO DECIDE THIS.
 			 *
-			 * An earlier version read INTF FRAME_COUNT and the
-			 * SSPP registers to discover ABL's buffer. That works
-			 * while ABL streams -- DPU registers need the MDP core
-			 * clock, which ABL has running -- but with the splash
-			 * DISABLED, MDP is unclocked and those same reads
-			 * wedge the AHB bus: no backlight, no boot, fastboot
-			 * recovery (b386/b387). Gating them on a clock status
-			 * bit did NOT fix it, so the safe answer is not to
-			 * touch the DPU at all this early.
+			 * Every block that could report "am I streaming?"
+			 * needs clocks that only run WHEN IT IS STREAMING, so
+			 * such a probe answers correctly in the live case and
+			 * WEDGES THE AHB BUS in the case it exists to detect
+			 * -- no backlight, no boot, fastboot recovery. Three
+			 * of them: DPU INTF/SSPP (b386), the same behind a
+			 * clock-status gate (b387), and DSI0 CLK_STATUS
+			 * (b392), which is no safer for being a DSI register.
 			 *
-			 * Liveness instead comes from DSI0 CLK_STATUS, a DSI
-			 * register and therefore safe on the AHB clock alone
-			 * (the same clock the state reads above already rely
-			 * on). Bit 14 is VID_PCLK: set only when the video
-			 * path is genuinely clocked and streaming.
+			 * Liveness comes from sheng_abl_splash_live instead,
+			 * decided in qcom_board_init() from a KTZ8866 register
+			 * over I2C -- independent of MDSS and always readable.
+			 * See its comment there for why 0x9f/0x98, and why the
+			 * test is deliberately conservative.
 			 *
 			 * The buffer geometry is known rather than probed:
 			 *   0xb8000000  = splash_region's base, the address
@@ -560,8 +562,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 			 *                 (ALIGN(3048,32)*4) -- using that
 			 *                 would shear every line.
 			 */
-			if (readl((void __iomem *)(uintptr_t)
-				  (SM8550_MDSS_DSI0_BASE + 0x11c)) & (1 << 14)) {
+			if (sheng_abl_splash_live) {
 				plat->base = SHENG_ABL_FB_ADDR;
 				plat->size = SHENG_ABL_FB_STRIDE * SHENG_PANEL_VACTIVE;
 				uc_priv->xsize = SHENG_PANEL_HACTIVE;
