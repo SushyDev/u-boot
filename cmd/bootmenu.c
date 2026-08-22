@@ -491,7 +491,16 @@ static void menu_display_statusline(struct menu *m)
 	printf(ANSI_CURSOR_POSITION, menu->count + 5, 1);
 	puts(ANSI_CLEAR_LINE);
 	printf(ANSI_CURSOR_POSITION, menu->count + 6, 3);
-	puts("Press UP/DOWN to move, ENTER to select, ESC to quit");
+	/* Named for the keys this board actually has. sheng's only input is
+	 * the three hardware buttons (see gpio-keys in
+	 * sm8550-xiaomi-sheng.dts): volume up/down send KEY_UP/KEY_DOWN and
+	 * power sends KEY_ENTER, so "ENTER" names a key nobody can see.
+	 *
+	 * "ESC to quit" is dropped rather than renamed: there is no fourth
+	 * button and nothing in the input path emits ESC, so quitting the
+	 * menu is genuinely unreachable here. Advertising it just tells the
+	 * user to press something that does not exist. */
+	puts("Press UP/DOWN to move, POWER to select");
 	puts(ANSI_CLEAR_LINE_TO_END);
 	printf(ANSI_CURSOR_POSITION, menu->count + 7, 1);
 	puts(ANSI_CLEAR_LINE);
