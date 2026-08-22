@@ -2752,19 +2752,27 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
         ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x9d, &[_]u8{0x01});
         if (ret != 0) return -20003;
 
-        // REAL BUG FOUND (SPEC.md task #5 log): this was mislabeled
-        // "144Hz framerate control branch" and sent 0xb2=0x91/0xb3=0x40
-        // -- those are actually the real driver's `cur_vrefresh == 120
-        // || cur_vrefresh == 60` branch values, not 144Hz at all. The
-        // real sheng_tianma_init_sequence() has three branches on
-        // cur_vrefresh (120/60 -> 0x91/0x40; 90/50/48/30 -> 0x00/0x80;
-        // else -> 0x00/0x00), and nt36532e_get_current_mode() returns
-        // mode index 0 (the *first* entry in sheng_tianma_modes[], the
-        // 144Hz mode) whenever connector->state->crtc is NULL --
-        // exactly our initial-prepare()/first-boot scenario. 144
-        // matches neither explicit branch, so the real driver falls
-        // through to the ELSE branch: 0xb2=0x00, 0xb3=0x00. We were
-        // sending the wrong branch's values.
+        // 0xb2 = 0x00 / 0xb3 = 0x00. THESE ARE THE 144Hz VALUES AND MUST
+        // NOT BE "CORRECTED" TO THE VENDOR'S.
+        //
+        // These are framerate control. The kernel driver branches on
+        // cur_vrefresh: 120/60 -> 0x91/0x40, 90/50/48/30 -> 0x00/0x80,
+        // else -> 0x00/0x00. nt36532e_get_current_mode() returns the
+        // 144Hz mode when connector->state->crtc is NULL, which is our
+        // first-boot case, and 144 matches neither explicit branch --
+        // hence the else branch, 0x00/0x00.
+        //
+        // Xiaomi's own table shows 0x91/0x40, which looks like a parity
+        // gap and is not: that node is the 120Hz timing
+        // (qcom,mdss-dsi-panel-framerate = 0x78), i.e. exactly the
+        // branch that ships 0x91/0x40.
+        //
+        // TESTED ON HARDWARE 2026-08-22 (b397): sending 0x91/0x40 at
+        // 144Hz gives a BLACK PANEL WITH NO BACKLIGHT. The inference
+        // above is correct and the vendor value is mode-specific.
+        //
+        // See VENDOR-PANEL-REFERENCE.md for the other vendor deltas and
+        // which of them are genuine.
         ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb2, &[_]u8{0x00});
         if (ret != 0) return -20004;
         ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb3, &[_]u8{0x00});

@@ -187,16 +187,11 @@
 		 * reg has no unit address; that warning is correct to ignore, and
 		 * adding one breaks the lookup.
 		 */
-		/* TEMPORARILY OFF: exercising the COLD bring-up path, which
-		 * is skipped entirely when we inherit. Re-enable after the
-		 * parity work.
-		 *
-		 *	splash_region {
-		 *		label = "cont_splash_region";
-		 *		reg = <0x0 0xb8000000 0x0 0x2b00000>;
-		 *		no-map;
-		 *	};
-		 */
+		splash_region {
+			label = "cont_splash_region";
+			reg = <0x0 0xb8000000 0x0 0x2b00000>;
+			no-map;
+		};
 
 		/* NB framebuffer-region@fb800000 above matches nothing in the
 		 * stock DTB and its 402MB size is implausible. Probably wrong,
