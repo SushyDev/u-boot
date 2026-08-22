@@ -2537,12 +2537,11 @@ export fn sheng_mdss_dsi_panel_sleep(dsi0_base: usize, dsi1_base: usize, dma_scr
 ///
 /// Tunable on purpose: if 1ms fixes it, bisect down to find the real
 /// requirement rather than leaving a guess in the boot path.
-/// 0, and the init loop no longer paces either: the vendor's own command
-/// blob for this panel carries an explicit per-command wait field that is
-/// zero throughout (see VENDOR-PANEL-REFERENCE.md). b109 added 1ms here
-/// on the mistaken basis that we transmitted 80x faster than the kernel
-/// -- the 24us in the per-command trace is DMA time, not the
-/// inter-command interval. It changed nothing, as expected in hindsight.
+/// 0: the init loop already paces at INIT_CMD_PACING_US = 2000us, which
+/// matches Linux's measured ~2ms/command. b109 added 1ms on top on the
+/// mistaken basis that we transmitted 80x faster -- the 24us in the
+/// per-command trace is DMA time, not the inter-command interval. It
+/// changed nothing, as expected in hindsight.
 const DSI_INTER_CMD_DELAY_US: u32 = 0;
 
 
@@ -2665,28 +2664,32 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
     const ENABLE_SETTLE_US: c_ulong = 250000;
     udelay(ENABLE_SETTLE_US);
 
-    // NO PACING. The vendor does not pace this table at all.
+    // Pace the init table.
     //
-    // Decoded from Xiaomi's own qcom,mdss-dsi-on-command for this exact
-    // panel (dtbo.img, qcom,mdss_dsi_n81a_36_02_0a_duledsi_dsc_vid --
-    // see VENDOR-PANEL-REFERENCE.md): 95 commands, and the per-command
-    // wait field is ZERO on every one of them except sleep-out, which
-    // waits 120ms. Qualcomm's blob format carries an explicit wait byte
-    // per command, so this is a positive statement, not an absence of
-    // evidence.
+    // The kernel emits these ~2ms apart, but that 2ms is not a
+    // deliberate delay in the panel driver -- it is the cost of its
+    // per-transfer path: mutex, per-transfer link clock
+    // enable/disable, IRQ completion wait. Here a command is a DMA
+    // trigger plus a busy-poll that clears in microseconds.
     //
-    // What was here before: 500us per command with 2ms after each 0xff
-    // page switch, on the theory that the DDIC needs settling time
-    // across a bank change or it silently drops writes. The vendor
-    // sends them back-to-back, so that theory is wrong, and it was
-    // costing ~52ms of a boot whose black gap we are trying to shrink.
+    // What actually needs settling time is the 0xff PAGE SWITCH: it
+    // changes which register bank every following write lands in, and a
+    // DDIC that has not finished switching drops them while every
+    // command still reports success. So keep the full 2ms after a page
+    // switch and pace the other 81 commands, which are plain writes
+    // within an already-selected bank, far tighter.
     //
-    // The kernel's apparent ~2ms spacing is not a deliberate delay
-    // either -- it is the cost of its per-transfer path (mutex,
-    // per-transfer link clock enable/disable, IRQ completion wait).
-    // Here a command is a DMA trigger plus a busy-poll that clears in
-    // microseconds.
-    //
+    // BOOT-TIME KNOB: 87 x 2ms = 174ms becomes ~52ms. If init goes
+    // intermittent, put PAGE_SWITCH_PACING_US's value back into
+    // INIT_CMD_PACING_US to restore the old uniform behaviour.
+    // NO PACING. Xiaomi's own qcom,mdss-dsi-on-command for this panel
+    // has an explicit per-command wait field that is ZERO on all 95
+    // commands except sleep-out (120ms). See VENDOR-PANEL-REFERENCE.md.
+    // Verified on hardware (b382): panel still inits, pm_val=9c.
+    const INIT_CMD_PACING_US: c_ulong = 0;
+    const PAGE_SWITCH_PACING_US: c_ulong = 0;
+    const DCS_PAGE_SELECT: u8 = 0xff;
+
     // Failures encode WHERE, not just what: -(10000 + index) inside the
     // table loop, -(20000 + stage) for the named stages after it. There
     // is no console, so the return value is the only report.
@@ -2694,6 +2697,7 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
     for (nt36532e_init_sequence) |entry| {
         const ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, entry.cmd, entry.args);
         if (ret != 0) return -(10000 + idx);
+        udelay(if (entry.cmd == DCS_PAGE_SELECT) PAGE_SWITCH_PACING_US else INIT_CMD_PACING_US);
         idx += 1;
     }
 

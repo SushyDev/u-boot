@@ -190,17 +190,6 @@
 		 * expected and must not be "fixed" -- the stock DTB does the
 		 * same, and adding one breaks the lookup.
 		 */
-		/* ENABLED for the continuous-splash inherit experiment. ABL
-		 * finds this by path (exact name, NO unit address) and stops
-		 * blanking, handing over a LIVE display. See
-		 * VENDOR-PANEL-REFERENCE.md and the comment below for the
-		 * history of why it was off. */
-		splash_region {
-			label = "cont_splash_region";
-			reg = <0x0 0xb8000000 0x0 0x2b00000>;
-			no-map;
-		};
-
 		/* DISABLED, and the reason is the interesting part.
 		 *
 		 * Enabling this node WORKS -- ABL finds it, stops blanking,
