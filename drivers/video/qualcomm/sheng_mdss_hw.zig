@@ -1577,27 +1577,19 @@ const DSI_IRQ_MASK_CMD_DMA_DONE: u32 = 1 << 1;
 const DSI_IRQ_MASK_ERROR: u32 = 1 << 25;
 const DSI_ERR_INT_MASK0_VALUE: u32 = 0x13ff3fe0;
 
-// STOLEN OUTPUT, NOT RECOMPUTED (SPEC.md task #5 log): rather than port
-// dsi_host.c's dsi_ctrl_enable() field-by-field (several fields turned
-// out to have undocumented bits our generated-header source doesn't
-// cover -- e.g. LANE_SWAP_CTRL/EOT_PACKET_CTRL have real live bits far
-// beyond their one documented field each) or port dsi_phy.c's D-PHY
-// timing-calculation cascade (clk_pre/clk_post -- ~100 lines of
-// interdependent linear_inter() math), these are the EXACT live
-// register values read directly off this same hardware via devmem
-// while Linux's own real, working driver had it configured -- for
-// this exact panel, exact PLL lock, exact everything. Identical on
-// both DSI0 (0xae94000) and DSI1 (0xae96000), as expected for the
-// dual-link panel. Confirmed real DST_FORMAT is RGB666 (1), not
-// RGB888 (3) as originally assumed -- DSC changes the wire packing
-// format regardless of the source pixel depth.
-// RE-STOLEN (SPEC.md task #5 log): every value below was originally
-// captured via devmem at the UNSHIFTED address (base+offset), before
-// the DSI_6G_REG_SHIFT discovery -- meaning every one of them was
-// actually reading whatever register sits one slot before the intended
-// one (SM8550_MDSS_DSI0/1_BASE now bakes in the +4 shift, matching the
-// real driver's ctrl_base). Re-captured live at the CORRECT address
-// (base+4+offset) after the shift fix. Every single value changed.
+// Captured live rather than recomputed. Several of these registers have
+// real bits beyond their one documented field (LANE_SWAP_CTRL and
+// EOT_PACKET_CTRL both do), and the D-PHY timings are ~100 lines of
+// interdependent linear_inter() math. These are what a working Linux
+// had programmed for this exact panel and PLL rate, identical on both
+// hosts.
+//
+// Capture at base+4+offset, not base+offset. Reading at the unshifted
+// address returns the register one slot before the intended one and
+// every value comes out wrong but plausible.
+//
+// DST_FORMAT is RGB666 (1), not RGB888 -- DSC changes the wire packing
+// regardless of source pixel depth.
 const VID_CFG0_VALUE: u32 = 0x02009230;
 const VID_CFG1_VALUE: u32 = 0x00000000; // live on both hosts; Linux writes 0 in dsi_ctrl_enable()
 const LANE_CTRL_VALUE: u32 = 0x01000000;
@@ -2245,22 +2237,11 @@ export fn sheng_mdss_dsi_retry_count() callconv(.c) u32 {
 }
 
 fn dsiCmdDmaTxDualOnce(dsi0_base: usize, dsi1_base: usize, dma_addr: usize, len: usize) c_int {
-    // msm_dsi_host_xfer_prepare(): temporarily OR in CMD_MODE_EN|ENABLE
-    // for the duration of the command, then restore CTRL exactly
-    // (msm_dsi_host_xfer_restore()):
+    // xfer_prepare/restore: OR in CMD_MODE_EN|ENABLE for the duration of
+    // the command, then put CTRL back exactly as it was.
     //
-    //   msm_host->dma_cmd_ctrl_restore = dsi_read(msm_host, REG_DSI_CTRL);
-    //   dsi_write(msm_host, REG_DSI_CTRL,
-    //             msm_host->dma_cmd_ctrl_restore |
-    //             DSI_CTRL_CMD_MODE_EN | DSI_CTRL_ENABLE);
-    //
-    // This driver never needed it while the whole init ran in command
-    // mode. Now that the link switches to VIDEO mode before the DCS
-    // sequence (matching the panel driver's prepare_prev_first
-    // ordering), CMD_MODE_EN is clear and commands cannot be issued
-    // without it -- exactly what the first attempt at the reorder hit:
-    // sheng.verify bit0 (DSI CTRL) mismatched and the DSC encoder went
-    // back to producing nothing.
+    // Required because the link is in VIDEO mode by this point, so
+    // CMD_MODE_EN is clear and commands cannot be issued without it.
     // Per-command PLL re-commit, exactly as link_clk_set_rate() does in
     // msm_dsi_host_xfer_prepare(). See dsiPhyPllRecommit().
     dsiPhyPllRecommit();
@@ -2487,25 +2468,16 @@ fn dsiSendRawLong(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, data_i
 }
 
 
-/// Host bring-up + video-mode switch, split out so it can run BEFORE
-/// the panel is powered and reset (SPEC.md task #5 log).
+/// Host bring-up and the video-mode switch, separated so they can run
+/// BEFORE the panel is powered and reset.
 ///
-/// Measured from the working kernel with a ktime-stamped trace:
+/// The panel must be powered, reset and initialised onto a link that is
+/// ALREADY in video mode -- that is the kernel's order:
 ///
-///   691.3ms  bridge_pre_enable
-///   743.0ms  host_enable_video      <-- video mode ON
-///   743.058ms panel_prepare enter   <-- panel powered 8us later
-///   743.48ms panel_reset enter      <-- panel reset AFTER video mode
-///   778.6ms  init_seq enter
-///   952.6ms  init_seq exit
+///   host_enable_video  ->  panel_prepare  ->  panel_reset  ->  init_seq
 ///
-/// So the panel is powered, reset and initialised onto a link that is
-/// ALREADY in video mode. This driver did all three before the host
-/// ever left command mode. An earlier attempt at this reorder moved
-/// only the video-mode switch and left the reset where it was, which
-/// regressed the DSC encoder -- the ordering was right, the
-/// implementation was not: the reset must follow the switch, not
-/// precede it.
+/// The reset must FOLLOW the switch. Moving the switch here while
+/// leaving the reset ahead of it regresses the DSC encoder.
 export fn sheng_mdss_dsi_host_video_prepare(dsi0_base: usize, dsi1_base: usize) callconv(.c) void {
     dsiHostBringUp(dsi0_base);
     dsiHostBringUp(dsi1_base);
@@ -3016,21 +2988,14 @@ const SPLIT_INTF_2_SW_TRG_MUX: u32 = 1 << 8;
 const MERGE_3D_0_BASE: usize = 0x4e000;
 
 // ===================================================================
-// VBIF -- the DPU's memory-interface block (SPEC.md task #5 log).
+// VBIF -- where the DPU's fetch clients get their memory type and QoS
+// priority. Left unprogrammed, the pipe's reads are neither classified
+// nor prioritised at the bus.
 //
-// A THIRD entire block this driver has never written, found by diffing
-// which blocks dpu_reg_write() touches on the working kernel against
-// ours. VBIF is where the DPU's fetch clients get their memory type and
-// QoS priority; left unprogrammed, the pipe's reads are not classified
-// or prioritised at the bus at all.
-//
-// Base is NOT dpu_base + 0x74000. VBIF is a SEPARATE ioremap --
-// dpu_kms.c does msm_ioremap(pdev, "vbif") and sm8550.dtsi gives
-// mdss_mdp `reg-names = "mdp", "vbif"` -- so the 0x74000 seen in the
-// trace is just where that mapping happened to land in kernel VA.
-// Verified by reading the real address on the device: 0x0aeb0160 and
-// 0x0aeb0164 read 0x33333333, 0x0aeb0550 reads 0x00000030, matching the
-// traced values exactly.
+// The base is NOT dpu_base + 0x74000. VBIF is a separate ioremap
+// (reg-names "mdp", "vbif"), so a 0x74000 seen in a kernel trace is
+// just where that mapping landed in kernel VA. The real address is
+// 0x0aeb0000.
 //
 //   0x160/0x164  VBIF_XIN_MEMTYPE_0/1 -- dpu_hw_set_mem_type(), written
 //                per-xin as a read-modify-write, which is why the trace
@@ -3106,27 +3071,20 @@ const DSC_RC_BUF_THRESH = [14]u32{ 14, 28, 42, 56, 70, 84, 98, 105, 112, 119, 12
 /// (dpu_base+0x80000, shared by both instances); `enc_off`/`ctl_off`
 /// are the per-instance sblk.enc/sblk.ctl sub-offsets.
 fn dscConfigureInstance(dce_base: usize, enc_off: usize, ctl_off: usize, pp_idx: u32) void {
-    // CROSS-VERIFIED AGAINST LIVE HARDWARE (SPEC.md task #5 log): this
-    // whole function's values were transcribed independently of the
-    // panel-side PPS and never checked against each other -- a gap this
-    // file has flagged as the prime suspect for "video streams but
-    // nothing is visible" for a long time. Dumping Linux's own live DSC
-    // encoder registers via devmem while DRM drove this exact panel and
-    // diffing all 25 of them found 21 identical and 5 wrong. Both
-    // encoder instances read back identical, so one set covers both.
-    //
-    // The five corrections are mutually consistent and describe a
-    // single coherent error: this panel uses FOUR 762-px slices across
-    // the full 3048 width, i.e. TWO soft slices per encoder, whereas
-    // this code described one slice per encoder over a 1524-px picture
-    // -- half the width and half the slices. A DSC decoder whose slice
+    // SLICE GEOMETRY MUST MATCH THE PPS. This panel is FOUR 762-px
+    // slices across the full 3048 width -- TWO soft slices per encoder,
+    // not one encoder over a 1524-px picture. A DSC decoder whose slice
     // geometry disagrees with the PPS it was sent emits nothing
-    // decodable, which is precisely the observed symptom (link clean at
-    // 144Hz, FIFOs healthy, panel initialised, screen black).
+    // decodable: link clean at 144Hz, FIFOs healthy, panel initialised,
+    // screen black.
     //
-    // DSC_CMN_MAIN_CNF: shared register, written identically by both
-    // instances -- SPLIT_PANEL with num_active_slice_per_enc in
-    // bits[8:7]. Live = 0x101, i.e. field value 2 (bit8), not 1 (bit7).
+    // The encoder config here and the PPS in nt36532e_pps_144hz are
+    // transcribed separately and nothing cross-checks them. They must be
+    // changed together.
+    //
+    // DSC_CMN_MAIN_CNF is shared, written identically by both
+    // instances: SPLIT_PANEL with num_active_slice_per_enc in bits
+    // [8:7]. 0x101 means field value 2, not 1.
     dpuHwWrite(dce_base, 0, DSC_CMN_MAIN_CNF, (DSC_MODE_SPLIT_PANEL & 1) | (@as(u32, 2) << 7));
 
     // ENC_DF_CTRL: initial_lines(8) | VIDEO_MODE(bit9) | max_addr(bits[18+])
@@ -3864,26 +3822,12 @@ export fn sheng_mdss_dpu_start(
     dsiHostSwitchToVideoMode(dsi1_base);
 
 
-    // TIMING ENGINE MOVED BELOW THE FLUSH (SPEC.md task #5 log).
+    // The timing engines are enabled BELOW, after CTL_FLUSH, not here.
     //
-    // This used to enable both timing engines HERE, before CTL_FLUSH,
-    // justified as "what dpu_encoder_phys_vid_enable() does". Checked
-    // against the actual kernel this device runs (ianchb/sm8550-mainline
-    // @005aa8cc): dpu_encoder_phys_vid_enable() does NOT touch the timing
-    // engine at all. It only programs the timing registers and the
-    // pending-flush bits. The engine is enabled later, in
-    // dpu_encoder_phys_vid_handle_post_kickoff(), whose own comment is
-    // explicit:
-    //
-    //   /*
-    //    * Video mode must flush CTL before enabling timing engine
-    //    * Video encoders need to turn on their interfaces now
-    //    */
-    //
-    // So the kernel order is flush-then-enable and ours was the exact
-    // inverse. This also matches the ktime-stamped trace taken off this
-    // device, where intf_timing_engine enable=1 lands 2.2ms AFTER the
-    // panel init sequence completes, as the last step.
+    // dpu_encoder_phys_vid_enable() only programs the timing registers
+    // and the pending-flush bits; the engine comes up later in
+    // handle_post_kickoff(), whose own comment says "Video mode must
+    // flush CTL before enabling timing engine".
 
 
     // -- CTL flush (v1 path, core_major_ver>=5): per-block flush masks
@@ -4114,23 +4058,14 @@ fn setupIntfTiming(
 }
 
 // ===========================================================================
-// SELF-VERIFICATION AGAINST LIVE-HARDWARE REFERENCE (SPEC.md task #5 log)
+// Whole-pipeline check against live-hardware reference values.
 //
-// Roughly two dozen individually-plausible register values in this driver
-// turned out to be wrong, each found by dumping Linux's own registers via
-// devmem while DRM drove this exact panel and diffing. Rather than keep
-// discovering those one boot at a time, this table holds every reference
-// value captured so far and checks the WHOLE pipeline in one shot, after
-// dpu_start() has run and committed.
+// Every entry was read from working silicon in this same 144Hz DSC
+// bonded-DSI mode. Run after dpu_start() has committed.
 //
-// Every entry is a value read from working silicon in the same 144Hz DSC
-// bonded-DSI mode this driver targets (verified: INTF timing registers
-// match ours bit-for-bit, so Linux was in the identical mode).
-//
-// Returns a bitmask: bit N set == entry N does NOT hold its reference
-// value. 0 means the entire programmed pipeline matches working hardware,
-// which would prove the remaining fault is NOT a register-content problem
-// and redirect the search entirely.
+// Returns a bitmask: bit N set means entry N does not hold its
+// reference value. 0 means the programmed pipeline matches working
+// hardware, so any remaining fault is not register content.
 // ===========================================================================
 
 
@@ -4138,26 +4073,19 @@ fn setupIntfTiming(
 
 
 
-/// REAL GAP FOUND (SPEC.md task #5 log): the MDSS wrapper's UBWC
-/// configuration block. msm_mdss_enable() writes all three of these on
-/// every MDSS bring-up, BEFORE any child DSI/DPU device is touched:
+/// The MDSS wrapper's UBWC block, which sits in the memory data path.
+/// msm_mdss_enable() writes all three on every bring-up, before any
+/// child DSI or DPU device is touched:
 ///
 ///   UBWC_STATIC          (0x144) = 0x0000103E
 ///   UBWC_CTRL_2          (0x150) = 0x00000002
 ///   UBWC_PREDICTION_MODE (0x154) = 0x00000001
 ///
-/// This driver never wrote any of them, and mdssCoreBcrReset() resets
-/// the MDSS core -- so whatever ABL left is destroyed and never
-/// restored, leaving the UBWC decoder block that sits in the MDSS
-/// memory data path at zero.
+/// Must be rewritten here: mdssCoreBcrReset() destroys whatever ABL
+/// left and nothing else restores it, leaving the block at zero.
 ///
-/// Same shape as this session's other two real finds
-/// (GCC_DISP_HF_AXI_CLK ordering, DSC_CLK_CTRL): top-level block state
-/// that appears in no per-block register diff, because it lives above
-/// the DSI/DPU register spaces that have all been audited clean
-/// (sheng.verify = 0, sheng.dsiaudit = 0).
-///
-/// Values are Linux's own live registers on this panel.
+/// Top-level state like this appears in no per-block register diff,
+/// because it lives above the DSI and DPU spaces that get audited.
 const MDSS_UBWC_STATIC: usize = 0x144;
 const MDSS_UBWC_CTRL_2: usize = 0x150;
 const MDSS_UBWC_PREDICTION_MODE: usize = 0x154;

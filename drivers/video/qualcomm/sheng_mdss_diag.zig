@@ -471,29 +471,21 @@ export fn sheng_mdss_dsi1_audit(dsi1_base: usize) callconv(.c) i64 {
 }
 
 // ===========================================================================
-// DSI PHY AUDIT (SPEC.md task #5 log)
+// DSI PHY audit.
 //
-// Until now the PHY had NO automated verification at all -- 46 register
-// writes with nothing checking them, while DSI0, DSI1 and the DPU each had
-// tables. The "31/31 PHY registers match" claim carried in this project for
-// a long time was a manual, self-selected comparison, and it only ever
-// covered the CMN block below +0x200. The PLL sub-block at phy+0x500 --
-// 29 registers, every one of them programmed by this driver -- had never
-// been compared to anything.
+// Covers the CMN block AND the PLL sub-block at phy+0x500. A
+// hand-picked offset list cannot find a register nobody thought to
+// check, which is how the slave PLL stayed unconfigured and how
+// CTL_FETCH_PIPE_ACTIVE, DSC_CLK_CTRL and the MDSS UBWC block all hid.
 //
-// That is exactly the blind spot that hid CTL_FETCH_PIPE_ACTIVE, DSC_CLK_
-// CTRL and the MDSS UBWC block: a self-selected offset list cannot find a
-// register nobody thought to look at. It also hid the slave PLL being left
-// entirely unconfigured (see sheng_mdss_dsi_phy_init()'s comment).
+// Values read from this device at explicit single offsets while Linux
+// drove the panel in the same 144Hz DSC bonded mode. Never range-scan;
+// that wedges the bus.
 //
-// Every value below was read off THIS device with devmem, explicit single
-// offsets only (never a range scan -- those wedge this hardware's bus),
-// while Linux was driving the panel in the same 144Hz DSC bonded mode.
+// CLK_CFG1 (0x014) is the one master/slave-dependent entry: 0x30 on the
+// master, 0x34 on the slave (BITCLK_SEL set).
 //
-// CLK_CFG1 (0x014) is the one genuinely master/slave-dependent entry:
-// 0x30 on the master, 0x34 on the slave (BITCLK_SEL bit2 set).
-//
-// Returns a bitmask: bit N set == entry N differs from live silicon.
+// Returns a bitmask: bit N set means entry N differs from live.
 const PhyAuditEntry = struct { off: usize, expect: u32 };
 
 const phy_audit_table = [_]PhyAuditEntry{
@@ -1202,10 +1194,8 @@ export fn sheng_mdss_phy_lanepll_sweep(phy_base: usize) callconv(.c) i64 {
 /// Expectations captured from this device at explicit offsets only.
 /// Never sweep a blind range -- that wedges the bus.
 ///
-/// Same encoding as the other sweeps: (first mismatching offset << 32) |
-/// count. A count of 0 clears the slave PHY and closes the last large
-/// unexamined area. Anything else is the first hard divergence found since
-/// the register-shift fix.
+/// Same encoding as the other sweeps: (first mismatching offset << 32)
+/// | count.
 const phy1_cmn_sweep_table = [_]PhyAuditEntry{
     .{ .off = 0x004, .expect = 0x00000000 },
     .{ .off = 0x008, .expect = 0x00000002 },
