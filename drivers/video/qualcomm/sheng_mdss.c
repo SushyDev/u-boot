@@ -156,6 +156,15 @@ static int sheng_fastpath;
  * still needs to know what state we started from. */
 static int sheng_fastpath_state_ok;
 
+/* ABL's live pipeline, sampled before we touch anything:
+ * [0]/[7] INTF FRAME_COUNT bracketing a delay (advancing = really live),
+ * [1..4]  DMA0 SRC0_ADDR / YSTRIDE0 / SRC_FORMAT / SRC_SIZE,
+ * [5..6]  VIG0 SRC0_ADDR / YSTRIDE0. */
+static u32 sheng_abl_live[8];
+
+/* Did we inherit ABL's live display instead of rebuilding it? */
+int sheng_inherited;
+
 #define SHENG_DIAG_N 9
 static u32 sheng_diag[SHENG_DIAG_N];
 static int sheng_panel_init_ret;
@@ -189,8 +198,11 @@ int sheng_mdss_diag_fmt(char *buf, int len)
 			" status0=%08x fifo=%08x fifo_late=%08x lane=%08x"
 			" ackerr=%08x timeout=%08x pll_l=%08x"
 			" frames=%u->%u pm=%012llx pm_val=%02x"
-			" pm_pre=%012llx pm_pre_val=%02x",
-			sheng_fastpath, sheng_probe_count, sheng_panel_init_ret_first,
+			" pm_pre=%012llx pm_pre_val=%02x"
+			" abl[frames=%u->%u dma0=%08x/%08x/%08x/%08x"
+			" vig0=%08x/%08x]",
+			sheng_inherited, sheng_fastpath, sheng_probe_count,
+			sheng_panel_init_ret_first,
 			sheng_panel_init_ret,
 			(unsigned long long)sheng_mdss_gdsc_probe_result(),
 			(int)sheng_mdss_gdsc_collapse_us(),
@@ -200,7 +212,11 @@ int sheng_mdss_diag_fmt(char *buf, int len)
 			(unsigned long long)sheng_panel_pm,
 			(unsigned int)(sheng_panel_pm & 0xff),
 			(unsigned long long)sheng_panel_pm_pre,
-			(unsigned int)(sheng_panel_pm_pre & 0xff)) + 1;
+			(unsigned int)(sheng_panel_pm_pre & 0xff),
+			sheng_abl_live[0], sheng_abl_live[7],
+			sheng_abl_live[1], sheng_abl_live[2],
+			sheng_abl_live[3], sheng_abl_live[4],
+			sheng_abl_live[5], sheng_abl_live[6]) + 1;
 }
 
 static void sheng_tmark(const char *name)
@@ -510,6 +526,121 @@ static int sheng_mdss_probe(struct udevice *dev)
 				    (unsigned long)sheng_mdss_abl_state3(
 					    SM8550_MDSS_DSI0_PHY_BASE,
 					    SM8550_MDSS_DSI1_PHY_BASE));
+
+			/* Capture ABL's LIVE pipeline config, for the
+			 * continuous-splash inherit path.
+			 *
+			 * With /reserved-memory/splash_region advertised ABL
+			 * stops blanking and hands over a running display.
+			 * Tearing that down and rebuilding it does not work
+			 * (b375/b376/b380) -- but if it is already scanning a
+			 * framebuffer, U-Boot does not need to rebuild
+			 * anything: it can draw into THAT buffer and leave
+			 * MDSS completely alone. No teardown, no panel
+			 * re-init, and no black gap by construction.
+			 *
+			 * For that we need ABL's real values, not assumed
+			 * ones: which pipe, what address, what stride. Read
+			 * them rather than guessing -- the splash region's
+			 * base (0xb8000000) is where the region STARTS, not
+			 * necessarily where the scanout buffer sits.
+			 *
+			 * frames_a/frames_b bracket a short delay: if
+			 * FRAME_COUNT advances, ABL's timing engine really is
+			 * running and the inherit is valid. If it does not,
+			 * there is nothing to inherit and the normal cold
+			 * bring-up must run.
+			 *
+			 * Safe here: MDSS_GDSC is on and the DISPCC AHB clock
+			 * runs (both just enabled above), which is exactly
+			 * what makes DPU register reads legal this early.
+			 */
+			{
+				const uintptr_t dpu = SM8550_MDSS_DPU_BASE;
+				const uintptr_t intf = dpu + 0x35000;
+				const uintptr_t dma0 = dpu + DPU_SSPP_DMA0_OFF;
+				const uintptr_t vig0 = dpu + 0x4000;
+
+				sheng_abl_live[0] = readl((void __iomem *)(intf + 0x0ac));
+				sheng_abl_live[1] = readl((void __iomem *)(dma0 + 0x14)); /* SRC0_ADDR */
+				sheng_abl_live[2] = readl((void __iomem *)(dma0 + 0x24)); /* YSTRIDE0 */
+				sheng_abl_live[3] = readl((void __iomem *)(dma0 + 0x30)); /* SRC_FORMAT */
+				sheng_abl_live[4] = readl((void __iomem *)(dma0 + 0x00)); /* SRC_SIZE */
+				sheng_abl_live[5] = readl((void __iomem *)(vig0 + 0x14)); /* VIG0 SRC0_ADDR */
+				sheng_abl_live[6] = readl((void __iomem *)(vig0 + 0x24)); /* VIG0 YSTRIDE0 */
+				mdelay(20);
+				sheng_abl_live[7] = readl((void __iomem *)(intf + 0x0ac));
+			}
+
+			/* CONTINUOUS SPLASH INHERIT.
+			 *
+			 * If ABL handed over a display that is genuinely
+			 * scanning out, do not rebuild it -- draw into the
+			 * buffer it is already showing and touch nothing
+			 * else. No GDSC collapse, no MDSS reset, no panel
+			 * power-cycle, no 94-command init, no dpu_start.
+			 *
+			 * This removes the whole black gap between the Xiaomi
+			 * logo and U-Boot's first pixels, and it sidesteps the
+			 * failure that made splash_region unusable: our
+			 * teardown killed ABL's live stream mid-frame and
+			 * wedged the DDIC beyond recovery (b375/b376/b380).
+			 * The fix is not to tear it down.
+			 *
+			 * Every value comes from ABL's live registers rather
+			 * than assumption -- measured (b383):
+			 *     VIG0 SRC0_ADDR = 0xb8000000
+			 *     VIG0 YSTRIDE0  = 0x2fa0 = 12192 = 3048 * 4
+			 * Note that is a TIGHT stride; this driver's own
+			 * framebuffer uses 12288 (ALIGN(3048,32)*4), so
+			 * assuming our value here would shear every line.
+			 *
+			 * Guarded on the timing engine ACTUALLY ADVANCING
+			 * across a delay, not merely on registers looking
+			 * plausible: a configured-but-stopped pipeline would
+			 * leave the console drawing into a buffer nobody
+			 * scans out. If anything here fails the normal cold
+			 * bring-up below runs unchanged.
+			 */
+			if (sheng_abl_live[7] != sheng_abl_live[0] &&
+			    sheng_abl_live[5] && sheng_abl_live[6]) {
+				u32 fb = sheng_abl_live[5];
+				u32 stride = sheng_abl_live[6] & 0xffff;
+
+				plat->base = fb;
+				plat->size = stride * SHENG_PANEL_VACTIVE;
+				uc_priv->xsize = SHENG_PANEL_HACTIVE;
+				uc_priv->ysize = SHENG_PANEL_VACTIVE;
+				uc_priv->bpix = VIDEO_BPP32;
+				uc_priv->format = VIDEO_X8R8G8B8;
+				uc_priv->rot = 0;
+				uc_priv->line_length = stride;
+
+				/* Console writes go through the CPU cache and
+				 * the DPU fetches DRAM, exactly as for our own
+				 * framebuffer. */
+				video_set_flush_dcache(dev, true);
+
+				/* Keep LMB off ABL's scanout buffer. The
+				 * reserved-memory node covers it for Linux,
+				 * but U-Boot's own allocator needs telling
+				 * too -- board_late_init() runs nine
+				 * lmb_alloc() calls after this. */
+				{
+					phys_addr_t a = fb;
+					int lret = lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &a,
+								 plat->size, LMB_NONE);
+					if (lret)
+						log_warning("sheng_mdss: ABL fb not reserved (%d)\n",
+							    lret);
+				}
+
+				sheng_inherited = 1;
+				sheng_tmark("inherit abl fb");
+				sheng_tmark_report();
+				SHENG_DBG_STAGE(SHENG_MDSS_STATUS_PROBE, 0);
+				return 0;
+			}
 		}
 	}
 

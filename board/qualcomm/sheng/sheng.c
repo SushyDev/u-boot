@@ -29,6 +29,7 @@
 DECLARE_GLOBAL_DATA_PTR;
 
 extern void sheng_mdss_teardown(void);
+extern int sheng_inherited;
 extern int sheng_mdss_timing_fmt(char *buf, int len);
 extern int sheng_mdss_diag_fmt(char *buf, int len);
 extern unsigned long sheng_uboot_entry_us;
@@ -916,6 +917,11 @@ void qcom_late_init(void)
  */
 void board_preboot_os(void)
 {
-	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS))
+	/* Nothing to tear down if we inherited ABL's live pipeline -- we
+	 * never brought MDSS up, and tearing down someone else's running
+	 * display on the way into Linux would only recreate the black gap
+	 * this whole path exists to remove. Linux does its own bring-up
+	 * regardless. */
+	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS) && !sheng_inherited)
 		sheng_mdss_teardown();
 }
