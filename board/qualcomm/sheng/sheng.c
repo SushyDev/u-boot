@@ -28,6 +28,14 @@
 
 DECLARE_GLOBAL_DATA_PTR;
 
+/* The DPU base, for the gentle stop in board_preboot_os(). Duplicated
+ * rather than including sheng_mdss_regs.h, for the same reason as the
+ * GPIO numbers below: this file must still build with
+ * CONFIG_VIDEO_SHENG_MDSS off. */
+#define SHENG_DPU_BASE			0x0ae01000
+
+extern void sheng_mdss_intf_stop(unsigned long dpu_base);
+extern int sheng_inherited;
 extern void sheng_mdss_teardown(void);
 extern int sheng_mdss_timing_fmt(char *buf, int len);
 extern int sheng_mdss_diag_fmt(char *buf, int len);
@@ -916,6 +924,41 @@ void qcom_late_init(void)
  */
 void board_preboot_os(void)
 {
-	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS))
-		sheng_mdss_teardown();
+	if (!IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS))
+		return;
+
+	/* Two different handovers, because we may not own the pipeline.
+	 *
+	 * Built it ourselves -> full teardown, as always.
+	 *
+	 * INHERITED ABL's live pipeline -> a GENTLE STOP instead. Both
+	 * extremes were measured and both fail:
+	 *   - skipping the stop entirely leaves MDSS streaming, and Linux
+	 *     boots to a black panel: drm/msm has no continuous-splash
+	 *     support and cannot adopt a running pipeline.
+	 *   - the full teardown unclocks MDSS and then touches DPU
+	 *     registers, which hangs the board when the pipeline is still
+	 *     live.
+	 * Halting the INTF timing engines stops the panel being fed while
+	 * leaving clocks, power and configuration intact -- quiescent but
+	 * not dismantled, which is what Linux's own bring-up expects.
+	 */
+	/* Inherited: stop the timing engine FIRST so nothing is streaming,
+	 * then run the same full teardown as always.
+	 *
+	 * The gentle stop alone (b389) was not enough: Linux came up with
+	 * DPMS On, connector enabled, backlight lit at brightness 1800 and
+	 * fb0 unblanked -- and the panel still dark. Its bring-up does not
+	 * take against a pipeline left powered and configured by someone
+	 * else, exactly as ours did not.
+	 *
+	 * The full teardown is what Linux has always been handed on this
+	 * board, and it works. Doing it AFTER the timing engine has stopped
+	 * removes the one thing that made it dangerous here -- touching DPU
+	 * registers on a block still mid-frame.
+	 */
+	if (sheng_inherited)
+		sheng_mdss_intf_stop(SHENG_DPU_BASE);
+
+	sheng_mdss_teardown();
 }

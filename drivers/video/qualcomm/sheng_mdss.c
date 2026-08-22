@@ -178,6 +178,10 @@ static int sheng_panel_init_ret;
  * Keep the FIRST attempt's result separately; it is the one that says
  * why the panel is broken.
  */
+/* Did we inherit ABL's live display instead of rebuilding it? Drives the
+ * handover to Linux in board_preboot_os(). */
+int sheng_inherited;
+
 static unsigned int sheng_probe_count;
 static int sheng_panel_init_ret_first = 0x7fffffff;
 
@@ -510,6 +514,79 @@ static int sheng_mdss_probe(struct udevice *dev)
 				    (unsigned long)sheng_mdss_abl_state3(
 					    SM8550_MDSS_DSI0_PHY_BASE,
 					    SM8550_MDSS_DSI1_PHY_BASE));
+
+			/* CONTINUOUS-SPLASH INHERIT.
+			 *
+			 * With /reserved-memory/splash_region advertised, ABL
+			 * stops blanking ~2s before handover and hands over a
+			 * LIVE, STREAMING display. Do not rebuild it: draw
+			 * into the buffer it is already scanning and touch
+			 * nothing else. That removes the entire black gap
+			 * between the Xiaomi logo and U-Boot's first pixels,
+			 * and it avoids the failure that made every rebuild
+			 * attempt fail -- the teardown below kills a live
+			 * stream mid-frame and wedges the DDIC beyond
+			 * recovery.
+			 *
+			 * NO DPU REGISTER ACCESS HERE, DELIBERATELY.
+			 *
+			 * An earlier version read INTF FRAME_COUNT and the
+			 * SSPP registers to discover ABL's buffer. That works
+			 * while ABL streams -- DPU registers need the MDP core
+			 * clock, which ABL has running -- but with the splash
+			 * DISABLED, MDP is unclocked and those same reads
+			 * wedge the AHB bus: no backlight, no boot, fastboot
+			 * recovery (b386/b387). Gating them on a clock status
+			 * bit did NOT fix it, so the safe answer is not to
+			 * touch the DPU at all this early.
+			 *
+			 * Liveness instead comes from DSI0 CLK_STATUS, a DSI
+			 * register and therefore safe on the AHB clock alone
+			 * (the same clock the state reads above already rely
+			 * on). Bit 14 is VID_PCLK: set only when the video
+			 * path is genuinely clocked and streaming.
+			 *
+			 * The buffer geometry is known rather than probed:
+			 *   0xb8000000  = splash_region's base, the address
+			 *                 ABL was measured scanning from
+			 *                 (VIG0 SRC0_ADDR, b383)
+			 *   12192       = VIG0 YSTRIDE0, a TIGHT 3048*4.
+			 *                 NOT this driver's own 12288
+			 *                 (ALIGN(3048,32)*4) -- using that
+			 *                 would shear every line.
+			 */
+			if (readl((void __iomem *)(uintptr_t)
+				  (SM8550_MDSS_DSI0_BASE + 0x11c)) & (1 << 14)) {
+				plat->base = SHENG_ABL_FB_ADDR;
+				plat->size = SHENG_ABL_FB_STRIDE * SHENG_PANEL_VACTIVE;
+				uc_priv->xsize = SHENG_PANEL_HACTIVE;
+				uc_priv->ysize = SHENG_PANEL_VACTIVE;
+				uc_priv->bpix = VIDEO_BPP32;
+				uc_priv->format = VIDEO_X8R8G8B8;
+				uc_priv->rot = 0;
+				uc_priv->line_length = SHENG_ABL_FB_STRIDE;
+
+				/* Console writes go through the CPU cache while
+				 * the DPU fetches DRAM, exactly as for our own
+				 * framebuffer. */
+				video_set_flush_dcache(dev, true);
+
+				/* Keep U-Boot's allocator off the live scanout
+				 * buffer: board_late_init() runs nine
+				 * lmb_alloc() calls after this. */
+				{
+					phys_addr_t a = SHENG_ABL_FB_ADDR;
+					int lret = lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &a,
+								 plat->size, LMB_NONE);
+					if (lret)
+						log_warning("sheng_mdss: ABL fb not reserved (%d)\n",
+							    lret);
+				}
+
+				sheng_inherited = 1;
+				SHENG_DBG_STAGE(SHENG_MDSS_STATUS_PROBE, 0);
+				return 0;
+			}
 		}
 	}
 

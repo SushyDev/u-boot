@@ -75,6 +75,19 @@
  * or every console line lands 96 bytes short. */
 #define SHENG_MDSS_FB_STRIDE		12288
 #define SHENG_MDSS_FB_ADDR		0xa3200000
+
+/* ABL's continuous-splash framebuffer, for the inherit path in
+ * sheng_mdss_probe(). Both values MEASURED off ABL's live pipeline
+ * (b383), not assumed:
+ *
+ *     VIG0 SRC0_ADDR = 0xb8000000   (matches /reserved-memory/splash_region)
+ *     VIG0 YSTRIDE0  = 0x2fa0 = 12192 = 3048 * 4
+ *
+ * NOTE the stride is TIGHT, unlike SHENG_MDSS_FB_STRIDE above which is
+ * 32-pixel aligned. Using our own value here shears every line.
+ */
+#define SHENG_ABL_FB_ADDR		0xb8000000
+#define SHENG_ABL_FB_STRIDE		12192
 #define SHENG_MDSS_DSI_DMA_SCRATCH	0xa3100000
 
 #endif /* __SHENG_MDSS_REGS_H */

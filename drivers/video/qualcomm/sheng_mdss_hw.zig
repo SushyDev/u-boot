@@ -2469,6 +2469,41 @@ export fn sheng_mdss_dsi_timeout_diag() callconv(.c) i64 {
 ///    7:0   decoded payload. **0x9C on a correctly initialised panel**
 ///          (DISPLAY_ON | NORMAL_MODE | SLEEP_OUT); 0x08 is sleep-in,
 ///          display-off, i.e. an init that did not take.
+/// GENTLE STOP, for handing a pipeline we did NOT build over to Linux.
+///
+/// Stops the INTF timing engines and nothing else: clocks stay on, the
+/// GDSC stays powered, no block is reset, no register is cleared. The
+/// panel simply stops being fed.
+///
+/// This exists because neither existing option works when U-Boot has
+/// INHERITED ABL's live display rather than building its own:
+///
+///   skip sheng_mdss_teardown()  -> Linux boots to a black panel.
+///        drm/msm has no continuous-splash support upstream; it always
+///        does a full bring-up and cannot adopt a running pipeline.
+///   run  sheng_mdss_teardown()  -> hangs the board into fastboot. That
+///        function unclocks MDSS and then touches DPU registers, which
+///        is fine on a pipeline we built and stopped, and fatal on one
+///        still streaming.
+///
+/// Halting the timing engine leaves MDSS quiescent but intact, which is
+/// what Linux's own bring-up expects to find.
+///
+/// Deliberately does NOT read anything back: after this the DPU is idle
+/// but still clocked, and there is no status here worth the risk of an
+/// extra MMIO access on a block mid-transition.
+export fn sheng_mdss_intf_stop(dpu_base: usize) callconv(.c) void {
+    const intf1_base = dpu_base + 0x35000; // DSI0 (master)
+    const intf2_base = dpu_base + 0x36000; // DSI1 (slave)
+
+    mmioWrite32(intf1_base, INTF_TIMING_ENGINE_EN, 0);
+    mmioWrite32(intf2_base, INTF_TIMING_ENGINE_EN, 0);
+
+    // Let the current frame drain. One frame at 120Hz is ~8.3ms; 20ms
+    // covers the slowest supported rate with margin.
+    udelay(20000);
+}
+
 export fn sheng_mdss_dsi_read_power_mode_single(dsi0_base: usize, dma_scratch: usize) callconv(.c) i64 {
     const dst: [*]volatile u8 = @ptrFromInt(dma_scratch);
 

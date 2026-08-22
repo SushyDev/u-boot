@@ -190,6 +190,16 @@
 		 * expected and must not be "fixed" -- the stock DTB does the
 		 * same, and adding one breaks the lookup.
 		 */
+		/* THE GAP FIX. ABL finds this by PATH -- exact name, NO unit
+		 * address -- stops blanking, and hands over a live display.
+		 * Requires the inherit path in sheng_mdss_probe() and the
+		 * gentle stop in board_preboot_os(); do not enable alone. */
+		splash_region {
+			label = "cont_splash_region";
+			reg = <0x0 0xb8000000 0x0 0x2b00000>;
+			no-map;
+		};
+
 		/* DISABLED, and the reason is the interesting part.
 		 *
 		 * Enabling this node WORKS -- ABL finds it, stops blanking,
