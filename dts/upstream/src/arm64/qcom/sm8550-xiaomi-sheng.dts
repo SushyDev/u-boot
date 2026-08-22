@@ -51,6 +51,37 @@
 /delete-node/ &hyp_ext_tags_mem;
 /delete-node/ &hyp_ext_reserved_mem;
 
+/*
+ * Carveouts that lie OUTSIDE this board's actual DRAM banks.
+ *
+ * lmb tries to reserve every reserved-memory region at boot, and each of
+ * these fails with -22 because the address is not inside any bank in
+ * memory@a0000000 above, printing
+ *
+ *     ERROR: reserving fdt memory region failed (addr=... flags=2): -22
+ *
+ * on every boot. The reservations achieve nothing either way -- deleting
+ * the nodes is behaviourally identical to leaving them to fail -- so
+ * this is purely removing noise. Same reasoning as the hypervisor/VM
+ * regions deleted above.
+ *
+ * Note these became VISIBLE only once the display came up early enough
+ * to show U-Boot's own startup log; they have presumably always failed.
+ */
+/delete-node/ &hyp_tags_mem;
+/delete-node/ &xbl_sc_mem;
+/delete-node/ &tz_reserved_mem;
+/delete-node/ &qtee_mem;
+/delete-node/ &ta_mem;
+/delete-node/ &tz_tags_mem;
+
+/*
+ * cpucp-fw-region@d8140000 is 0x1c0000, but this board's DRAM bank at
+ * that address is only 0x20000 -- the region runs off the end of it, so
+ * the reservation fails the same way.
+ */
+/delete-node/ &cpucp_fw_mem;
+
 /* SM8550P doesn't have a Modem DSP -- no modem firmware region needed. */
 /delete-node/ &mpss_dsm_mem;
 /delete-node/ &mpss_mem;
@@ -157,10 +188,14 @@
 	};
 
 	reserved-memory {
-		framebuffer_mem: framebuffer-region@fb800000 {
-			reg = <0x0 0xfb800000 0x0 0x18000000>;
-			no-map;
-		};
+		/* REMOVED: framebuffer-region@fb800000.
+		 *
+		 * 402MB at an address that appears nowhere in the stock DTB,
+		 * and it overruns the end of its DRAM bank, so lmb refused it
+		 * (-22) and printed an error every boot. The REAL splash
+		 * framebuffer is splash_region below, 0xb8000000, measured off
+		 * ABL's live VIG0 pipe. Deleting a reservation that always
+		 * failed is behaviourally identical to leaving it. */
 
 		/* ABL's continuous-splash framebuffer. THE GAP FIX.
 		 *
@@ -226,10 +261,13 @@
 			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>;
 		};
 
-		hwfence_shbuf: hwfence-shbuf-region@e6440000 {
-			reg = <0 0xe6440000 0 0x2dd000>;
-			no-map;
-		};
+		/* REMOVED: hwfence-shbuf-region@e6440000.
+		 *
+		 * Deleted from sm8550.dtsi at the top of this file and then
+		 * redefined here, at an address outside every bank in
+		 * memory@a0000000 -- so lmb refused it (-22) and printed an
+		 * error on every boot. Nothing in U-Boot uses hardware fences.
+		 */
 
 		llcc_lpi_mem: llcc-lpi-region@ff800000 {
 			reg = <0 0xff800000 0 0x600000>;

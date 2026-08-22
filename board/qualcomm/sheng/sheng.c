@@ -26,6 +26,7 @@
 #include <linux/kconfig.h>
 #include <linux/sizes.h>
 #include <power/pmic.h>
+#include <linux/psci.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -859,23 +860,138 @@ static int sheng_pon_dump(char *out, int outlen)
 		n += snprintf(out + n, outlen - n, " %02x", v < 0 ? 0xff : v & 0xff);
 	}
 
-	/* PON reset-control window. PON_PS_HOLD_RESET_CTL is documented at
-	 * PON base + 0x5A and RESET_CTL2 at 0x5B -- the pair that selects
-	 * SHUTDOWN vs WARM_RESET when PS_HOLD is dropped. Dumped read-only
-	 * because the charger-boot fix has to WRITE them, and getting that
-	 * wrong turns "boots when you plug in" into "reboot-loops when you
-	 * plug in", which needs fastboot to escape.
+	/* DO NOT SCAN THE PMIC BLIND.
 	 *
-	 * Want to see: a plausible type field at 0x5a (1 = warm reset,
-	 * 4 = shutdown, 7 = hard reset) rather than 0x00/0xff, which would
-	 * mean the register is not where the documentation says. */
-	n += snprintf(out + n, outlen - n, " rst@135x:");
-	for (i = 0x50; i < 0x60 && n < outlen - 8; i++) {
-		int v = pmic_reg_read(pmic, (0x13 << 8) | i);
-
-		n += snprintf(out + n, outlen - n, " %02x", v < 0 ? 0xff : v & 0xff);
-	}
+	 * b404 walked both peripherals 0x20-0xff looking for
+	 * PON_PS_HOLD_RESET_CTL and CRASHED THE BOARD INTO FASTBOOT. Reads
+	 * are not automatically safe on SPMI: unimplemented addresses can
+	 * fault the bus, and some registers are clear-on-read. Only touch
+	 * offsets something documents or a driver already uses.
+	 *
+	 * The 0x00-0x1f window above is known-good (b402/b403) and is what
+	 * carries the power-on reason bits.
+	 */
 	return n + 1;
+}
+
+/* CHARGER-INSERT BOOT: shut down instead of booting.
+ *
+ * The PMIC powers the SoC up whenever a cable is inserted; stock ABL
+ * routes that to offline charging, which we do not implement, so every
+ * plug-in becomes a full boot into Linux. This restores the expected
+ * behaviour: plug in a charger while off, and it stays off.
+ *
+ * DETECTION is measured, not guessed. PBS peripheral (PID 0x08) offset
+ * 0x15, across three boot types with every other byte identical:
+ *
+ *     warm reboot (ssh)   0x17    bit5=0 bit7=0
+ *     power key   (cold)  0x37    bit5=1 bit7=0
+ *     charger     (cold)  0xb7    bit5=1 bit7=1
+ *
+ * so bit7 = charger-initiated and bit5 = cold boot. Require BOTH: a warm
+ * reboot must never be mistaken for a cable insert.
+ *
+ * SHUTDOWN uses PSCI SYSTEM_OFF, not PMIC registers. The documented
+ * route -- select SHUTDOWN in PON_PS_HOLD_RST_CTL (0x5a) then drop
+ * PS_HOLD -- means writing PMIC state, and if the type is wrong the drop
+ * is a WARM RESET, turning this into a reboot loop. PSCI hands the whole
+ * problem to firmware, which already knows how to power this board down,
+ * and PSCI is known to work here (it is what makes the fastboot menu
+ * entry work). Note U-Boot's qcom_pshold driver would NOT do: it writes
+ * 0 to PS_HOLD for every sysreset type including POWER_OFF, i.e. a reset.
+ *
+ * ESCAPE HATCH, and it is load-bearing. We have NOT measured what the
+ * reason bits read when the power key is pressed while a cable is
+ * already connected -- that boot may look identical to a plain cable
+ * insert. Rather than risk refusing to turn on, this announces itself
+ * and waits: hold POWER during the countdown and it boots normally.
+ * KPDPWR live state comes from PON_INT_RT_STS, the same register and bit
+ * U-Boot's own button-qcom-pmic driver uses.
+ */
+#define SHENG_PON_PBS_PID	0x08
+#define SHENG_PON_REASON_OFF	0x15
+#define SHENG_PON_REASON_CHARGER	BIT(7)
+#define SHENG_PON_REASON_COLD		BIT(5)
+#define SHENG_PON_HLOS_PID	0x13
+#define SHENG_PON_INT_RT_STS	0x10
+#define SHENG_PON_GEN3_KPDPWR	BIT(7)
+#define SHENG_CHARGER_ABORT_MS	4000
+
+static struct udevice *sheng_pon_pmic(void)
+{
+	struct udevice *pmic;
+	ofnode node;
+
+	node = ofnode_path("/soc@0/spmi@c400000/pmic@0");
+	if (!ofnode_valid(node))
+		node = ofnode_path("/spmi@c400000/pmic@0");
+	if (!ofnode_valid(node))
+		return NULL;
+
+	return uclass_get_device_by_ofnode(UCLASS_PMIC, node, &pmic) ? NULL : pmic;
+}
+
+static void sheng_charger_boot_poweroff(void)
+{
+	struct udevice *pmic = sheng_pon_pmic();
+	int reason, i;
+
+	if (!pmic)
+		return;
+
+	reason = pmic_reg_read(pmic, (SHENG_PON_PBS_PID << 8) | SHENG_PON_REASON_OFF);
+	if (reason < 0)
+		return;
+
+	if (!(reason & SHENG_PON_REASON_CHARGER) ||
+	    !(reason & SHENG_PON_REASON_COLD))
+		return;
+
+	/* DO NOT POWER OFF HERE. Tried it (b406) and it is an INFINITE
+	 * REBOOT LOOP: the cable is still inserted, so the PMIC powers the
+	 * SoC straight back up, we detect the charger again, power off
+	 * again, forever. Powering down is simply not available while a
+	 * charger is connected -- which is exactly why stock shows a
+	 * charging screen instead of shutting down.
+	 *
+	 * So do what stock does: stay here. Linux is never booted, the panel
+	 * shows this message, and pressing POWER boots normally. Idling in
+	 * U-Boot is not a low-power charging mode, but it does the thing
+	 * that actually matters -- plugging in a charger no longer drags the
+	 * whole OS up.
+	 */
+	printf("\nsheng: charger-insert power-on (PON reason 0x%02x).\n", reason);
+	printf("sheng: charging. Press POWER to boot.\n");
+
+	for (i = 0; ; i++) {
+		int sts = pmic_reg_read(pmic,
+					(SHENG_PON_HLOS_PID << 8) | SHENG_PON_INT_RT_STS);
+
+		if (sts > 0 && (sts & SHENG_PON_GEN3_KPDPWR)) {
+			printf("sheng: POWER pressed, booting.\n");
+
+			/* WAIT FOR RELEASE before returning, or the same
+			 * press is still down when the boot menu starts
+			 * polling stdin and instantly selects entry 0.
+			 * button-kbd reports the live pin state, so a held
+			 * key is indistinguishable from a fresh keystroke.
+			 *
+			 * Bounded so a stuck or shorted key cannot strand
+			 * the boot here -- after 10s give up and continue,
+			 * which is the same outcome as before this loop
+			 * existed. */
+			for (i = 0; i < 100; i++) {
+				sts = pmic_reg_read(pmic,
+						    (SHENG_PON_HLOS_PID << 8) |
+						    SHENG_PON_INT_RT_STS);
+				if (sts >= 0 && !(sts & SHENG_PON_GEN3_KPDPWR))
+					break;
+				mdelay(100);
+			}
+			return;
+		}
+		mdelay(100);
+	}
 }
 
 int ft_board_setup(void *blob, struct bd_info *bd)
@@ -1032,6 +1148,11 @@ void qcom_late_init(void)
 
 	sheng_ktz8866_bias_readback();
 	printf("sheng: late_init done at %lu ms\n", timer_get_us() / 1000);
+
+	/* Last thing in late_init, deliberately: the display and console are
+	 * up by now, so the countdown and its escape hatch are actually
+	 * visible on the panel rather than announced to nobody. */
+	sheng_charger_boot_poweroff();
 }
 
 /*
