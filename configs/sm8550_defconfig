@@ -21,25 +21,16 @@ CONFIG_FIT=y
 CONFIG_FIT_VERBOSE=y
 CONFIG_BOOTSTD_FULL=y
 # CONFIG_BOOTMETH_VBE is not set
-# Interactive serial console for display bring-up debugging.
+# A real window to interrupt and reach the prompt.
 #
-# Was 1 second, which is unusable -- and irrelevant until now, because
-# &uart7 was left status="disabled" so there was no console to interrupt at
-# all. With the UART enabled and stdout-path set in the board DTS, 30s is a
-# real window to hit a key and land at the U-Boot prompt.
-#
-# Deliberately NOT -1 (never autoboot). If the serial wiring or baud is
-# wrong on the first attempt, -1 would leave a board that never boots Linux
-# and therefore has no exec.sh either -- recoverable only by reflashing.
-# With 30 it still boots normally if untouched, so a silent console costs
-# nothing. Once the prompt is confirmed working, -1 is the better setting.
+# Do NOT set -1. If the console is unreachable, -1 leaves a board that
+# never boots Linux and therefore has no exec.sh either -- recoverable
+# only by reflashing. 30 still autoboots if untouched.
 CONFIG_BOOTDELAY=30
 
-# Needed to poke MDSS/DSI/PHY registers live from the prompt (md/mw) and to
-# drive the panel reset and bias lines by hand (gpio). Both default to y in
-# Kconfig, but this board's defconfig never stated them -- make it explicit
-# so an upstream default change cannot silently remove the console tooling
-# this debugging depends on.
+# md/mw to poke MDSS registers from the prompt, gpio to drive the panel
+# reset and bias lines by hand. Both default to y; stated explicitly so
+# an upstream default change cannot remove them silently.
 CONFIG_CMD_MEMORY=y
 CONFIG_CMD_GPIO=y
 CONFIG_OF_BOARD_SETUP=y
@@ -66,108 +57,31 @@ CONFIG_ENV_USE_DEFAULT_ENV_TEXT_FILE=y
 # CONFIG_WDT is not set
 # CONFIG_EFI_LOADER is not set
 # CONFIG_MMC is not set
-# CONFIG_VIDEO / CONFIG_VIDEO_SHENG_MDSS: re-enabled to visually confirm
-# the DSI-bypass test patch (sheng_mdss_dsi_test_patch) with U-Boot's
-# OWN backlight enable (GPIO 128 + corrected I2C BL_EN/BL_CFG2/BL_DIMMING
-# writes, entirely within sheng_mdss_probe(), no dependency on Linux's
-# own driver at all). SPEC.md task #5 log has the full story: disabling
-# these confirmed Linux's OWN backlight only works when U-Boot doesn't
-# touch GDSC/DISPCC/DSI/RSC first -- but that's specifically about
-# LINUX's later re-init, not necessarily about whether OUR OWN direct
-# GPIO+I2C backlight control works while these pokes are active. This
-# build tests that directly.
-# Isolation test result: with CONFIG_VIDEO/SHENG_MDSS off, board.c's
-# backlight bring-up is now PROVEN correct via readback (BL_EN reads
-# back 0x5f on both chips over real I2C, GPIO128's io_reg reads back
-# 0x3 -- driven high AND input pin genuinely high) -- yet still no
-# visible light. Conclusion: the LED driver chip really is outputting
-# current, but the DSI panel itself was never sent exit_sleep/
-# display_on in this build (CONFIG_VIDEO off => sheng_mdss_probe()
-# never runs => no panel init at all), so the LCD glass is almost
-# certainly still sitting in its default-closed/blank state, physically
-# blocking backlight light from getting through regardless of the LEDs
-# being lit.
-#
-# GROUND-TRUTH TEST (SPEC.md task #5 log): user confirmed this exact
-# NixOS rootfs DID show a login prompt on screen before, with an
-# earlier boot.img -- meaning Linux's own complete driver stack CAN
-# drive this panel successfully. With CONFIG_VIDEO_SHENG_MDSS active
-# (all our GDSC/DISPCC/DSI/DPU register pokes), Linux's fbdev path now
-# fails with "framebuffer is not in virtual address space" (a GEM/vmap
-# failure) -- almost certainly our own hardware pokes leaving IOMMU/
-# SMMU or DPU state Linux's later re-init can't cleanly recover from,
-# the same class of problem as the backlight disruption, just
-# manifesting differently. Disabling entirely to test whether Linux's
-# OWN complete init succeeds again with sheng_mdss_probe() never
-# running at all -- the cleanest possible isolation.
-#
-# Ground truth confirmed (SPEC.md task #5 log): with this off, Linux
-# shows a real login prompt -- hardware is fully capable. Re-enabling
-# now that MDP_CLK is back to the real 514MHz rate (see
-# sheng_mdss_hw.zig's MDP_CLK_DIV_REG_VAL comment) combined with the
-# pclk0/byte0/esc0 clock fix and the VID_CFG0/lane/timing register fix
-# -- none of these three fixes have ever been tested together before.
-# RESULT: still broken on both sides -- our own pixel push shows
-# nothing, and Linux's fbdev vmap failure reproduces identically at
-# 514MHz too, same as at the lowered SVS rate. No SMMU/IOMMU fault
-# messages in dmesg either (ruling out a translation-fault theory).
-# The clock-rate mismatch was a real, worthwhile fix in isolation but
-# not the actual disruptor -- whatever sheng_mdss_probe() does still
-# corrupts state Linux can't recover from, independent of clock rate.
-# Reverting to disabled: this is the one config confirmed to actually
-# work (Linux shows a real login prompt). Don't regress past this
-# known-good point; resume investigation from here next time.
-#
-# REAL LIKELY ANSWER FOUND (SPEC.md task #5 log): live devmem read of
-# apps_smmu's SCR0 (0x15000000) showed USFCFG=1 -- unidentified/
-# unmatched IOMMU streams FAULT by default on this hardware, not
-# bypass. The display's real stream ID (mdss's iommus property,
-# 0x1c00/mask 0x2 in sm8550.dtsi) has a firmware-provisioned SMR entry
-# at a fixed slot (SMR[3] = 0x80021c00, confirmed by scanning all 105
-# stream-match groups) -- every raw physical-address SSPP fetch this
-# driver ever did was almost certainly silently aborted by the SMMU,
-# explaining precisely why frame/line counters increment fine (pure
-# INTF timing, no memory access) while zero real pixel content ever
-# showed up, with no visible hang. Added smmuBypassMdssStream()
-# (forces S2CR[3] to BYPASS before any framebuffer fetch) and
-# sheng_mdss_dpu_stop()/sheng_mdss_teardown() (clean pipeline teardown
-# before Linux boots, likely fixing the GEM/vmap corruption too).
-# Re-enabling to test both fixes together.
+# The display driver. See drivers/video/qualcomm/ARCHITECTURE.md.
 CONFIG_VIDEO=y
 CONFIG_VIDEO_SHENG_MDSS=y
-# Root cause of the CONFIG_VIDEO hang (see git history / SPEC.md):
-# growing the u-boot binary enough to cross ~1MB loaded size (physical
-# kernel_offset 0x8000 + kernel_size) apparently collides with
-# something ABL still has resident there while jumping into "the
-# kernel" (actually u-boot.bin) -- confirmed via breadcrumb
-# instrumentation that _main's first instruction never even executes
-# once that boundary is crossed. Not a bug in any of our code; a size
-# budget. Trim what we don't need: the embedded splash logo and its
-# BMP decode support save real space for zero functional loss (we
-# don't use splash screens).
-# CONFIG_VIDEO_LOGO must stay OFF: show_splash() is called from
-# video_post_probe() and its failure return propagates out, which would
-# abort the console bind that happens after it. The logo is a BMP and
-# CONFIG_BMP / CONFIG_VIDEO_BMP_RLE8 are both disabled here.
+# IMAGE SIZE IS A BUDGET, NOT A PREFERENCE. Crossing ~1MB of loaded
+# size (kernel_offset 0x8000 + kernel_size) collides with something ABL
+# still has resident, and _main's first instruction never executes.
+# Keep the binary small; the splash logo and BMP decode buy nothing
+# here.
+#
+# CONFIG_VIDEO_LOGO must stay off for a second reason: show_splash() is
+# called from video_post_probe() and its failure return propagates out,
+# aborting the console bind that follows. The logo is a BMP and BMP
+# support is disabled below.
 # CONFIG_VIDEO_LOGO is not set
 # CONFIG_VIDEO_BMP_RLE8 is not set
 # CONFIG_BMP is not set
 # CONFIG_CMD_BMP is not set
-# CONFIG_VIDEO pulls these in via `imply`, and CONSOLE_MUX +
-# SYS_CONSOLE_IS_IN_ENV means console_init_r() looks up stdin/stdout/
-# stderr device names from the saved environment -- this board's env
-# was never set up with those and hung silently before any console
-# output at all when this was left on (confirmed on hardware). Force
-# both off; a single fixed serial console is all that's needed here.
-# RE-ENABLED (display now works). These were forced off because the board
-# "hung silently before any console output at all" -- the comment above
-# names the cause: CONSOLE_MUX + SYS_CONSOLE_IS_IN_ENV make console_init_r()
-# look up stdin/stdout/stderr from the environment, and this board's env did
-# not define them. sheng.env now sets all three explicitly, so that premise
-# no longer holds. Both are required for the panel to show U-Boot's console:
-# without SYS_CONSOLE_IS_IN_ENV the env's stdout is never consulted, and
-# without CONSOLE_MUX stdout can only be a single device, so the
-# "serial,vidconsole" setting cannot take effect.
+# Both are required for the console to appear on the panel: without
+# SYS_CONSOLE_IS_IN_ENV the env's stdout is never consulted, and without
+# CONSOLE_MUX stdout can only be one device, so "serial,vidconsole"
+# cannot take effect.
+#
+# These make console_init_r() look up stdin/stdout/stderr in the
+# environment. If sheng.env stops defining all three, the board hangs
+# silently before any console output at all.
 CONFIG_CONSOLE_MUX=y
 CONFIG_SYS_CONSOLE_IS_IN_ENV=y
 # The panel is 3048x2032, so an 8x16 bitmap font is ~1/380th of the screen
@@ -210,27 +124,13 @@ CONFIG_DM_KEYBOARD=y
 CONFIG_BUTTON_KEYBOARD=y
 CONFIG_BUTTON_QCOM_PMIC=y
 CONFIG_CMD_BOOTMENU=y
-# CONFIG_VIDEO_ANSI: ON. (Historical note, kept because it is the record of
-# a wrong diagnosis.) It was held off on the theory that the menu rendered
-# "invisibly" -- a colour/attribute bug. It was not: the escapes were always
-# honoured and the glyphs were always drawn, they just never left the CPU
-# dcache, because video_set_flush_dcache() sat below probe's return.
-#
-# The boot menu needs it -- it clears the screen, positions the cursor and
-# uses reverse video for the selected entry. With it enabled the escapes ARE
-# honoured (the startup log gets correctly cleared away), but the menu's own
-# text then renders invisibly and the panel stays black for the whole
-# timeout. That is a colour/attribute problem, not a menu problem, and it
-# costs the working startup log to chase. Leaving it off keeps the console
-# useful; re-enable together with a fix for the menu's colour handling.
+# The boot menu clears the screen, positions the cursor and uses reverse
+# video for the selected entry, so it needs ANSI. A non-ANSI vidconsole
+# prints the escapes as raw control characters instead.
 CONFIG_SYS_DEVICE_NULLDEV=y
 CONFIG_VIDEO_ANSI=y
-# AUTOBOOT_MENU_SHOW: OFF, paired with VIDEO_ANSI being off. It replaces the
-# plain countdown with the boot menu, and the menu emits ANSI escapes that a
-# non-ANSI vidconsole prints as raw control characters -- which wipes the
-# startup log and leaves a blank panel. Both must be enabled together, and
-# only once the menu's colour handling renders visibly. CMD_BOOTMENU stays
-# available so `bootmenu` can still be run by hand.
+# Off: bootcmd drives the menu itself. CMD_BOOTMENU stays available so
+# `bootmenu` can be run by hand.
 # CONFIG_AUTOBOOT_MENU_SHOW is not set
 # `version` is used by bootcmd to put real U-Boot build info on the panel.
 # U-Boot's own banner is printed before the video device probes and is then
@@ -238,9 +138,9 @@ CONFIG_VIDEO_ANSI=y
 # bootcmd is the way to actually see it. Without this the command does not
 # exist, bootcmd fails at that point, and every && after it is skipped.
 CONFIG_CMD_VERSION=y
-# Still hung with just those two off -- force off the rest of what
-# CONFIG_VIDEO implies too, to isolate whether it's one of these or
-# something in the core video uclass itself.
+# CONFIG_VIDEO implies these. The panel is driven entirely by
+# sheng_mdss, and CYCLIC being off is what makes VIDEO_DAMAGE mandatory
+# above.
 # CONFIG_PANEL is not set
 # CONFIG_SIMPLE_PANEL is not set
 # CONFIG_CYCLIC is not set
@@ -305,4 +205,3 @@ CONFIG_UFS_QCOM=y
 # arm64 "Image" header parsing, needed for booti to size/relocate the
 # kernel correctly.
 CONFIG_LINUX_KERNEL_IMAGE_HEADER=y
-CONFIG_VIDEO_SHENG_MDSS_DEBUG=y
