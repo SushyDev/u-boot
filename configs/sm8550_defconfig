@@ -43,6 +43,12 @@ CONFIG_CMD_UFS=y
 CONFIG_CMD_CAT=y
 # CONFIG_OF_LIVE is not set
 CONFIG_OF_UPSTREAM_BUILD_VENDOR=y
+# DO NOT ENABLE CONFIG_OF_LIBFDT_OVERLAY here. Tried 2026-08-22 (b360) to
+# get "dtc -@" and a __symbols__ node for ABL's cont_splash lookup. It
+# did not stop ABL blanking, and it BROKE RENDERING: it adds a tenth
+# lmb_alloc() in board_late_init() (fdtoverlay_addr_r) and grows the DTB
+# by 35KB, which moves the LMB allocations onto the live framebuffer.
+# That is the documented intermittent-corruption trap in this tree.
 
 # Shell handoff: ABL -> U-Boot -> kernel on UFS, no interactive UX. See
 # board/qualcomm/sheng.env for the boot sequence.

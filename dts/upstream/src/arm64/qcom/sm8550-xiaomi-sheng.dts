@@ -162,6 +162,34 @@
 			no-map;
 		};
 
+		/* TRIED AND DISPROVEN 2026-08-22 (b360): advertising ABL's
+		 * continuous-splash framebuffer here does NOT stop ABL
+		 * blanking the panel before handover.
+		 *
+		 * The stock DTB (dtbo.img entry 0, fragment@49) has exactly:
+		 *
+		 *     splash_region {
+		 *             label = "cont_splash_region";
+		 *             reg = <0x00 0xb8000000 0x00 0x2b00000>;
+		 *     };
+		 *
+		 * That was reproduced here field-for-field, with BOTH naming
+		 * conventions (dtc label "cont_splash" per upstream's
+		 * doc/board/qualcomm/phones.rst, and the label property
+		 * "cont_splash_region" per this device's firmware) and with
+		 * __symbols__ emitted so the label was resolvable. ABL blanked
+		 * anyway. So ABL's decision is not driven by this node.
+		 *
+		 * Removed because enabling CONFIG_OF_LIBFDT_OVERLAY to get
+		 * __symbols__ broke rendering outright -- see the comment in
+		 * configs/sm8550_defconfig.
+		 *
+		 * Kept here as a record so nobody spends another round on it.
+		 * The real splash framebuffer address is 0xb8000000; note the
+		 * framebuffer-region@fb800000 node above matches nothing in
+		 * the stock DTB and is likely wrong.
+		 */
+
 		xbl_ramdump_mem: xbl-ramdump-region@81200000 {
 			reg = <0 0x81200000 0 0x280000>;
 			no-map;
