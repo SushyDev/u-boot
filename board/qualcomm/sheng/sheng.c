@@ -185,11 +185,12 @@ void qcom_board_init(void)
 	sheng_handover_blret =
 		sheng_ktz8866_read_handover("/soc@0/geniqup@ac0000/i2c@a84000");
 
-	/* ANSWERED 2026-08-22 (b359): the panel is ALREADY BLACK during a
-	 * 3s hold here, with backlight EN and both rails still reading
-	 * high. ABL does not cut power -- it blanks and hands over dark.
-	 * Which is why the fix is the "cont_splash" label in the DTB, not
-	 * anything in this file. */
+	/* Measured 2026-08-22: WITHOUT /reserved-memory/splash_region, a 3s
+	 * hold here shows an already-black panel with backlight EN and both
+	 * rails still high -- ABL does not cut power, it blanks and hands
+	 * over dark. WITH the node present it does not blank at all and
+	 * hands over a live pipeline, which sheng_mdss_probe() inherits.
+	 * Either way the answer was in the DTB, not in this file. */
 }
 
 /* Raw MMIO breadcrumb, same pattern (and same reason) as sheng_mdss.c's

@@ -2467,6 +2467,10 @@ export fn sheng_mdss_dsi_timeout_diag() callconv(.c) i64 {
 ///          and the result says nothing about the panel.
 ///   15:8   TIMEOUT_STATUS low byte.
 ///    7:0   decoded payload. **0x9C on a correctly initialised panel**
+///          -- but note the VENDOR's own ESD check expects 0x9D
+///          (qcom,mdss-dsi-panel-status-value, see
+///          VENDOR-PANEL-REFERENCE.md). Both have been observed here;
+///          do not treat 0x9C as the only healthy value.
 ///          (DISPLAY_ON | NORMAL_MODE | SLEEP_OUT); 0x08 is sleep-in,
 ///          display-off, i.e. an init that did not take.
 /// GENTLE STOP, for handing a pipeline we did NOT build over to Linux.

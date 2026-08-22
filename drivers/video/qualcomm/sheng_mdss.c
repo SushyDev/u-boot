@@ -286,6 +286,11 @@ static void sheng_mdss_panel_power_and_reset(void)
 
 	/* nt36532e_reset(). The reset line is active-low, so a logical
 	 * assert is physical LOW. Delays are the panel driver's. */
+	/* The vendor DT says <0 10, 1 3, 0 3, 1 15> (level, ms) --
+	 * qcom,mdss-dsi-reset-sequence, see VENDOR-PANEL-REFERENCE.md.
+	 * These are 1ms longer at each step, which is harmless and has
+	 * always worked; left alone rather than churn the panel path,
+	 * which has a known intermittent init. */
 	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, false);
 	SHENG_DBG_PIN("rst assert1", TLMM_PANEL_RESET_GPIO);
 	mdelay(11);
