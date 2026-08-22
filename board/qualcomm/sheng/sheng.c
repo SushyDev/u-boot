@@ -257,7 +257,7 @@ static void sheng_ktz8866_status_set(unsigned int slot, int ret)
 	dsb();
 }
 
-static int sheng_ktz8866_write_chip(const char *path, u32 *bl_en_readback_out)
+static int sheng_ktz8866_write_chip(const char *path)
 {
 	struct udevice *bus, *chip;
 	ofnode i2c_node;
@@ -385,18 +385,6 @@ static int sheng_ktz8866_write_chip(const char *path, u32 *bl_en_readback_out)
 	ret = dm_i2c_write(chip, 0x08, &val, 1);
 	if (ret)
 		return ret;
-	/* Read BL_EN straight back: if the write really landed in real
-	 * hardware this reads 0x5f. If GENI reported write success without
-	 * a real ACK (or the chip never actually powered up because its
-	 * enable-gpio write was a silent no-op), this reads back stale/0/
-	 * garbage instead -- a much stronger signal than the write's own
-	 * return code. */
-	if (bl_en_readback_out) {
-		u8 rb = 0;
-		int rb_ret = dm_i2c_read(chip, 0x08, &rb, 1);
-		*bl_en_readback_out = rb_ret ? (0xdead0000u | (rb_ret & 0xff)) : rb;
-	}
-
 	/* One write pair, no ramp, same value Linux uses.
 	 * ktz8866_backlight_update_status() writes BL_BRT_LSB =
 	 * brightness & 0x7 and BL_BRT_MSB = (brightness >> 3) & 0xff, and
@@ -414,50 +402,6 @@ static int sheng_ktz8866_write_chip(const char *path, u32 *bl_en_readback_out)
 		return ret;
 
 	return 0;
-}
-
-extern void sheng_mdss_teardown(void);
-
-
-/* Bias IC state after the video probe has cycled the avdd/avee enable
- * pins.
- *
- *   0x09 LCD_BIAS_CFG1 -- did LCD_BIAS_EN stick, and survive the cycle?
- *   0x0F FLAG          -- the chip's own fault register. A latched
- *                         OVP/OCP/UVLO on OUTP/OUTN turns the +/-5.8V
- *                         panel rails OFF regardless of the enable pins
- *                         and the 0x09 enable bit.
- *
- * An unpowered panel is deaf on LP and HS alike, answers no BTA, and
- * shows black while every SoC-side register reads correct.
- *
- * Live under a working display, both chips: 0x09 = 0x9f, 0x0F = 0x00.
- *
- * Packed: [63:56] A 0x09, [55:48] A 0x0F, [31:24] B 0x09, [23:16] B 0x0F.
- */
-static int sheng_ktz8866_read_chip(const char *path, u8 *cfg1, u8 *flag)
-{
-	struct udevice *bus, *chip;
-	ofnode i2c_node;
-	int ret;
-
-	*cfg1 = 0xff;
-	*flag = 0xff;
-
-	i2c_node = ofnode_path(path);
-	if (!ofnode_valid(i2c_node))
-		return -ENOENT;
-	ret = uclass_get_device_by_ofnode(UCLASS_I2C, i2c_node, &bus);
-	if (ret)
-		return ret;
-	ret = dm_i2c_probe(bus, 0x11, 0, &chip);
-	if (ret)
-		return ret;
-
-	ret = dm_i2c_read(chip, 0x09, cfg1, 1);
-	if (ret)
-		return ret;
-	return dm_i2c_read(chip, 0x0f, flag, 1);
 }
 
 /* Drive LCD_BIAS_CFG1 (0x09) on both KTZ8866s. 0x9F sets LCD_BIAS_EN,
@@ -495,18 +439,6 @@ int sheng_ktz8866_set_bias(int enable)
 			rc = -1;
 	}
 	return rc;
-}
-
-static void sheng_ktz8866_bias_readback(void)
-{
-	u8 a_cfg1, a_flag, b_cfg1, b_flag;
-
-	sheng_ktz8866_read_chip("/soc@0/geniqup@ac0000/i2c@a84000", &a_cfg1, &a_flag);
-	sheng_ktz8866_read_chip("/soc@0/geniqup@9c0000/i2c@988000", &b_cfg1, &b_flag);
-
-	env_set_hex("sheng_bl_post",
-		    (((unsigned long)a_cfg1) << 56) | (((unsigned long)a_flag) << 48) |
-		    (((unsigned long)b_cfg1) << 24) | (((unsigned long)b_flag) << 16));
 }
 
 /* Brightness only -- two writes, for when the chip is already configured
@@ -563,11 +495,8 @@ static void sheng_ktz8866_backlight_init(void)
 		sheng_ktz8866_status_set(0, ret);
 		ret = sheng_ktz8866_set_brightness("/soc@0/geniqup@9c0000/i2c@988000");
 		sheng_ktz8866_status_set(1, ret);
-		env_set_hex("sheng_bl_fast", 1);
 		return;
 	}
-	env_set_hex("sheng_bl_fast", 0);
-
 	sheng_ktz8866_status_set(0, SHENG_KTZ8866_STATUS_NOT_REACHED);
 	sheng_ktz8866_status_set(1, SHENG_KTZ8866_STATUS_NOT_REACHED);
 
@@ -582,36 +511,13 @@ static void sheng_ktz8866_backlight_init(void)
 	 * DDIC. Everything drawn afterwards, the startup log included, goes
 	 * to a dead panel. */
 	sheng_backlight_gpio_enable();
-	u32 io_readback = sheng_backlight_gpio_set(1);
 	mdelay(2);
 
-	u32 bl_en_rb_a = 0xffffffff, bl_en_rb_b = 0xffffffff;
-
-	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@ac0000/i2c@a84000", &bl_en_rb_a); /* "A" */
+	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@ac0000/i2c@a84000");
 	sheng_ktz8866_status_set(0, ret);
-	int ret_a = ret;
 
-	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@9c0000/i2c@988000", &bl_en_rb_b); /* "B" */
+	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@9c0000/i2c@988000");
 	sheng_ktz8866_status_set(1, ret);
-
-	/* Report through the environment, not the status relay: that lives
-	 * in a no-map reserved region, and /dev/mem cannot read one at all
-	 * (xlate_dev_mem_ptr() has no linear-map pointer for it, so read()
-	 * returns EFAULT). These land in bootargs, so /proc/cmdline is the
-	 * readout.
-	 *
-	 * io_readback bit 1 is the driven GPIO 128 value, bit 0 the actual
-	 * pin. Both writes returning 0 while bl_en_rb_a/b do not read back
-	 * 0x5f means the I2C driver reported success without a real ACK, or
-	 * the chip never powered up. */
-	env_set_hex("sheng_bl_ret_a", (unsigned long)ret_a);
-	env_set_hex("sheng_bl_ret_b", (unsigned long)ret);
-	env_set_hex("sheng_bl_gpio_io", (unsigned long)io_readback);
-	env_set_hex("sheng_bl_pre",
-		    (unsigned long)*(volatile u32 *)(uintptr_t)(SHENG_KTZ8866_STATUS_ADDR + 0x10));
-	env_set_hex("sheng_bl_en_rb_a", (unsigned long)bl_en_rb_a);
-	env_set_hex("sheng_bl_en_rb_b", (unsigned long)bl_en_rb_b);
-
 }
 
 /* XBL/ABL's own log, scraped out of the reserved region it writes into.
@@ -633,7 +539,6 @@ static void sheng_ktz8866_backlight_init(void)
 #define SHENG_XBL_LOG_ADDR	0x81a00000
 #define SHENG_XBL_LOG_SIZE	0x40000
 #define SHENG_XBL_LOG_COPY	768
-#define SHENG_XBL_LOG_MINRUN	16
 
 /* Keywords worth finding. Dumping from the start of the region just
  * shows PBL/XBL boot banners (verified b367) -- anything ABL says about
@@ -915,7 +820,6 @@ static int sheng_pon_dump(char *out, int outlen)
 #define SHENG_PON_HLOS_PID	0x13
 #define SHENG_PON_INT_RT_STS	0x10
 #define SHENG_PON_GEN3_KPDPWR	BIT(7)
-#define SHENG_CHARGER_ABORT_MS	4000
 
 static struct udevice *sheng_pon_pmic(void)
 {
@@ -1143,10 +1047,8 @@ void qcom_late_init(void)
 		 * video device bound" (-ENODEV) from "bound, probe failed". */
 		if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
 			*(volatile int *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3020) = vret;
-		env_set_hex("sheng_mdss_vret", (unsigned long)vret);
 	}
 
-	sheng_ktz8866_bias_readback();
 	log_debug("sheng: late_init done at %lu ms\n", timer_get_us() / 1000);
 
 	/* Last thing in late_init, deliberately: the display and console are

@@ -3245,7 +3245,7 @@ const vbif_qos_remap_values = [8]u32{
     0x44444454, 0x55555555, 0x66666666, 0x77777767,
 };
 
-export fn sheng_mdss_vbif_init(vbif_base: usize) callconv(.c) void {
+fn sheng_mdss_vbif_init(vbif_base: usize) callconv(.c) void {
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         mmioWrite32(vbif_base, VBIF_QOS_REMAP_BASE + i * 8, vbif_qos_remap_values[i]);
@@ -3746,7 +3746,7 @@ fn clkBranchDisable(dispcc_base: usize, cbcr_off: usize) void {
 /// instead of finding them already running with this driver's
 /// configuration (wrong parent for Linux's own clk tree bookkeeping,
 /// even though the physical rate happens to be correct).
-export fn sheng_mdss_dispcc_dsi_clks_stop(dispcc_base: usize) callconv(.c) void {
+fn sheng_mdss_dispcc_dsi_clks_stop(dispcc_base: usize) callconv(.c) void {
     clkBranchDisable(dispcc_base, PCLK0_CLK_CBCR);
     clkBranchDisable(dispcc_base, PCLK1_CLK_CBCR);
     clkBranchDisable(dispcc_base, BYTE0_CLK_CBCR);
