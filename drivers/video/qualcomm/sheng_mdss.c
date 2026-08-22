@@ -11,6 +11,7 @@
 #include <dm.h>
 #include <env.h>
 #include <log.h>
+#include <lmb.h>
 #include <video.h>
 #include <asm/io.h>
 #include <asm/barriers.h>
@@ -121,10 +122,6 @@ extern void sheng_mdss_dsi_host_video_prepare(unsigned long dsi0_base,
 					     unsigned long dsi1_base);
 extern int sheng_mdss_dsi_panel_init(unsigned long dsi0_base, unsigned long dsi1_base,
 				      unsigned long dma_scratch, bool enable_dsc);
-extern int sheng_mdss_dsi_test_patch(unsigned long dsi0_base, unsigned long dsi1_base,
-				      unsigned long dma_scratch);
-extern long long sheng_mdss_dsi_read_power_mode(unsigned long dsi0_base, unsigned long dsi1_base,
-						 unsigned long dma_scratch);
 extern unsigned int sheng_mdss_dsi_status0_before_first_cmd(void);
 extern long long sheng_mdss_dsi_timeout_diag(void);
 extern long long sheng_mdss_dsi_snapshot_1(void);
@@ -142,9 +139,6 @@ extern long long sheng_mdss_smmu_fault_diag(void);
 extern long long sheng_mdss_smmu_fault_addr(void);
 extern void sheng_mdss_dsi_tpg_enable(unsigned long dsi0_base,
 				     unsigned long dsi1_base);
-extern void sheng_mdss_capture_state(unsigned long dst);
-extern long long sheng_mdss_dsi_read_power_mode_single(unsigned long dsi0_base,
-						       unsigned long dma_scratch);
 extern unsigned int sheng_mdss_dsi_retry_count(void);
 extern unsigned int sheng_mdss_dsi_trigger_probe(void);
 extern long long sheng_mdss_dsi_audit(unsigned long dsi0_base);
@@ -608,6 +602,33 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * plat->base unset, video_post_probe() maps the framebuffer at NULL
 	 * and every console write goes nowhere. */
 	plat->base = SHENG_MDSS_FB_ADDR;
+
+	/* RESERVE THE FRAMEBUFFER IN LMB, or something else will be given
+	 * it. This driver allocates its own framebuffer at a fixed address
+	 * rather than going through video_reserve(), so nothing else knows
+	 * the region is in use.
+	 *
+	 * board_late_init() runs nine lmb_alloc() calls at INITCALL 758 and
+	 * memcpy()s the FDT into one of them. The video probe is INITCALL
+	 * 729, so by then the panel is already scanning this memory out. An
+	 * allocation landing here writes straight into the live
+	 * framebuffer.
+	 *
+	 * Which addresses LMB picks depends on the image size, so this
+	 * fails intermittently: a build that shrinks by a few KB can move
+	 * an allocation onto the framebuffer and corrupt the display with
+	 * no other change. Reserve the DSI DMA scratch in the same span --
+	 * it sits 1MB below and has the same problem. */
+	{
+		phys_addr_t fb = SHENG_MDSS_DSI_DMA_SCRATCH;
+		phys_size_t len = (SHENG_MDSS_FB_ADDR - SHENG_MDSS_DSI_DMA_SCRATCH) +
+				  (phys_size_t)SHENG_MDSS_FB_STRIDE * SHENG_PANEL_VACTIVE;
+
+		ret = lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &fb, len, LMB_NONE);
+		if (ret)
+			log_warning("sheng_mdss: framebuffer not reserved (%d)\n", ret);
+		SHENG_DBG_ENV("sheng_mdss_fb_reserve", (unsigned long)ret);
+	}
 
 	uc_priv->xsize = SHENG_PANEL_HACTIVE;
 	uc_priv->ysize = SHENG_PANEL_VACTIVE;
