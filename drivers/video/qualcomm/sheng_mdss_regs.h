@@ -1,13 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0+ */
 /*
- * SM8550 MDSS block addresses for the sheng display driver.
+ * SM8550 MDSS block addresses. From sm8550.dtsi; U-Boot does not
+ * instantiate the DPU/DSI sub-nodes as udevices, so they are named here
+ * rather than walked from the device tree.
  *
- * Addresses come from dts/upstream/src/arm64/qcom/sm8550.dtsi. U-Boot
- * does not instantiate the DPU/DSI sub-nodes as separate udevices, so
- * they are named here rather than walked from the device tree.
- *
- * DPU sub-block offsets are relative to SM8550_MDSS_DPU_BASE and match
- * the kernel's dpu_9_0_sm8550.h catalog.
+ * DPU sub-block offsets match the kernel's dpu_9_0_sm8550.h catalog.
  */
 
 #ifndef __SHENG_MDSS_REGS_H
@@ -76,16 +73,9 @@
 #define SHENG_MDSS_FB_STRIDE		12288
 #define SHENG_MDSS_FB_ADDR		0xa3200000
 
-/* ABL's continuous-splash framebuffer, for the inherit path in
- * sheng_mdss_probe(). Both values MEASURED off ABL's live pipeline
- * (b383), not assumed:
- *
- *     VIG0 SRC0_ADDR = 0xb8000000   (matches /reserved-memory/splash_region)
- *     VIG0 YSTRIDE0  = 0x2fa0 = 12192 = 3048 * 4
- *
- * NOTE the stride is TIGHT, unlike SHENG_MDSS_FB_STRIDE above which is
- * 32-pixel aligned. Using our own value here shears every line.
- */
+/* ABL's continuous-splash framebuffer, read off its live VIG0 pipeline.
+ * The stride is TIGHT (3048*4), unlike SHENG_MDSS_FB_STRIDE above, which
+ * is 32-pixel aligned. Using our value here shears every line. */
 #define SHENG_ABL_FB_ADDR		0xb8000000
 #define SHENG_ABL_FB_STRIDE		12192
 #define SHENG_MDSS_DSI_DMA_SCRATCH	0xa3100000
