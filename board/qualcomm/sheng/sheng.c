@@ -54,49 +54,16 @@ static unsigned long sheng_backlight_us;
 #define SHENG_KTZ8866_STATUS_NOT_REACHED	0x7fffffff
 
 /* GPIO 128 is EN on both KTZ8866s. On this chip EN gates the I2C
- * interface itself, not just the LED current sinks, so writes issued
- * before it is high either NAK or land on a chip still in reset.
- *
- * Duplicated from the driver's own TLMM poke rather than shared: this
- * must run even when CONFIG_VIDEO_SHENG_MDSS is off. */
-#define SHENG_TLMM_BASE			0x00f100000
-#define SHENG_TLMM_GPIO_REG_SIZE	0x1000
+ * interface itself, not just the LED sinks, so writes issued before it is
+ * high either NAK or land on a chip still in reset. */
 #define SHENG_BACKLIGHT_GPIO		128
-#define SHENG_TLMM_MUX_FUNC_MASK	(0x7u << 2)
-#define SHENG_TLMM_OE_BIT		(1u << 9)
-#define SHENG_TLMM_OUT_BIT		(1u << 1)
+#define SHENG_PANEL_AVDD_GPIO		30
+#define SHENG_PANEL_AVEE_GPIO		31
+#define SHENG_PANEL_RESET_GPIO		133
 
-/* Returns the io_reg readback: bit0 the actual pin state, bit1 the
- * driven value. A write to a TZ/XPU-protected TLMM register is dropped
- * silently, not faulted, so the readback is the only way to tell a real
- * electrical change from a no-op. */
-static u32 sheng_backlight_gpio_set(int high)
-{
-	volatile u32 *ctl = (volatile u32 *)(uintptr_t)
-		(SHENG_TLMM_BASE + SHENG_TLMM_GPIO_REG_SIZE * SHENG_BACKLIGHT_GPIO);
-	volatile u32 *io = (volatile u32 *)(uintptr_t)
-		(SHENG_TLMM_BASE + 0x4 + SHENG_TLMM_GPIO_REG_SIZE * SHENG_BACKLIGHT_GPIO);
-	u32 v;
-
-	v = *ctl;
-	v &= ~SHENG_TLMM_MUX_FUNC_MASK;
-	v |= SHENG_TLMM_OE_BIT;
-	*ctl = v;
-
-	v = *io;
-	if (high)
-		v |= SHENG_TLMM_OUT_BIT;
-	else
-		v &= ~SHENG_TLMM_OUT_BIT;
-	*io = v;
-
-	return *io;
-}
-
-static u32 sheng_backlight_gpio_enable(void)
-{
-	return sheng_backlight_gpio_set(1);
-}
+/* sheng_mdss_hw.zig */
+extern void sheng_gpio_set(unsigned int gpio, bool high);
+extern u32 sheng_gpio_read(unsigned int gpio);
 
 /* Display state as ABL left it, sampled at board_init() before anything
  * of ours touches it. bit0 is the pin level, bit1 the driven value.
@@ -107,18 +74,8 @@ static u32 sheng_backlight_gpio_enable(void)
  * GPIO numbers are duplicated rather than including sheng_mdss_regs.h:
  * this file must still build with CONFIG_VIDEO_SHENG_MDSS off.
  */
-#define SHENG_PANEL_AVDD_GPIO	30
-#define SHENG_PANEL_AVEE_GPIO	31
-#define SHENG_PANEL_RESET_GPIO	133
-
 static u32 sheng_handover_bl, sheng_handover_avdd;
 static u32 sheng_handover_avee, sheng_handover_rst;
-
-static u32 sheng_tlmm_io_read(unsigned int gpio)
-{
-	return *(volatile u32 *)(uintptr_t)
-		(SHENG_TLMM_BASE + 0x4 + SHENG_TLMM_GPIO_REG_SIZE * gpio);
-}
 
 /* KTZ8866 state as ABL left it, read before anything of ours writes to
  * the chip. Diagnostic only: LCD_BIAS_CFG1 reflects whoever programmed
@@ -164,10 +121,10 @@ static int sheng_ktz8866_read_handover(const char *path)
 
 void qcom_board_init(void)
 {
-	sheng_handover_bl = sheng_tlmm_io_read(SHENG_BACKLIGHT_GPIO);
-	sheng_handover_avdd = sheng_tlmm_io_read(SHENG_PANEL_AVDD_GPIO);
-	sheng_handover_avee = sheng_tlmm_io_read(SHENG_PANEL_AVEE_GPIO);
-	sheng_handover_rst = sheng_tlmm_io_read(SHENG_PANEL_RESET_GPIO);
+	sheng_handover_bl = sheng_gpio_read(SHENG_BACKLIGHT_GPIO);
+	sheng_handover_avdd = sheng_gpio_read(SHENG_PANEL_AVDD_GPIO);
+	sheng_handover_avee = sheng_gpio_read(SHENG_PANEL_AVEE_GPIO);
+	sheng_handover_rst = sheng_gpio_read(SHENG_PANEL_RESET_GPIO);
 	sheng_handover_blret =
 		sheng_ktz8866_read_handover("/soc@0/geniqup@ac0000/i2c@a84000");
 
@@ -452,7 +409,7 @@ static void sheng_ktz8866_backlight_init(void)
 	    sheng_handover_blregs != 0xffffffff &&
 	    ((sheng_handover_blregs >> 24) & 0x40) &&
 	    (sheng_handover_blregs & 0x80)) {
-		sheng_backlight_gpio_enable();
+		sheng_gpio_set(SHENG_BACKLIGHT_GPIO, true);
 		ret = sheng_ktz8866_set_brightness("/soc@0/geniqup@ac0000/i2c@a84000");
 		sheng_ktz8866_status_set(0, ret);
 		ret = sheng_ktz8866_set_brightness("/soc@0/geniqup@9c0000/i2c@988000");
@@ -472,7 +429,7 @@ static void sheng_ktz8866_backlight_init(void)
 	 * scanning out, so dropping EN removes its AVDD/AVEE and kills the
 	 * DDIC. Everything drawn afterwards, the startup log included, goes
 	 * to a dead panel. */
-	sheng_backlight_gpio_enable();
+	sheng_gpio_set(SHENG_BACKLIGHT_GPIO, true);
 	mdelay(2);
 
 	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@ac0000/i2c@a84000");

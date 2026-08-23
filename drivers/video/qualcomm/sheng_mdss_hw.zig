@@ -4375,6 +4375,12 @@ const TLMM_OUT: u32 = 1 << 1;
 /// is output enable, IN_OUT bit 1 carries the value.
 ///
 /// Raw MMIO rather than the gpio uclass: a .bind hook hangs this board.
+/// TLMM IN_OUT for one pin: bit0 the actual pin level, bit1 the driven
+/// value. TLMM is always clocked, so this is safe before MDSS is up.
+export fn sheng_gpio_read(gpio: u32) callconv(.c) u32 {
+    return mmioRead32(TLMM_BASE + TLMM_PIN_STRIDE * gpio, TLMM_IN_OUT);
+}
+
 export fn sheng_gpio_set(gpio: u32, high: bool) callconv(.c) void {
     const pin = TLMM_BASE + TLMM_PIN_STRIDE * gpio;
 
