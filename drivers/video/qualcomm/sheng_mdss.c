@@ -50,27 +50,6 @@ DECLARE_GLOBAL_DATA_PTR;
  * a hang on the next instruction would otherwise leave it in a dirty
  * cache line that a post-mortem scrape never sees.
  */
-void sheng_mdss_stage_record(unsigned int stage, int ret)
-{
-	volatile struct sheng_blackbox *bb = SHENG_BLACKBOX;
-
-	if (!IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
-		return;
-	if (stage >= SHENG_MDSS_STATUS_COUNT)
-		return;
-
-	sheng_breadcrumb_u32((unsigned long)(uintptr_t)&bb->stage[stage],
-			     (u32)ret);
-}
-
-void sheng_mdss_stage_init(void)
-{
-	unsigned int i;
-
-	for (i = 0; i < SHENG_MDSS_STATUS_COUNT; i++)
-		sheng_mdss_stage_record(i, SHENG_MDSS_STATUS_NOT_REACHED);
-}
-
 /* Boot timing.
  *
  * There is no console during probe, so marks are only collected here

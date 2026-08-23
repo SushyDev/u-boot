@@ -144,3 +144,6 @@ __pycache__
 
 # Clang's compilation database file
 /compile_commands.json
+
+# Generated from Kconfig by scripts/Makefile.zig
+sheng_mdss_config.zig

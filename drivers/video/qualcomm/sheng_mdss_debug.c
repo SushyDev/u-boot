@@ -79,11 +79,12 @@ void sheng_mdss_debug_env(const char *name, unsigned long long v)
 
 void sheng_mdss_debug_start(void)
 {
-	volatile u32 *count = (volatile u32 *)(uintptr_t)SHENG_MDSS_LOG_ADDR;
+	volatile struct sheng_blackbox *bb = SHENG_BLACKBOX;
 
 	if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
-		*count = 0;
-		breadcrumb_flush(SHENG_MDSS_LOG_ADDR, sizeof(*count));
+		bb->log.count = 0;
+		breadcrumb_flush((uintptr_t)&bb->log.count,
+				 sizeof(bb->log.count));
 	}
 
 	/* Reserve the blackbox for the same reason the driver reserves its

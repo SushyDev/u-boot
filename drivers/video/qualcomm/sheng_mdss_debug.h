@@ -60,9 +60,6 @@ enum {
  * with no MMIO, and it is the only way to tell which stage aborted on a
  * board with no console. Always built.
  */
-void sheng_mdss_stage_record(unsigned int stage, int ret);
-void sheng_mdss_stage_init(void);
-#define SHENG_DBG_STAGE(s, r)	sheng_mdss_stage_record((s), (r))
 
 #if IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS_DEBUG)
 
