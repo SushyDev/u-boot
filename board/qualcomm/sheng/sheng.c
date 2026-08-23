@@ -191,42 +191,24 @@ void qcom_board_init(void)
 	sheng_handover_blret =
 		sheng_ktz8866_read_handover("/soc@0/geniqup@ac0000/i2c@a84000");
 
-	/* DID ABL HAND OVER A LIVE DISPLAY? Decided HERE, over I2C, and
-	 * never by reading an MDSS register.
+	/* Does ABL hand over a live display? Decided from our own DTB, never
+	 * by reading an MDSS register.
 	 *
-	 * The display driver needs this to choose between inheriting ABL's
-	 * running pipeline and doing a cold bring-up. The obvious test --
-	 * ask the DPU or the DSI host whether it is streaming -- is a trap:
-	 * those blocks need clocks that are only running WHEN ABL IS
-	 * STREAMING, so the probe answers correctly in the live case and
-	 * WEDGES THE AHB BUS in the case it exists to detect. That cost
-	 * three fastboot recoveries (b386/b387 on DPU registers, b392 on
-	 * DSI0 CLK_STATUS, which is no safer despite being a DSI register).
+	 * Asking the DPU or DSI host whether it is streaming is a trap: those
+	 * blocks need clocks that only run WHILE ABL IS STREAMING, so the read
+	 * answers correctly when live and WEDGES THE AHB BUS in exactly the
+	 * case it exists to detect. Recovery is fastboot.
 	 *
-	 * The KTZ8866 is on I2C, independent of MDSS, and always readable.
-	 * LCD_BIAS_CFG1 differs measurably between the two handovers:
+	 * The KTZ8866 is on I2C and always readable, but LCD_BIAS_CFG1
+	 * reflects whoever programmed the chip last, which on a warm reboot is
+	 * Linux, not ABL. It is recorded in the diag, not used as a test.
 	 *
-	 *     0x9f  ABL left the panel live and scanning (splash_region
-	 *           advertised, ABL did not blank)
-	 *     0x98  ABL blanked before handover
+	 * Whether ABL keeps the panel alive is decided by whether we advertise
+	 * /reserved-memory/splash_region. We control both sides of that, and
+	 * reading our own device tree cannot wedge a bus.
 	 *
-	 * ...except it does NOT work: LCD_BIAS_CFG1 reflects whoever last
-	 * programmed the chip, and on a warm reboot that is LINUX's own
-	 * ktz8866 driver, not ABL. Measured 0x9f with the splash live and
-	 * 0x98 without, but only across a single pair of boots; with the
-	 * splash disabled and Linux having run first it still read 0x9f and
-	 * the driver wrongly inherited a dead pipeline (b395: U-Boot black,
-	 * Linux fine). Kept in the diag as information, not used as a test.
-	 *
-	 * ASK OUR OWN DTB INSTEAD. Whether ABL keeps the display alive is
-	 * decided by whether we advertise /reserved-memory/splash_region --
-	 * that is the contract, and we control both sides of it. Reading our
-	 * own device tree is pure memory access: no MDSS, no I2C, nothing
-	 * that can wedge a bus or depend on who booted last.
-	 *
-	 * Failure modes stay survivable. If ABL ever ignores the node we
-	 * inherit a dead pipeline and U-Boot shows a dark panel -- Linux
-	 * still boots, and no fastboot recovery is needed.
+	 * If ABL ever ignores the node we inherit a dead pipeline and U-Boot
+	 * shows a dark panel. Linux still boots.
 	 */
 	sheng_abl_splash_live =
 		ofnode_valid(ofnode_path("/reserved-memory/splash_region"));
@@ -779,39 +761,32 @@ static int sheng_pon_dump(char *out, int outlen)
 	return n + 1;
 }
 
-/* CHARGER-INSERT BOOT: shut down instead of booting.
+/* Charger insert powers the SoC up. Stay off instead of booting Linux.
  *
- * The PMIC powers the SoC up whenever a cable is inserted; stock ABL
- * routes that to offline charging, which we do not implement, so every
- * plug-in becomes a full boot into Linux. This restores the expected
- * behaviour: plug in a charger while off, and it stays off.
+ * Stock ABL routes a cable insert to offline charging, which we do not
+ * implement, so every plug-in becomes a full boot.
  *
- * DETECTION is measured, not guessed. PBS peripheral (PID 0x08) offset
- * 0x15, across three boot types with every other byte identical:
+ * Detection: PBS peripheral (PID 0x08) offset 0x15. Across three boot
+ * types every other byte was identical:
  *
- *     warm reboot (ssh)   0x17    bit5=0 bit7=0
- *     power key   (cold)  0x37    bit5=1 bit7=0
- *     charger     (cold)  0xb7    bit5=1 bit7=1
+ *     warm reboot  0x17   bit5=0 bit7=0
+ *     power key    0x37   bit5=1 bit7=0
+ *     charger      0xb7   bit5=1 bit7=1
  *
- * so bit7 = charger-initiated and bit5 = cold boot. Require BOTH: a warm
- * reboot must never be mistaken for a cable insert.
+ * bit7 is charger-initiated, bit5 is cold boot. Require BOTH, or a warm
+ * reboot is mistaken for a cable insert.
  *
- * SHUTDOWN uses PSCI SYSTEM_OFF, not PMIC registers. The documented
- * route -- select SHUTDOWN in PON_PS_HOLD_RST_CTL (0x5a) then drop
- * PS_HOLD -- means writing PMIC state, and if the type is wrong the drop
- * is a WARM RESET, turning this into a reboot loop. PSCI hands the whole
- * problem to firmware, which already knows how to power this board down,
- * and PSCI is known to work here (it is what makes the fastboot menu
- * entry work). Note U-Boot's qcom_pshold driver would NOT do: it writes
- * 0 to PS_HOLD for every sysreset type including POWER_OFF, i.e. a reset.
+ * Shutdown uses PSCI SYSTEM_OFF, not PMIC registers. Selecting SHUTDOWN
+ * in PON_PS_HOLD_RST_CTL (0x5a) and dropping PS_HOLD means writing PMIC
+ * state, and a wrong type makes the drop a WARM RESET -- a reboot loop.
+ * U-Boot's qcom_pshold driver has that bug: it writes 0 to PS_HOLD for
+ * every sysreset type, POWER_OFF included.
  *
- * ESCAPE HATCH, and it is load-bearing. We have NOT measured what the
- * reason bits read when the power key is pressed while a cable is
- * already connected -- that boot may look identical to a plain cable
- * insert. Rather than risk refusing to turn on, this announces itself
- * and waits: hold POWER during the countdown and it boots normally.
- * KPDPWR live state comes from PON_INT_RT_STS, the same register and bit
- * U-Boot's own button-qcom-pmic driver uses.
+ * The escape hatch is load-bearing. It is not known what the reason bits
+ * read when POWER is pressed with a cable already connected; that boot
+ * may look like a plain insert. So announce and wait: hold POWER during
+ * the countdown and it boots normally. KPDPWR live state comes from
+ * PON_INT_RT_STS, the same bit button-qcom-pmic uses.
  */
 #define SHENG_PON_PBS_PID	0x08
 #define SHENG_PON_REASON_OFF	0x15
@@ -1074,35 +1049,19 @@ void board_preboot_os(void)
 	if (!IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS))
 		return;
 
-	/* Two different handovers, because we may not own the pipeline.
+	/* Two handovers, because we may not own the pipeline.
 	 *
-	 * Built it ourselves -> full teardown, as always.
+	 * Built it ourselves -> full teardown.
 	 *
-	 * INHERITED ABL's live pipeline -> a GENTLE STOP instead. Both
-	 * extremes were measured and both fail:
-	 *   - skipping the stop entirely leaves MDSS streaming, and Linux
-	 *     boots to a black panel: drm/msm has no continuous-splash
-	 *     support and cannot adopt a running pipeline.
-	 *   - the full teardown unclocks MDSS and then touches DPU
-	 *     registers, which hangs the board when the pipeline is still
-	 *     live.
-	 * Halting the INTF timing engines stops the panel being fed while
-	 * leaving clocks, power and configuration intact -- quiescent but
-	 * not dismantled, which is what Linux's own bring-up expects.
-	 */
-	/* Inherited: stop the timing engine FIRST so nothing is streaming,
-	 * then run the same full teardown as always.
+	 * Inherited ABL's live pipeline -> stop the INTF timing engines first,
+	 * then the same full teardown. Both extremes fail on their own:
+	 *   - no stop at all leaves MDSS streaming and Linux boots to a black
+	 *     panel; drm/msm cannot adopt a running pipeline.
+	 *   - teardown alone unclocks MDSS and then touches DPU registers,
+	 *     which hangs the board mid-frame.
 	 *
-	 * The gentle stop alone (b389) was not enough: Linux came up with
-	 * DPMS On, connector enabled, backlight lit at brightness 1800 and
-	 * fb0 unblanked -- and the panel still dark. Its bring-up does not
-	 * take against a pipeline left powered and configured by someone
-	 * else, exactly as ours did not.
-	 *
-	 * The full teardown is what Linux has always been handed on this
-	 * board, and it works. Doing it AFTER the timing engine has stopped
-	 * removes the one thing that made it dangerous here -- touching DPU
-	 * registers on a block still mid-frame.
+	 * Stopping the timing engine leaves clocks, power and configuration
+	 * intact, which is what Linux's own bring-up expects to find.
 	 */
 	if (sheng_inherited)
 		sheng_mdss_intf_stop(SHENG_DPU_BASE);
