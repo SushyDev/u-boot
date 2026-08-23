@@ -1411,7 +1411,8 @@ fn dsiPhyPllRecommit() void {
 /// is_master selects DSI0, which drives its own PLL. DSI1 is the slave
 /// and takes its bit clock from DSI0 over the sync-dual-dsi link. Call
 /// this for both, then sheng_mdss_dsi_phy_start_dual() once.
-export fn sheng_mdss_dsi_phy_init(dsi_phy_base: usize, is_master: bool) callconv(.c) c_int {
+export fn sheng_mdss_dsi_phy_init(dsi_phy_base: usize, role: DsiPhyRole) callconv(.c) c_int {
+    const is_master = role == .master;
     if (is_master) g_phy0_base = dsi_phy_base else g_phy1_base = dsi_phy_base;
     // Request REFGEN READY (DSI_PHY_7NM_QUIRK_V5_2 path).
     mmioWrite32(dsi_phy_base, CMN_GLBL_DIGTOP_SPARE10, 0x1);
@@ -2664,7 +2665,8 @@ export fn sheng_mdss_dsi_host_video_prepare(dsi0_base: usize, dsi1_base: usize) 
 }
 
 
-export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, enable_dsc: bool) callconv(.c) c_int {
+export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scratch: usize, dsc: DscMode) callconv(.c) c_int {
+    const enable_dsc = dsc == .enabled;
     // Must run before ANY DSI command traffic, not just before the
     // DPU's video fetch: the host's own command-mode DMA reads
     // dma_scratch through the same stream, so command #0 hits an
@@ -3758,16 +3760,21 @@ export fn sheng_mdss_dpu_start(
     dsi0_base: usize,
     dsi1_base: usize,
     fb_addr: usize,
-    hactive: u32,
-    vactive: u32,
-    hfront_porch: u32,
-    hback_porch: u32,
-    hsync_width: u32,
-    vfront_porch: u32,
-    vback_porch: u32,
-    vsync_width: u32,
-    enable_dsc: bool,
+    timing: *const PanelTiming,
+    dsc: DscMode,
 ) callconv(.c) c_int {
+    // Unpacked once, so the body below reads exactly as it did when these
+    // were thirteen positional parameters -- eight of them same-typed
+    // integers that a transposition would have silently accepted.
+    const hactive = timing.hactive;
+    const vactive = timing.vactive;
+    const hfront_porch = timing.hfront_porch;
+    const hback_porch = timing.hback_porch;
+    const hsync_width = timing.hsync_width;
+    const vfront_porch = timing.vfront_porch;
+    const vback_porch = timing.vback_porch;
+    const vsync_width = timing.vsync_width;
+    const enable_dsc = dsc == .enabled;
     const half_w: u32 = hactive / 2; // 1524
     // msm_drv.h's align_pitch(): "adreno needs pitch aligned to 32
     // pixels" -- (hactive+31)&~31 = 3072 for hactive=3048, *4 bytes =
@@ -4439,7 +4446,26 @@ export fn sheng_gpio_read(gpio: u32) callconv(.c) u32 {
     return mmioRead32(TLMM_BASE + TLMM_PIN_STRIDE * gpio, TLMM_IN_OUT);
 }
 
-export fn sheng_gpio_set(gpio: u32, high: bool) callconv(.c) void {
+/// The literal electrical state of a pin. Nothing more -- no pin's
+/// active sense is encoded here.
+const PinLevel = enum { low, high };
+
+/// nt36532e reset is ACTIVE LOW: asserting reset drives the pin LOW.
+/// The inversion is encoded exactly once, in panelReset(), so no call
+/// site has to remember it.
+const ResetState = enum { asserted, released };
+
+/// The panel bias rails (AVDD/AVEE) and the backlight EN pin are active
+/// high, so their logical and physical states coincide -- but they are
+/// still named, because they used to share `sheng_gpio_set(pin, bool)`
+/// with reset, where `false` meant "rail off" for one pin and "reset
+/// ASSERTED" for another. Same function, opposite senses, and a
+/// transposition in the reset pulse train below is an unbootable panel
+/// that the type system said nothing about.
+const RailState = enum { off, on };
+
+/// Drive a pin as a plain output at a literal level.
+fn gpioSetLevel(gpio: u32, level: PinLevel) void {
     const pin = TLMM_BASE + TLMM_PIN_STRIDE * gpio;
 
     var v = mmioRead32(pin, TLMM_CFG);
@@ -4448,8 +4474,57 @@ export fn sheng_gpio_set(gpio: u32, high: bool) callconv(.c) void {
     mmioWrite32(pin, TLMM_CFG, v);
 
     v = mmioRead32(pin, TLMM_IN_OUT);
-    if (high) v |= TLMM_OUT else v &= ~TLMM_OUT;
+    if (level == .high) v |= TLMM_OUT else v &= ~TLMM_OUT;
     mmioWrite32(pin, TLMM_IN_OUT, v);
+}
+
+/// Panel reset, in logical terms. THE ONLY PLACE the active-low
+/// inversion appears.
+fn panelReset(state: ResetState) void {
+    gpioSetLevel(GPIO_PANEL_RESET, switch (state) {
+        .asserted => .low,
+        .released => .high,
+    });
+}
+
+/// Both panel bias rails together. AVEE drops before AVDD on the way
+/// down, matching the order the teardown path has always used.
+fn panelRails(state: RailState) void {
+    switch (state) {
+        .on => {
+            gpioSetLevel(GPIO_PANEL_AVDD, .high);
+            gpioSetLevel(GPIO_PANEL_AVEE, .high);
+        },
+        .off => {
+            gpioSetLevel(GPIO_PANEL_AVEE, .low);
+            gpioSetLevel(GPIO_PANEL_AVDD, .low);
+        },
+    }
+}
+
+/// Panel to cold-boot state: reset asserted, both bias rails down.
+///
+/// The inverse of panelPowerAndReset(), so Linux's nt36532e_prepare()
+/// finds a genuinely unpowered panel and re-runs its own init instead of
+/// assuming one already on.
+///
+/// Exported as one operation rather than three GPIO writes so the C
+/// teardown path never has to state a polarity -- it used to open-code
+/// `sheng_gpio_set(RESET, false)` under a comment explaining that false
+/// meant asserted.
+export fn sheng_mdss_panel_power_off() callconv(.c) void {
+    panelReset(.asserted);
+    panelRails(.off);
+}
+
+/// Backlight EN high. There is deliberately no way to drive it LOW.
+///
+/// EN gates the KTZ8866's AVDD/AVEE output, not just the LED sinks, so
+/// dropping it after the video probe has run kills the DDIC and
+/// everything drawn afterwards goes to a dead panel. That rule used to
+/// live in a comment above a call that could just as easily pass false.
+export fn sheng_backlight_enable() callconv(.c) void {
+    gpioSetLevel(GPIO_BACKLIGHT_EN, .high);
 }
 
 const GCC_BASE: usize = 0x00100000;
@@ -4712,13 +4787,46 @@ pub const ShengFb = extern struct {
 const PANEL_HACTIVE: u32 = 3048;
 const PANEL_VACTIVE: u32 = 2032;
 
-// 144Hz, nt36532e. Matches the DPU crtc-0 modeline.
-const PANEL_HFRONT_PORCH: u32 = 142;
-const PANEL_HSYNC_WIDTH: u32 = 4;
-const PANEL_HBACK_PORCH: u32 = 92;
-const PANEL_VFRONT_PORCH: u32 = 26;
-const PANEL_VSYNC_WIDTH: u32 = 2;
-const PANEL_VBACK_PORCH: u32 = 138;
+/// Which DSI half a PHY is. The master (DSI0) drives its own PLL and the
+/// slave takes its bit clock from it, so this is not a symmetric pair.
+pub const DsiPhyRole = enum(c_int) { master, slave };
+
+/// Display Stream Compression on or off for the pipeline. Off is
+/// untested on this panel -- see the note in sheng_mdss_dpu_start().
+pub const DscMode = enum(c_int) { bypassed, enabled };
+
+/// One panel mode's blanking timings.
+///
+/// hactive/vactive are the FULL panel resolution; sheng_mdss_dpu_start()
+/// derives the per-DSI-half parameters itself.
+///
+/// Passed as a struct because the alternative was eight same-typed
+/// positional u32s in a thirteen-argument call, where transposing
+/// hback_porch and hsync_width compiles, links, and produces a subtly
+/// wrong modeline.
+pub const PanelTiming = extern struct {
+    hactive: u32,
+    vactive: u32,
+    hfront_porch: u32,
+    hback_porch: u32,
+    hsync_width: u32,
+    vfront_porch: u32,
+    vback_porch: u32,
+    vsync_width: u32,
+};
+
+/// 144Hz, nt36532e. Matches the DPU crtc-0 modeline and the panel
+/// driver's own mode table.
+const PANEL_TIMING_144HZ = PanelTiming{
+    .hactive = PANEL_HACTIVE,
+    .vactive = PANEL_VACTIVE,
+    .hfront_porch = 142,
+    .hback_porch = 92,
+    .hsync_width = 4,
+    .vfront_porch = 26,
+    .vback_porch = 138,
+    .vsync_width = 2,
+};
 
 // Aligned stride: the DPU fetches at ALIGN(3048,32)*4.
 const FB_ADDR: usize = 0xa3200000;
@@ -4740,6 +4848,24 @@ const DSI1_PHY: usize = 0x0ae97000;
 const GPIO_PANEL_AVDD: u32 = 30;
 const GPIO_PANEL_AVEE: u32 = 31;
 const GPIO_PANEL_RESET: u32 = 133;
+/// EN on both KTZ8866s. Gates the I2C interface itself, not just the LED
+/// sinks, so writes issued before it is high either NAK or land on a chip
+/// still in reset.
+const GPIO_BACKLIGHT_EN: u32 = 128;
+
+/// Rail ramp before the reset pulse train. The DT's
+/// regulator-enable-ramp-delay is 233us on both rails; 1ms covers it.
+const PANEL_RAIL_RAMP_MS: u32 = 1;
+/// Settle after the final reset release, before the first DCS command.
+const PANEL_RESET_SETTLE_MS: u32 = 16;
+/// LOAD-BEARING, and the single largest delay in the cold path.
+///
+/// The rails need an off window long enough to actually discharge or the
+/// DDIC keeps its state across the "power cycle" and refuses a fresh
+/// init. A panel killed mid-scan needs the long one. Only reached when
+/// the probe fast path is declined -- see the `quiet` check in
+/// sheng_mdss_bringup().
+const PANEL_RAIL_DISCHARGE_MS: u32 = 1080;
 
 /// A stage or sample that never ran. Same sentinel the C side relays for
 /// an unreached bring-up stage.
@@ -4809,18 +4935,18 @@ export fn sheng_mdss_diag_state() callconv(.c) *ShengDiag {
 /// a logical assert is physical LOW.
 fn panelPowerAndReset() void {
     _ = sheng_ktz8866_set_bias(1);
-    sheng_gpio_set(GPIO_PANEL_AVDD, true);
-    sheng_gpio_set(GPIO_PANEL_AVEE, true);
-    mdelay(1); // regulator-enable-ramp-delay is 233us on both
+    panelRails(.on);
+    mdelay(PANEL_RAIL_RAMP_MS); // regulator-enable-ramp-delay is 233us on both
 
-    sheng_gpio_set(GPIO_PANEL_RESET, false);
+    // nt36532e reset pulse train, from the panel driver's own sequence.
+    panelReset(.asserted);
     mdelay(11);
-    sheng_gpio_set(GPIO_PANEL_RESET, true);
+    panelReset(.released);
     mdelay(4);
-    sheng_gpio_set(GPIO_PANEL_RESET, false);
+    panelReset(.asserted);
     mdelay(4);
-    sheng_gpio_set(GPIO_PANEL_RESET, true);
-    mdelay(16);
+    panelReset(.released);
+    mdelay(PANEL_RESET_SETTLE_MS);
 }
 
 /// cmd-db lookup then the vote. Returns -ENODEV when the resource is
@@ -4919,11 +5045,11 @@ export fn sheng_mdss_bringup(splash_live: c_int, fb: *ShengFb) callconv(.c) c_in
 
     sheng_mdss_dsi_reset_both_phys(DSI0, DSI1);
 
-    ret = sheng_mdss_dsi_phy_init(DSI0_PHY, true);
+    ret = sheng_mdss_dsi_phy_init(DSI0_PHY, .master);
     shengStage(STATUS_DSI0_PHY, ret);
     if (ret != 0) return ret;
 
-    ret = sheng_mdss_dsi_phy_init(DSI1_PHY, false);
+    ret = sheng_mdss_dsi_phy_init(DSI1_PHY, .slave);
     shengStage(STATUS_DSI1_PHY, ret);
     if (ret != 0) return ret;
 
@@ -4959,21 +5085,19 @@ export fn sheng_mdss_bringup(splash_live: c_int, fb: *ShengFb) callconv(.c) c_in
         sheng_mdss_dsi_panel_sleep(DSI0, DSI1, DSI_DMA_SCRATCH);
         shengTmark("host+abl sleep");
 
-        sheng_gpio_set(GPIO_PANEL_RESET, false);
-        sheng_gpio_set(GPIO_PANEL_AVEE, false);
-        sheng_gpio_set(GPIO_PANEL_AVDD, false);
+        sheng_mdss_panel_power_off();
         _ = sheng_ktz8866_set_bias(0);
 
         // The rails need an off window long enough to discharge, or the
         // DDIC keeps its state across the power cycle. A panel killed
         // mid-scan needs the long one.
-        mdelay(1080);
+        mdelay(PANEL_RAIL_DISCHARGE_MS);
     }
 
     panelPowerAndReset();
     shengTmark("panel pwr cycle");
 
-    ret = sheng_mdss_dsi_panel_init(DSI0, DSI1, DSI_DMA_SCRATCH, true);
+    ret = sheng_mdss_dsi_panel_init(DSI0, DSI1, DSI_DMA_SCRATCH, .enabled);
     shengTmark("panel DCS init");
     g_diag.panel_init_ret = ret;
     if (g_diag.panel_init_ret_first == 0x7fffffff) g_diag.panel_init_ret_first = ret;
@@ -4985,13 +5109,7 @@ export fn sheng_mdss_bringup(splash_live: c_int, fb: *ShengFb) callconv(.c) c_in
     fillFramebuffer();
     shengTmark("fb clear");
 
-    ret = sheng_mdss_dpu_start(
-        DPU, DSI0, DSI1, FB_ADDR,
-        PANEL_HACTIVE, PANEL_VACTIVE,
-        PANEL_HFRONT_PORCH, PANEL_HBACK_PORCH, PANEL_HSYNC_WIDTH,
-        PANEL_VFRONT_PORCH, PANEL_VBACK_PORCH, PANEL_VSYNC_WIDTH,
-        true,
-    );
+    ret = sheng_mdss_dpu_start(DPU, DSI0, DSI1, FB_ADDR, &PANEL_TIMING_144HZ, .enabled);
     shengTmark("dpu start");
 
     const intf1 = DPU + DPU_INTF1_OFFSET;

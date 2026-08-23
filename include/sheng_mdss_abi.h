@@ -84,14 +84,116 @@ static_assert(offsetof(struct sheng_diag_state, status0) == 36,
 static_assert(sizeof(struct sheng_fb) == 32,
 	      "ShengFb/sheng_fb size drift -- update sheng_mdss_hw.zig's comptime block");
 
-/* A stage or sample that never ran. Matches NEVER_RAN in the Zig and
- * SHENG_MDSS_STATUS_NOT_REACHED in sheng_mdss_debug.h. */
-#define SHENG_NEVER_RAN 0x7fffffff
+/* A stage or sample that never ran. Matches NEVER_RAN in the Zig. */
+#define SHENG_MDSS_STATUS_NOT_REACHED 0x7fffffff
+
+/*
+ * Bring-up stages, one status slot each. There must be a slot for EVERY
+ * early return in sheng_mdss_probe(): any of them aborts before the
+ * framebuffer handoff, and the backlight still comes up in
+ * board_late_init(), so the board shows backlight and no picture with no
+ * other clue as to why.
+ */
+enum {
+	SHENG_MDSS_STATUS_MDSS_RESET,
+	SHENG_MDSS_STATUS_GDSC,
+	SHENG_MDSS_STATUS_BCM_MM0,
+	SHENG_MDSS_STATUS_DISPCC,
+	SHENG_MDSS_STATUS_DSI0_PHY,
+	SHENG_MDSS_STATUS_DSI1_PHY,
+	SHENG_MDSS_STATUS_DSI_PHY_START,
+	SHENG_MDSS_STATUS_DSI_LINK_CLKS,
+	SHENG_MDSS_STATUS_DSI_PANEL,
+	SHENG_MDSS_STATUS_DPU,
+	SHENG_MDSS_STATUS_PROBE,
+	SHENG_MDSS_STATUS_COUNT,
+};
+
+#define SHENG_MDSS_LOG_MAX 64
+
+/*
+ * THE POST-MORTEM BREADCRUMB REGION, as one layout.
+ *
+ * These slots sit in the no-map area CONFIG_PRE_CON_BUF_ADDR reserves,
+ * past U-Boot's own pre-console buffer, and are relayed into /chosen by
+ * ft_board_setup() because the board has no reachable UART and Linux
+ * cannot read the region directly (/dev/mem gives EFAULT).
+ *
+ * The offsets used to be bare hex -- 0x3000, 0x3040, 0x3100, 0x3400 --
+ * spread across three .c files and kept from overlapping by comments
+ * ("Sits clear of the log ring, which ends at 0x3304"). ft_board_setup()
+ * also hardcoded the stage array's relay length as `11 * 4` under a
+ * comment saying it MUST track SHENG_MDSS_STATUS_COUNT.
+ *
+ * As a struct, the compiler enforces both: the padding members below fail
+ * to compile if any section grows into the next, and every relay length
+ * is a sizeof().
+ */
+struct sheng_blackbox {
+	/* +0x000: one status code per bring-up stage. SHENG_MDSS_STATUS_*
+	 * order; SHENG_MDSS_STATUS_NOT_REACHED, 0, or -errno. */
+	s32 stage[SHENG_MDSS_STATUS_COUNT];
+	u8 __pad_stage[0x040 - SHENG_MDSS_STATUS_COUNT * 4];
+
+	/* +0x040: uclass_get_device(UCLASS_VIDEO) result, so "no video
+	 * device bound" is distinguishable from "bound, probe failed". */
+	s32 uclass_get_device_ret;
+	u8 __pad_uclass[0x100 - 0x044];
+
+	/* +0x100: (tag, value) log ring, written only by
+	 * sheng_mdss_debug.c. Zeros without that build. */
+	struct {
+		u32 count;
+		struct {
+			u32 tag;
+			u32 value;
+		} entry[SHENG_MDSS_LOG_MAX];
+	} log;
+	u8 __pad_log[0x400 - 0x100 - 4 - SHENG_MDSS_LOG_MAX * 8];
+
+	/* +0x400: per-chip KTZ8866 init status, [chip_a, chip_b], same
+	 * convention as stage[]. */
+	s32 ktz8866[2];
+	u8 __pad_ktz[0x010 - 2 * 4];
+
+	/* +0x410: KTZ8866 OUTP_CFG/OUTN_CFG as found before our writes,
+	 * packed (OUTP << 8) | OUTN. 0x1e1c means ABL's bias config
+	 * survived and our writes are a no-op. */
+	u32 ktz8866_outcfg;
+};
+
+/* The region begins 0x3000 into the pre-console reservation: U-Boot's own
+ * pre-console buffer occupies the start of it. All offsets in the struct
+ * above are relative to THIS base. */
+#define SHENG_BLACKBOX_OFFSET	0x3000
+#define SHENG_BLACKBOX							\
+	((volatile struct sheng_blackbox *)(uintptr_t)			\
+	 (CONFIG_PRE_CON_BUF_ADDR + SHENG_BLACKBOX_OFFSET))
+
+/* Pin the layout the post-mortem scrapers and every previous boot's
+ * captured data expect. */
+static_assert(offsetof(struct sheng_blackbox, uclass_get_device_ret) == 0x040,
+	      "blackbox map drifted at uclass_get_device_ret");
+static_assert(offsetof(struct sheng_blackbox, log) == 0x100,
+	      "blackbox map drifted at log ring");
+static_assert(offsetof(struct sheng_blackbox, ktz8866) == 0x400,
+	      "blackbox map drifted at ktz8866 status");
+static_assert(offsetof(struct sheng_blackbox, ktz8866_outcfg) == 0x410,
+	      "blackbox map drifted at ktz8866_outcfg");
 
 /* --- Implemented in sheng_mdss_hw.zig ------------------------------- */
 
-void sheng_gpio_set(unsigned int gpio, bool high);
 u32 sheng_gpio_read(unsigned int gpio);
+
+/* Panel reset is ACTIVE LOW and the backlight EN pin gates the KTZ8866's
+ * AVDD/AVEE rather than just its LED sinks. Both used to be driven
+ * through a shared sheng_gpio_set(pin, bool), where `false` meant "rail
+ * off" for one pin and "reset ASSERTED" for another -- same function,
+ * opposite senses, no type-level distinction. These name the operation
+ * instead, and there is deliberately no way to drive backlight EN low:
+ * doing so after the video probe kills the DDIC. */
+void sheng_mdss_panel_power_off(void);
+void sheng_backlight_enable(void);
 
 int sheng_mdss_bringup(int splash_live, struct sheng_fb *fb);
 void sheng_mdss_intf_stop(unsigned long dpu_base);

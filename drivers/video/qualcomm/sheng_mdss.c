@@ -50,19 +50,17 @@ DECLARE_GLOBAL_DATA_PTR;
  * a hang on the next instruction would otherwise leave it in a dirty
  * cache line that a post-mortem scrape never sees.
  */
-#define SHENG_MDSS_STATUS_ADDR	(CONFIG_PRE_CON_BUF_ADDR + 0x3000)
-
 void sheng_mdss_stage_record(unsigned int stage, int ret)
 {
-	volatile int *slots = (volatile int *)(uintptr_t)SHENG_MDSS_STATUS_ADDR;
+	volatile struct sheng_blackbox *bb = SHENG_BLACKBOX;
 
 	if (!IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
 		return;
+	if (stage >= SHENG_MDSS_STATUS_COUNT)
+		return;
 
-	slots[stage] = ret;
-	flush_dcache_range(SHENG_MDSS_STATUS_ADDR + stage * sizeof(*slots),
-			   SHENG_MDSS_STATUS_ADDR + (stage + 1) * sizeof(*slots));
-	dsb();
+	sheng_breadcrumb_u32((unsigned long)(uintptr_t)&bb->stage[stage],
+			     (u32)ret);
 }
 
 void sheng_mdss_stage_init(void)
@@ -202,12 +200,10 @@ void sheng_mdss_teardown(void)
 				  SM8550_DISPCC_BASE);
 
 	/* 3. Panel to cold-boot state: reset asserted, bias rails dropped.
-	 * The inverse of sheng_mdss_panel_power_and_reset(), so Linux's
-	 * nt36532e_prepare() finds a genuinely unpowered panel and re-runs
-	 * its own init instead of assuming one already on. */
-	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, false); /* physical LOW = asserted */
-	sheng_gpio_set(TLMM_PANEL_AVEE_GPIO, false);
-	sheng_gpio_set(TLMM_PANEL_AVDD_GPIO, false);
+	 * One call rather than three GPIO writes, so this path never states
+	 * a polarity -- panel reset is active low and it used to say so in a
+	 * comment next to a `false` that meant "asserted". */
+	sheng_mdss_panel_power_off();
 }
 
 static int sheng_mdss_probe(struct udevice *dev)

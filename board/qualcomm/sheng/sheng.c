@@ -44,16 +44,20 @@ DECLARE_GLOBAL_DATA_PTR;
 static unsigned long sheng_backlight_us;
 
 #define SHENG_KTZ8866_BRIGHTNESS		1500u
-#define SHENG_KTZ8866_STATUS_ADDR	(CONFIG_PRE_CON_BUF_ADDR + 0x3400)
-#define SHENG_KTZ8866_STATUS_NOT_REACHED	0x7fffffff
 
-/* GPIO 128 is EN on both KTZ8866s. On this chip EN gates the I2C
- * interface itself, not just the LED sinks, so writes issued before it is
- * high either NAK or land on a chip still in reset. */
+/* Read-only handover sampling only -- driving these goes through the
+ * named helpers in <sheng_mdss_abi.h>. GPIO 128 is EN on both KTZ8866s;
+ * on this chip EN gates the I2C interface itself, not just the LED sinks,
+ * so writes issued before it is high either NAK or land on a chip still
+ * in reset. */
 #define SHENG_BACKLIGHT_GPIO		128
 #define SHENG_PANEL_AVDD_GPIO		30
 #define SHENG_PANEL_AVEE_GPIO		31
 #define SHENG_PANEL_RESET_GPIO		133
+
+/* EN-to-I2C-ready. Generous: the DT's kinetic,led-enable-ramp-delay-ms
+ * bounds the LED current ramp, not I2C readiness. */
+#define SHENG_KTZ8866_EN_TO_I2C_MS	2
 
 /* Display state as ABL left it, sampled at board_init() before anything
  * of ours touches it. bit0 is the pin level, bit1 the driven value.
@@ -182,7 +186,9 @@ void sheng_breadcrumb_u32(unsigned long addr, u32 value)
 
 static void sheng_ktz8866_status_set(unsigned int slot, int ret)
 {
-	sheng_breadcrumb_u32(SHENG_KTZ8866_STATUS_ADDR + slot * sizeof(u32),
+	volatile struct sheng_blackbox *bb = SHENG_BLACKBOX;
+
+	sheng_breadcrumb_u32((unsigned long)(uintptr_t)&bb->ktz8866[slot],
 			     (u32)ret);
 }
 
@@ -245,7 +251,8 @@ static int sheng_ktz8866_write_chip(const char *path)
 			pre_outp = 0xff;
 		if (dm_i2c_read(chip, 0x0e, &pre_outn, 1))
 			pre_outn = 0xff;
-		sheng_breadcrumb_u32(SHENG_KTZ8866_STATUS_ADDR + 0x10,
+		sheng_breadcrumb_u32((unsigned long)(uintptr_t)
+				     &SHENG_BLACKBOX->ktz8866_outcfg,
 				     ((u32)pre_outp << 8) | (u32)pre_outn);
 	}
 
@@ -422,15 +429,15 @@ static void sheng_ktz8866_backlight_init(void)
 	    sheng_handover_blregs != 0xffffffff &&
 	    ((sheng_handover_blregs >> 24) & 0x40) &&
 	    (sheng_handover_blregs & 0x80)) {
-		sheng_gpio_set(SHENG_BACKLIGHT_GPIO, true);
+		sheng_backlight_enable();
 		ret = sheng_ktz8866_set_brightness("/soc@0/geniqup@ac0000/i2c@a84000");
 		sheng_ktz8866_status_set(0, ret);
 		ret = sheng_ktz8866_set_brightness("/soc@0/geniqup@9c0000/i2c@988000");
 		sheng_ktz8866_status_set(1, ret);
 		return;
 	}
-	sheng_ktz8866_status_set(0, SHENG_KTZ8866_STATUS_NOT_REACHED);
-	sheng_ktz8866_status_set(1, SHENG_KTZ8866_STATUS_NOT_REACHED);
+	sheng_ktz8866_status_set(0, SHENG_MDSS_STATUS_NOT_REACHED);
+	sheng_ktz8866_status_set(1, SHENG_MDSS_STATUS_NOT_REACHED);
 
 	/* EN must be high before either chip will ACK on I2C. 2ms is
 	 * generous for EN-to-I2C-ready; the DT's
@@ -442,8 +449,8 @@ static void sheng_ktz8866_backlight_init(void)
 	 * scanning out, so dropping EN removes its AVDD/AVEE and kills the
 	 * DDIC. Everything drawn afterwards, the startup log included, goes
 	 * to a dead panel. */
-	sheng_gpio_set(SHENG_BACKLIGHT_GPIO, true);
-	mdelay(2);
+	sheng_backlight_enable();
+	mdelay(SHENG_KTZ8866_EN_TO_I2C_MS);
 
 	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@ac0000/i2c@a84000");
 	sheng_ktz8866_status_set(0, ret);
@@ -810,38 +817,42 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	 * Linux under /proc/device-tree/chosen/. There is no console during
 	 * probe, so this is the only way the results get out.
 	 *
-	 * mdss-status is 11 stages x 4 bytes, in SHENG_MDSS_STATUS_* order.
-	 * The length MUST track SHENG_MDSS_STATUS_COUNT. Each slot is
-	 * 0x7fffffff for a stage never reached, 0 on success, or -errno.
+	 * mdss-status is one 4-byte slot per stage, in SHENG_MDSS_STATUS_*
+	 * order. Each slot is SHENG_MDSS_STATUS_NOT_REACHED for a stage
+	 * never reached, 0 on success, or -errno.
 	 *
 	 * The last slot is the probe result. Anything but 0 there means an
 	 * early return and therefore backlight with no picture; the first
 	 * non-zero slot before it names the stage that failed.
+	 *
+	 * Every length below is a sizeof() over struct sheng_blackbox, so
+	 * adding a stage or a log entry cannot leave a relay truncated. The
+	 * stage count in particular used to be a literal `11 * 4` under a
+	 * comment saying it must track SHENG_MDSS_STATUS_COUNT.
 	 */
 	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS) && IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
+		volatile struct sheng_blackbox *bb = SHENG_BLACKBOX;
 		int nodeoff = fdt_path_offset(blob, "/chosen");
 
 		if (nodeoff >= 0) {
 			fdt_setprop(blob, nodeoff, "sheng,mdss-status",
-				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3000),
-				    11 * 4);
+				    (void *)(uintptr_t)bb->stage,
+				    sizeof(bb->stage));
 			fdt_setprop(blob, nodeoff, "sheng,uclass-get-device-ret",
-				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3040),
-				    4);
-			/* Log ring: a u32 count then up to 64 (tag, value)
-			 * pairs. Only sheng_mdss_debug.c writes it, so
-			 * without that build it is 516 bytes of zeros in
-			 * the device tree. */
+				    (void *)(uintptr_t)&bb->uclass_get_device_ret,
+				    sizeof(bb->uclass_get_device_ret));
+			/* Log ring: a u32 count then up to SHENG_MDSS_LOG_MAX
+			 * (tag, value) pairs. Only sheng_mdss_debug.c writes
+			 * it, so without that build it is zeros. */
 			if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS_DEBUG))
 				fdt_setprop(blob, nodeoff, "sheng,mdss-log",
-					    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3100),
-					    4 + 64 * 8);
+					    (void *)(uintptr_t)&bb->log,
+					    sizeof(bb->log));
 			/* Per-chip KTZ8866 status, [chip_a, chip_b], same
-			 * convention as mdss-status. Sits clear of the log
-			 * ring, which ends at 0x3304. */
+			 * convention as mdss-status. */
 			fdt_setprop(blob, nodeoff, "sheng,ktz8866-status",
-				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3400),
-				    8);
+				    (void *)(uintptr_t)bb->ktz8866,
+				    sizeof(bb->ktz8866));
 
 			/* Boot timing, as a plain string. The same block is
 			 * printed to the panel during probe, but that is
@@ -952,11 +963,12 @@ void qcom_late_init(void)
 		int vret;
 
 		vret = uclass_get_device(UCLASS_VIDEO, 0, &vdev);
-		/* Clear of the stage array at 0x3000, which is 11 slots and
-		 * runs to 0x302b. Populated even when probe() is never
-		 * entered, so "no video device bound" (-ENODEV) is
-		 * distinguishable from "bound, probe failed". */
-		sheng_breadcrumb_u32(CONFIG_PRE_CON_BUF_ADDR + 0x3040, (u32)vret);
+		/* Populated even when probe() is never entered, so "no video
+		 * device bound" (-ENODEV) is distinguishable from "bound,
+		 * probe failed". */
+		sheng_breadcrumb_u32((unsigned long)(uintptr_t)
+				     &SHENG_BLACKBOX->uclass_get_device_ret,
+				     (u32)vret);
 	}
 
 	log_debug("sheng: late_init done at %lu ms\n", timer_get_us() / 1000);

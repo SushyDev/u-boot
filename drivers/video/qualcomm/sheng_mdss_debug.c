@@ -26,11 +26,6 @@ DECLARE_GLOBAL_DATA_PTR;
 #include "sheng_mdss_debug.h"
 #include "sheng_mdss_regs.h"
 
-/* The log ring. The stage slots live at +0x3000 and are written from
- * sheng_mdss.c; keep clear of them. */
-#define SHENG_MDSS_LOG_ADDR		(CONFIG_PRE_CON_BUF_ADDR + 0x3100)
-#define SHENG_MDSS_LOG_MAX		64
-
 /* Must match BB_BASE / BB_HDR + BB_CAP in sheng_mdss_hw.zig. */
 #define SHENG_BB_BASE			0xa5000000
 #define SHENG_BB_SIZE			(16 + 512 * 1024)
@@ -47,18 +42,21 @@ static void breadcrumb_flush(uintptr_t addr, size_t len)
 
 void sheng_mdss_debug_log(unsigned int tag, unsigned int value)
 {
-	volatile u32 *count = (volatile u32 *)(uintptr_t)SHENG_MDSS_LOG_ADDR;
-	volatile u32 *entries = (volatile u32 *)(uintptr_t)(SHENG_MDSS_LOG_ADDR + 4);
+	volatile struct sheng_blackbox *bb = SHENG_BLACKBOX;
+	u32 n;
 
 	if (!IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
 		return;
-	if (*count >= SHENG_MDSS_LOG_MAX)
+
+	n = bb->log.count;
+	if (n >= SHENG_MDSS_LOG_MAX)
 		return;
 
-	entries[*count * 2] = tag;
-	entries[*count * 2 + 1] = value;
-	(*count)++;
-	breadcrumb_flush(SHENG_MDSS_LOG_ADDR, 4 + (*count) * 8);
+	bb->log.entry[n].tag = tag;
+	bb->log.entry[n].value = value;
+	bb->log.count = n + 1;
+	breadcrumb_flush((uintptr_t)&bb->log,
+			 sizeof(bb->log.count) + (n + 1) * sizeof(bb->log.entry[0]));
 }
 
 /* CFG in the high half, IN_OUT in the low half. In IN_OUT, bit 0 is the

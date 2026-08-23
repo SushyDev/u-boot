@@ -27,6 +27,7 @@
 #define __SHENG_MDSS_DEBUG_H
 
 #include <linux/kconfig.h>
+#include <sheng_mdss_abi.h>
 
 /* Tags for the (tag, value) log ring. Values recorded from inside
  * load-bearing code -- cmd-db lookups, RSC ids, register readbacks. */
@@ -53,33 +54,6 @@ enum {
 	SHENG_LOG_WRAPPER_WRITE_READBACK,
 };
 
-/* A stage that never ran. */
-#define SHENG_MDSS_STATUS_NOT_REACHED	0x7fffffff
-
-/*
- * Bring-up stages, one status slot each. There must be a slot for EVERY
- * early return in sheng_mdss_probe(): any of them aborts before the
- * framebuffer handoff, and the backlight still comes up in
- * board_late_init(), so the board shows backlight and no picture with
- * no other clue as to why.
- *
- * ft_board_setup() relays these into /chosen, so its length must track
- * SHENG_MDSS_STATUS_COUNT.
- */
-enum {
-	SHENG_MDSS_STATUS_MDSS_RESET,
-	SHENG_MDSS_STATUS_GDSC,
-	SHENG_MDSS_STATUS_BCM_MM0,
-	SHENG_MDSS_STATUS_DISPCC,
-	SHENG_MDSS_STATUS_DSI0_PHY,
-	SHENG_MDSS_STATUS_DSI1_PHY,
-	SHENG_MDSS_STATUS_DSI_PHY_START,
-	SHENG_MDSS_STATUS_DSI_LINK_CLKS,
-	SHENG_MDSS_STATUS_DSI_PANEL,
-	SHENG_MDSS_STATUS_DPU,
-	SHENG_MDSS_STATUS_PROBE,
-	SHENG_MDSS_STATUS_COUNT,
-};
 
 /*
  * The stage relay is NOT part of the debug rig. It is nine DRAM writes
