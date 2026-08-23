@@ -24,6 +24,11 @@ config SYS_MALLOC_LEN
 	default 0x800000
 
 config LNX_KRNL_IMG_TEXT_OFFSET_BASE
+	# TEXT_OFFSET = CONFIG_TEXT_BASE - this value, which is bogus for
+	# position-independent builds where CONFIG_TEXT_BASE=0x0 (produces
+	# an invalid Image header TEXT_OFFSET, rejected by spec-compliant
+	# loaders such as kexec_file_load).
+	default 0x0 if POSITION_INDEPENDENT
 	default 0x80000000
 
 config SYS_BOARD

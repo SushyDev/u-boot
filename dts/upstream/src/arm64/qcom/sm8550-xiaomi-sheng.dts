@@ -1,0 +1,784 @@
+// SPDX-License-Identifier: GPL-2.0-only OR BSD-3-Clause
+/*
+ * Copyright (c) 2024, map220v <map220v300@gmail.com>
+ *
+ * U-Boot board port for the Xiaomi Pad 6S Pro 12.4 (sheng), trimmed down
+ * from the sm8550-mainline downstream Linux DTS (arch/arm64/boot/dts/qcom/
+ * sm8550-xiaomi-sheng.dts) to the subset U-Boot needs: power sequencing and
+ * UFS to reach /boot/extlinux/extlinux.conf. Camera, audio, touchscreen,
+ * fingerprint, hall sensor, Wi-Fi/BT, PCIe, and display are all dropped --
+ * U-Boot has no drivers for them, and probing them only adds ways to hang
+ * before a console is up.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include "sm8550.dtsi"
+#include "pm8010.dtsi"
+#include "pm8550.dtsi"
+#include "pm8550b.dtsi"
+#define PMK8550VE_SID 5
+#include "pm8550ve.dtsi"
+#include "pm8550vs.dtsi"
+#include "pmk8550.dtsi"
+
+/*
+ * Delete upstream (sm8550.dtsi) reserved-memory placeholders that this
+ * board redefines below with real addresses/sizes.
+ */
+/delete-node/ &rmtfs_mem;
+/delete-node/ &adspslpi_mem;
+/delete-node/ &xbl_dt_log_merged_mem;
+/delete-node/ &hwfence_shbuf;
+
+/*
+ * Free unused hypervisor/VM regions -- these don't exist on this SM8550P
+ * variant and aren't removed from the DDR memory map by UEFI/ABL, so they'd
+ * otherwise sit around as unusable holes.
+ */
+/delete-node/ &hyp_tags_reserved_mem;
+/delete-node/ &cdsp_secure_heap_mem;
+/delete-node/ &trust_ui_vm_mem;
+/delete-node/ &trust_ui_vm_dump;
+/delete-node/ &trust_ui_vm_qrtr;
+/delete-node/ &trust_ui_vm_vblk0_ring;
+/delete-node/ &trust_ui_vm_vblk1_ring;
+/delete-node/ &trust_ui_vm_swiotlb;
+/delete-node/ &oem_vm_vblk0_ring;
+/delete-node/ &oem_vm_swiotlb;
+/delete-node/ &oem_vm_mem;
+/delete-node/ &hyp_ext_tags_mem;
+/delete-node/ &hyp_ext_reserved_mem;
+
+/*
+ * Carveouts that lie OUTSIDE this board's actual DRAM banks.
+ *
+ * lmb tries to reserve every reserved-memory region at boot, and each of
+ * these fails with -22 because the address is not inside any bank in
+ * memory@a0000000 above, printing
+ *
+ *     ERROR: reserving fdt memory region failed (addr=... flags=2): -22
+ *
+ * on every boot. The reservations achieve nothing either way -- deleting
+ * the nodes is behaviourally identical to leaving them to fail -- so
+ * this is purely removing noise. Same reasoning as the hypervisor/VM
+ * regions deleted above.
+ *
+ * Note these became VISIBLE only once the display came up early enough
+ * to show U-Boot's own startup log; they have presumably always failed.
+ */
+/delete-node/ &hyp_tags_mem;
+/delete-node/ &xbl_sc_mem;
+/delete-node/ &tz_reserved_mem;
+/delete-node/ &qtee_mem;
+/delete-node/ &ta_mem;
+/delete-node/ &tz_tags_mem;
+
+/*
+ * cpucp-fw-region@d8140000 is 0x1c0000, but this board's DRAM bank at
+ * that address is only 0x20000 -- the region runs off the end of it, so
+ * the reservation fails the same way.
+ */
+/delete-node/ &cpucp_fw_mem;
+
+/* SM8550P doesn't have a Modem DSP -- no modem firmware region needed. */
+/delete-node/ &mpss_dsm_mem;
+/delete-node/ &mpss_mem;
+/delete-node/ &q6_mpss_dtb_mem;
+/delete-node/ &remoteproc_mpss;
+
+/ {
+	model = "Xiaomi Pad 6S Pro 12.4";
+	compatible = "xiaomi,sheng", "qcom,sm8550";
+	chassis-type = "tablet";
+
+	/* required for bootloader to select correct board */
+	qcom,msm-id = <536 0x20000>; /* SM8550P v2.0 */
+	qcom,board-id = <0x10008 0>;
+
+	aliases {
+		serial0 = &uart7;
+		i2c1 = &i2c1;
+	};
+
+	/*
+	 * Real DRAM layout for this device, pulled from
+	 * /proc/device-tree/memory@a0000000/reg on a live, booted system:
+	 * 7 fragmented banks (an 8th, 0xd8800000 size 0, is a degenerate
+	 * zero-size artifact and is dropped). Gives qcom_parse_memory() a
+	 * valid internal DTB instead of depending on ABL handing off a
+	 * usable FDT pointer in x0. Must be named exactly memory@a0000000
+	 * to override sm8550.dtsi's placeholder rather than create a second,
+	 * separate node.
+	 */
+	memory@a0000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x00e00000>,
+		      <0x0 0x811d0000 0x0 0x56e30000>,
+		      <0x0 0xd8140000 0x0 0x00020000>,
+		      <0x0 0xe7cb0000 0x0 0x18350000>,
+		      <0x8 0x80000000 0x0 0x3b300000>,
+		      <0x8 0xbb500000 0x0 0x01e00000>,
+		      <0x8 0xc0000000 0x1 0x40000000>;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* Points U-Boot's console at serial0 (= &uart7, the GENI debug
+		 * UART). Without this the serial driver may bind but nothing is
+		 * selected as stdout, so the board stays silent. */
+		stdout-path = "serial0:115200n8";
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		pinctrl-0 = <&volume_up_n>;
+		pinctrl-names = "default";
+
+		key-volume-up {
+			label = "Volume Up";
+			/* U-Boot only: KEY_UP so this moves the boot menu
+			 * highlight up. button_kbd passes linux,code straight
+			 * through to the input layer, and KEY_VOLUMEUP maps to
+			 * nothing a menu can consume; KEY_UP becomes the ANSI
+			 * sequence "\e[A" (input.c's ansi_kbd table), which
+			 * cli_ch_esc() converts to CTL_CH('p') and
+			 * bootmenu_conv_key() turns into BKEY_UP.
+			 *
+			 * Linux is unaffected -- it loads its own DTB from
+			 * /boot rather than the one appended to U-Boot, so this
+			 * is still an ordinary volume-up key there. */
+			linux,code = <KEY_UP>;
+			gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
+			debounce-interval = <15>;
+			linux,can-disable;
+			wakeup-source;
+		};
+	};
+
+	backlight-gpio {
+		compatible = "gpio-backlight";
+		enable-gpios = <&tlmm 128 GPIO_ACTIVE_HIGH>;
+		default-on;
+	};
+
+	vph_pwr: vph-pwr-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vph_pwr";
+		regulator-min-microvolt = <3700000>;
+		regulator-max-microvolt = <3700000>;
+
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	framebuffer {
+		compatible = "simple-framebuffer";
+		reg = <0x0 0xfb800000 0x0 0x18000000>;
+		width = <3048>;
+		height = <2032>;
+		stride = <12288>;
+		format = "a8r8g8b8";
+		status = "okay";
+	};
+
+	reserved-memory {
+		/* REMOVED: framebuffer-region@fb800000.
+		 *
+		 * 402MB at an address that appears nowhere in the stock DTB,
+		 * and it overruns the end of its DRAM bank, so lmb refused it
+		 * (-22) and printed an error every boot. The REAL splash
+		 * framebuffer is splash_region below, 0xb8000000, measured off
+		 * ABL's live VIG0 pipe. Deleting a reservation that always
+		 * failed is behaviourally identical to leaving it. */
+
+		/* ABL's continuous-splash framebuffer. THE GAP FIX.
+		 *
+		 * With this node present ABL stops blanking the panel ~2s before
+		 * handover and hands over a LIVE, STREAMING display, so the
+		 * Xiaomi logo runs straight into U-Boot's console with no black
+		 * gap. sheng_mdss_probe() then INHERITS that pipeline instead of
+		 * rebuilding it, and board_preboot_os() stops the INTF timing
+		 * engines before the usual teardown so Linux still receives a
+		 * quiescent MDSS. All three parts are required together.
+		 *
+		 * THE NODE NAME IS THE MECHANISM: exactly "splash_region", NO
+		 * unit address. ABL looks it up by path -- its LinuxLoader
+		 * carries the literal string "/reserved-memory/splash_region"
+		 * next to "ERROR: Could not find the splash reg property". An
+		 * earlier attempt used splash_region@b8000000, never matched, and
+		 * was wrongly recorded as disproving the idea. The dtc label and
+		 * __symbols__ were never involved -- and chasing them broke
+		 * rendering via CONFIG_OF_LIBFDT_OVERLAY, which must stay off
+		 * (see the defconfig).
+		 *
+		 * reg copied from the stock DTB (dtbo.img entry 0, fragment@49),
+		 * which has no unit address either. dtc warns that a node with
+		 * reg has no unit address; that warning is correct to ignore, and
+		 * adding one breaks the lookup.
+		 */
+		splash_region {
+			label = "cont_splash_region";
+			reg = <0x0 0xb8000000 0x0 0x2b00000>;
+			no-map;
+		};
+
+		/* NB framebuffer-region@fb800000 above matches nothing in the
+		 * stock DTB and its 402MB size is implausible. Probably wrong,
+		 * but removing it is a separate change. */
+
+		xbl_ramdump_mem: xbl-ramdump-region@81200000 {
+			reg = <0 0x81200000 0 0x280000>;
+			no-map;
+		};
+
+		xbl_dt_log_mem: xbl-dt-log-region@81a00000 {
+			reg = <0 0x81a00000 0 0x40000>;
+			no-map;
+		};
+
+		aop_image_mem: aop-image-region@81c00000 {
+			reg = <0 0x81c00000 0 0x60000>;
+			no-map;
+		};
+
+		adspslpi_mem: adspslpi-region@9ea00000 {
+			reg = <0 0x9ea00000 0 0x4680000>;
+			no-map;
+		};
+
+		rmtfs_mem: rmtfs-region@ccd00000 {
+			compatible = "qcom,rmtfs-mem";
+			reg = <0x0 0xccd00000 0x0 0x280000>;
+			no-map;
+
+			qcom,client-id = <1>;
+			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>;
+		};
+
+		/* REMOVED: hwfence-shbuf-region@e6440000.
+		 *
+		 * Deleted from sm8550.dtsi at the top of this file and then
+		 * redefined here, at an address outside every bank in
+		 * memory@a0000000 -- so lmb refused it (-22) and printed an
+		 * error on every boot. Nothing in U-Boot uses hardware fences.
+		 */
+
+		llcc_lpi_mem: llcc-lpi-region@ff800000 {
+			reg = <0 0xff800000 0 0x600000>;
+			no-map;
+		};
+	};
+};
+
+&apps_rsc {
+	regulators-0 {
+		compatible = "qcom,pm8550-rpmh-regulators";
+		qcom,pmic-id = "b";
+
+		vdd-bob1-supply = <&vph_pwr>;
+		vdd-bob2-supply = <&vph_pwr>;
+		vdd-l1-l4-l10-supply = <&vreg_s6g_1p8>;
+		vdd-l2-l13-l14-supply = <&vreg_bob1>;
+		vdd-l3-supply = <&vreg_s4g_1p3>;
+		vdd-l5-l16-supply = <&vreg_bob1>;
+		vdd-l6-l7-supply = <&vreg_bob1>;
+		vdd-l8-l9-supply = <&vreg_bob1>;
+		vdd-l11-supply = <&vreg_s4g_1p3>;
+		vdd-l12-supply = <&vreg_s6g_1p8>;
+		vdd-l15-supply = <&vreg_s6g_1p8>;
+		vdd-l17-supply = <&vreg_bob2>;
+
+		vreg_bob1: bob1 {
+			regulator-name = "vreg_bob1";
+			regulator-min-microvolt = <3296000>;
+			regulator-max-microvolt = <3960000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_bob2: bob2 {
+			regulator-name = "vreg_bob2";
+			regulator-min-microvolt = <2704000>;
+			regulator-max-microvolt = <3296000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l1b_1p8: ldo1 {
+			regulator-name = "vreg_l1b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l2b_3p0: ldo2 {
+			regulator-name = "vreg_l2b_3p0";
+			regulator-min-microvolt = <3008000>;
+			regulator-max-microvolt = <3008000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l4b_1p8: ldo4 {
+			regulator-name = "vreg_l4b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l5b_3p1: ldo5 {
+			regulator-name = "vreg_l5b_3p1";
+			regulator-min-microvolt = <3104000>;
+			regulator-max-microvolt = <3104000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l10b_1p8: ldo10 {
+			regulator-name = "vreg_l10b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l11b_1p2: ldo11 {
+			regulator-name = "vreg_l11b_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1504000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l12b_1p8: ldo12 {
+			regulator-name = "vreg_l12b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l15b_1p8: ldo15 {
+			regulator-name = "vreg_l15b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l16b_2p8: ldo16 {
+			regulator-name = "vreg_l16b_2p8";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l17b_2p5: ldo17 {
+			regulator-name = "vreg_l17b_2p5";
+			regulator-min-microvolt = <2504000>;
+			regulator-max-microvolt = <2504000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-1 {
+		compatible = "qcom,pm8550vs-rpmh-regulators";
+		qcom,pmic-id = "c";
+
+		vdd-l3-supply = <&vreg_s4e_0p9>;
+
+		vreg_l3c_0p91: ldo3 {
+			regulator-name = "vreg_l3c_0p9";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <912000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-2 {
+		compatible = "qcom,pm8550vs-rpmh-regulators";
+		qcom,pmic-id = "d";
+
+		vdd-l1-supply = <&vreg_s4e_0p9>;
+
+		vreg_l1d_0p88: ldo1 {
+			regulator-name = "vreg_l1d_0p88";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <920000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-3 {
+		compatible = "qcom,pm8550vs-rpmh-regulators";
+		qcom,pmic-id = "e";
+
+		vdd-l1-supply = <&vreg_s4e_0p9>;
+		vdd-l2-supply = <&vreg_s4e_0p9>;
+		vdd-l3-supply = <&vreg_s4g_1p3>;
+		vdd-s4-supply = <&vph_pwr>;
+		vdd-s5-supply = <&vph_pwr>;
+
+		vreg_s4e_0p9: smps4 {
+			regulator-name = "vreg_s4e_0p9";
+			regulator-min-microvolt = <904000>;
+			regulator-max-microvolt = <984000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_s5e_1p1: smps5 {
+			regulator-name = "vreg_s5e_1p1";
+			regulator-min-microvolt = <1080000>;
+			regulator-max-microvolt = <1120000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l1e_0p88: ldo1 {
+			regulator-name = "vreg_l1e_0p88";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <880000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l2e_0p9: ldo2 {
+			regulator-name = "vreg_l2e_0p9";
+			regulator-min-microvolt = <904000>;
+			regulator-max-microvolt = <970000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l3e_1p2: ldo3 {
+			regulator-name = "vreg_l3e_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-4 {
+		compatible = "qcom,pm8550ve-rpmh-regulators";
+		qcom,pmic-id = "f";
+
+		vdd-l1-supply = <&vreg_s4e_0p9>;
+		vdd-l2-supply = <&vreg_s4e_0p9>;
+		vdd-l3-supply = <&vreg_s4e_0p9>;
+		vdd-s4-supply = <&vph_pwr>;
+
+		vreg_s4f_0p5: smps4 {
+			regulator-name = "vreg_s4f_0p5";
+			regulator-min-microvolt = <500000>;
+			regulator-max-microvolt = <700000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l1f_0p9: ldo1 {
+			regulator-name = "vreg_l1f_0p9";
+			regulator-min-microvolt = <912000>;
+			regulator-max-microvolt = <912000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l2f_0p88: ldo2 {
+			regulator-name = "vreg_l2f_0p88";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <912000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l3f_0p91: ldo3 {
+			regulator-name = "vreg_l3f_0p91";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <912000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-5 {
+		compatible = "qcom,pm8550vs-rpmh-regulators";
+		qcom,pmic-id = "g";
+
+		vdd-l1-supply = <&vreg_s4g_1p3>;
+		vdd-l2-supply = <&vreg_s4g_1p3>;
+		vdd-l3-supply = <&vreg_s4g_1p3>;
+		vdd-s1-supply = <&vph_pwr>;
+		vdd-s2-supply = <&vph_pwr>;
+		vdd-s3-supply = <&vph_pwr>;
+		vdd-s4-supply = <&vph_pwr>;
+		vdd-s5-supply = <&vph_pwr>;
+		vdd-s6-supply = <&vph_pwr>;
+
+		vreg_s1g_1p2: smps1 {
+			regulator-name = "vreg_s1g_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1300000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_s2g_0p8: smps2 {
+			regulator-name = "vreg_s2g_0p8";
+			regulator-min-microvolt = <800000>;
+			regulator-max-microvolt = <1000000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_s3g_0p7: smps3 {
+			regulator-name = "vreg_s3g_0p7";
+			regulator-min-microvolt = <600000>;
+			regulator-max-microvolt = <1900000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_s4g_1p3: smps4 {
+			regulator-name = "vreg_s4g_1p3";
+			regulator-min-microvolt = <1256000>;
+			regulator-max-microvolt = <1408000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_s5g_0p8: smps5 {
+			regulator-name = "vreg_s5g_0p8";
+			regulator-min-microvolt = <500000>;
+			regulator-max-microvolt = <1004000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_s6g_1p8: smps6 {
+			regulator-name = "vreg_s6g_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <2000000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l1g_1p2: ldo1 {
+			regulator-name = "vreg_l1g_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l2g_1p2: ldo2 {
+			regulator-name = "vreg_l2g_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l3g_1p2: ldo3 {
+			regulator-name = "vreg_l3g_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+};
+
+/*
+ * sheng_mdss (drivers/video/qualcomm/) is a native U-Boot MDSS/DPU
+ * driver -- enable both nodes upstream leaves disabled by default
+ * (sm8550.dtsi has no U-Boot driver in mind, so neither is on unless
+ * a board explicitly needs it). sheng_mdss does raw MMIO throughout
+ * (GDSC/DISPCC/DSI-PHY/DPU registers) rather than going through
+ * U-Boot's clock framework, so dispcc doesn't strictly need to probe
+ * successfully for mdss's own probe to run -- enabled anyway since
+ * mdss's `clocks` property phandle-references it.
+ */
+&dispcc {
+	status = "okay";
+};
+
+&mdss {
+	status = "okay";
+};
+
+&pm8550_gpios {
+	volume_up_n: volume-up-n-state {
+		pins = "gpio6";
+		function = "normal";
+		power-source = <1>;
+		bias-pull-up;
+		input-enable;
+	};
+};
+
+&pm8550b_eusb2_repeater {
+	vdd18-supply = <&vreg_l15b_1p8>;
+	vdd3-supply = <&vreg_l5b_3p1>;
+};
+
+&pm8550vs_c {
+	status = "okay";
+};
+
+&pm8550vs_d {
+	status = "okay";
+};
+
+&pm8550vs_e {
+	status = "okay";
+};
+
+&pm8550vs_g {
+	status = "okay";
+};
+
+/*
+ * Boot menu navigation, U-Boot only. Linux loads its own DTB from /boot, so
+ * these three stay ordinary volume/power keys there.
+ *
+ *   Volume Up   -> KEY_UP     (see gpio-keys above)
+ *   Volume Down -> KEY_DOWN   this node; resin IS the volume-down line
+ *   Power       -> KEY_ENTER  select
+ *
+ * button_kbd passes linux,code straight through to the input layer, so the
+ * code has to be one U-Boot's menu can consume: KEY_UP/KEY_DOWN become the
+ * ANSI sequences "\e[A"/"\e[B", which cli_ch_esc() converts to CTL_CH('p')
+ * and CTL_CH('n'); KEY_ENTER becomes '\r', which cli_ch_process() normalises
+ * to '\n'. bootmenu_conv_key() maps those to BKEY_UP/BKEY_DOWN/BKEY_SELECT.
+ * The volume codes map to nothing usable, which is why they are not used.
+ *
+ * An earlier comment here worried that button-qcom-pmic only advertises
+ * pm8916/pm8941/pm8998 while this board has a pm8550, so the read might be
+ * meaningless. It is not: the PON block is on pmk8550, not pm8550, and
+ * pmk8550.dtsi declares qcom,pmk8350-pon / -pwrkey / -resin -- all three are
+ * in the driver's table, with the GEN3 status bits (7 = pwrkey, 6 = resin).
+ */
+&pon_pwrkey {
+	/* Overrides pmk8550.dtsi's KEY_POWER. A stuck/held power key is the
+	 * benign failure here: it selects the highlighted entry, which starts
+	 * at entry 0, which is "Boot Linux" -- the same thing the countdown
+	 * would have done. */
+	linux,code = <KEY_ENTER>;
+	status = "okay";
+};
+
+&pon_resin {
+	linux,code = <KEY_DOWN>;
+	status = "okay";
+};
+
+&i2c1 {
+	status = "okay";
+};
+
+&qupv3_id_0 {
+	status = "okay";
+};
+
+&qupv3_id_1 {
+	status = "okay";
+};
+
+/*
+ * Debug UART -- GENI QUP1 SE7 at 0x00a9c000, the SAME physical port Linux
+ * drives as ttyMSM0 (console=ttyMSM0,115200n8 in bootargs).
+ *
+ * sm8550.dtsi marks it status = "disabled" and this board file only ever
+ * declared the serial0 alias, never enabled the node. So U-Boot has had NO
+ * serial console on this board at all: every diagnostic in this project has
+ * had to be smuggled out as sheng.* entries on the kernel command line and
+ * read back from /proc/cmdline after Linux boots, one boot per datapoint,
+ * inside a CONFIG_SYS_CBSIZE=512 budget.
+ *
+ * With this enabled and stdout-path set in /chosen, U-Boot gets a real
+ * interactive console: md/mw to read and write MDSS/DSI/PHY registers live,
+ * retry panel init without reflashing, and see printf() output as it
+ * happens. CONFIG_PRE_CONSOLE_BUFFER=y is already set, so output produced
+ * before the console is up is buffered and flushed rather than lost.
+ */
+&uart7 {
+	status = "okay";
+};
+
+/*
+ * KTZ8866 backlight is a PAIRED pair of chips (kernel driver:
+ * drivers/video/backlight/ktz8866.c) -- "A" on i2c1 (0xa84000, already
+ * enabled above) and "B" on this separate I2C master-hub instance
+ * (0x9c0000 wrapper, 0x988000 sub-bus), confirmed live via
+ * /sys/bus/i2c/devices/0-0011 under the booted Linux kernel (a
+ * completely different geniqup wrapper than chip A's). Master-hub
+ * wrappers are a distinct compatible ("qcom,geni-se-i2c-master-hub")
+ * from the regular "qcom,geni-se-qup" type i2c1 uses -- see qcom_geni.c's
+ * own comment on why they need a separate firmware-loading pass.
+ */
+&i2c_master_hub_0 {
+	status = "okay";
+};
+
+&i2c_hub_2 {
+	status = "okay";
+};
+
+&sleep_clk {
+	clock-frequency = <32764>;
+};
+
+&tlmm {
+	gpio-reserved-ranges = <36 4>;
+};
+
+&ufs_mem_hc {
+	/* Silence two harmless boot errors, by not asking a question that
+	 * cannot be answered:
+	 *
+	 *   qcom-ufshcd ufshc@1d84000: uclass_get_device_by_ofnode failed: -19
+	 *   qcom-ufshcd ufshc@1d84000: error finding src node
+	 *
+	 * sm8550.dtsi gives this node interconnects = <&aggre1_noc ...>, but
+	 * U-Boot has NO SM8550 interconnect driver -- drivers/interconnect/qcom
+	 * ships sm8650 only, and the defconfig enables that one because it is
+	 * the only one there. So the phandles resolve to a provider that was
+	 * never registered, icc_get() fails, and the uclass prints an error
+	 * per path on every boot. It is cosmetic: UFS enumerates and we boot
+	 * the rootfs off it.
+	 *
+	 * icc_get() returns NULL early when the property is absent, so
+	 * deleting it removes the errors without changing behaviour -- the
+	 * request was already failing. Revisit if an SM8550 interconnect
+	 * driver ever lands; then this should be dropped, not kept.
+	 *
+	 * NB the display driver does its own BCM voting directly
+	 * (sheng_mdss_bcm_vote), so it does not depend on this either.
+	 */
+	/delete-property/ interconnects;
+	/delete-property/ interconnect-names;
+
+	reset-gpios = <&tlmm 210 GPIO_ACTIVE_LOW>;
+	vcc-supply = <&vreg_l17b_2p5>;
+	vcc-max-microamp = <1300000>;
+	vccq-supply = <&vreg_l1g_1p2>;
+	vccq-max-microamp = <1200000>;
+	vdd-hba-supply = <&vreg_l3g_1p2>;
+
+	status = "okay";
+};
+
+&ufs_mem_phy {
+	vdda-phy-supply = <&vreg_l1d_0p88>;
+	vdda-pll-supply = <&vreg_l3e_1p2>;
+
+	status = "okay";
+};
+
+&usb_1 {
+	mode-switch;
+
+	status = "okay";
+};
+
+&usb_1_hsphy {
+	vdd-supply = <&vreg_l1e_0p88>;
+	vdda12-supply = <&vreg_l3e_1p2>;
+
+	phys = <&pm8550b_eusb2_repeater>;
+
+	status = "okay";
+};
+
+&usb_dp_qmpphy {
+	vdda-phy-supply = <&vreg_l3e_1p2>;
+	vdda-pll-supply = <&vreg_l3f_0p91>;
+
+	status = "okay";
+};
+
+&xo_board {
+	clock-frequency = <76800000>;
+};

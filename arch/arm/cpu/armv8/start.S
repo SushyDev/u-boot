@@ -53,6 +53,31 @@ _bss_end_ofs:
 	.quad	__bss_end - _start
 
 reset:
+	/*
+	 * save_boot_params() below is a C function called before crt0 sets
+	 * up a stack (must stay this early to capture x0 before the PIE
+	 * fixup code clobbers it). Give it a minimal stack first: just past
+	 * our own loaded image, PC-relative only since alignment isn't
+	 * verified yet. x0 is left untouched.
+	 */
+	/*
+	 * sheng board (Xiaomi Pad 6S Pro, SM8550) fix: the stock
+	 * computation here is sp = _start + image_size + 0x10000, which
+	 * moves upward as the binary grows. On this board that pushed
+	 * the temporary stack into ABL/TrustZone-reserved memory once
+	 * u-boot.bin grew past a certain size (confirmed via memory-
+	 * breadcrumb instrumentation across many boot/reboot cycles: a
+	 * large-enough image never even reached _main, i.e. faulted
+	 * right here on the very first stack write, before any
+	 * exception handlers exist to report it). Placing the stack
+	 * BELOW _start instead, in the headroom ABL leaves below the
+	 * kernel_offset load address, decouples it from image size
+	 * entirely -- this is the actual fix, not a workaround for one
+	 * specific size. This is core/shared armv8 code, not
+	 * board-specific, but this fork targets only the sheng board.
+	 */
+	adr	x1, _start
+	sub	sp, x1, #0x4000
 	/* Allow the board to save important registers */
 	b	save_boot_params
 .globl	save_boot_params_ret

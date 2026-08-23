@@ -10,20 +10,27 @@
 #define pr_fmt(fmt) "QCOM: " fmt
 
 #include <asm/armv8/mmu.h>
+#include <asm/barriers.h>
 #include <asm/gpio.h>
 #include <asm/io.h>
 #include <asm/psci.h>
 #include <asm/system.h>
+#include <bootm.h>
+#include <cpu_func.h>
 #include <dm/device.h>
 #include <dm/pinctrl.h>
 #include <dm/uclass-internal.h>
+#include <dm/uclass.h>
 #include <dm/read.h>
+#include <video.h>
 #include <power/regulator.h>
 #include <env.h>
 #include <fdt_support.h>
+#include <i2c.h>
 #include <init.h>
 #include <linux/arm-smccc.h>
 #include <linux/bug.h>
+#include <linux/delay.h>
 #include <linux/psci.h>
 #include <linux/sizes.h>
 #include <lmb.h>
@@ -48,8 +55,27 @@ static struct {
 	phys_size_t size;
 } prevbl_ddr_banks[CONFIG_NR_DRAM_BANKS] __section(".data") = { 0 };
 
+/* Boot timing. Microseconds since power-on, from the ARM generic
+ * counter, which nothing in the boot chain resets.
+ *
+ * These two split the ~5.9s that elapses before the display probe into
+ * the part that is not ours (XBL + ABL, everything up to U-Boot entry)
+ * and the part that is (U-Boot's own pre-video initcalls). Relayed to
+ * Linux alongside the driver's own marks -- see sheng_mdss_timing_fmt().
+ *
+ * .data, not .bss: dram_init() runs BEFORE relocation, and .bss is
+ * zeroed when the relocated image starts, which would discard the
+ * value. Same reason prevbl_ddr_banks above is placed there.
+ */
+unsigned long sheng_uboot_entry_us __section(".data") = 0;
+unsigned long sheng_board_init_us __section(".data") = 0;
+
 int dram_init(void)
 {
+	/* Earliest point with a working timer: init_sequence_f runs
+	 * timer_init() a few initcalls before dram_init(). */
+	sheng_uboot_entry_us = timer_get_us();
+
 	/*
 	 * gd->ram_base / ram_size have been setup already
 	 * in qcom_parse_memory().
@@ -204,15 +230,30 @@ static void qcom_psci_fixup(void *fdt)
  * or for supporting quirky devices where it's easier to leave the downstream DT in place
  * to improve ABL compatibility. Otherwise, we use the DT provided by ABL.
  */
+/*
+ * get_prev_bl_fdt_addr() returns raw x0 as saved at boot entry with no
+ * validation. sheng's internal DT is always valid, so gate the external
+ * pointer behind a sanity check instead of dereferencing it unconditionally
+ * this early in boot (no exception vectors installed yet).
+ */
+static bool qcom_debug_addr_plausible(phys_addr_t addr)
+{
+	return addr && !(addr & 0x7) &&
+	       addr >= 0x80000000ULL && addr < 0x400000000ULL;
+}
+
 int board_fdt_blob_setup(void **fdtp)
 {
 	struct fdt_header *external_fdt, *internal_fdt;
 	bool internal_valid, external_valid;
+	phys_addr_t prev_bl_fdt;
 	int ret = -ENODATA;
 
 	internal_fdt = (struct fdt_header *)*fdtp;
-	external_fdt = (struct fdt_header *)get_prev_bl_fdt_addr();
-	external_valid = external_fdt && !fdt_check_header(external_fdt);
+	prev_bl_fdt = get_prev_bl_fdt_addr();
+	external_fdt = (struct fdt_header *)prev_bl_fdt;
+	external_valid = qcom_debug_addr_plausible(prev_bl_fdt) &&
+			  !fdt_check_header(external_fdt);
 	internal_valid = !fdt_check_header(internal_fdt);
 
 	/*
@@ -313,6 +354,10 @@ void __weak qcom_board_init(void)
 
 int board_init(void)
 {
+	/* First hook after relocation, so the gap from
+	 * sheng_uboot_entry_us is board_init_f + relocation. */
+	sheng_board_init_us = timer_get_us();
+
 	show_psci_version();
 	qcom_board_init();
 	return 0;
@@ -630,7 +675,13 @@ static int fdt_cmp_res(const void *v1, const void *v2)
 	return res1->start - res2->start;
 }
 
-#define N_RESERVED_REGIONS 32
+/*
+ * sm8550-xiaomi-sheng.dtb has 34 no-map subnodes under /reserved-memory,
+ * over the original 32 -- carve_out_reserved_memory() silently drops
+ * anything past this count, leaving unmapped regions as ordinary
+ * cacheable RAM instead of PTE_TYPE_FAULT. Bumped with headroom.
+ */
+#define N_RESERVED_REGIONS 48
 
 /* Mark all no-map regions as PTE_TYPE_FAULT to prevent speculative access.
  * On some platforms this is enough to trigger a security violation and trap

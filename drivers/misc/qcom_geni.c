@@ -560,6 +560,24 @@ static int qcom_geni_fw_initialise(void)
 		}
 	}
 
+	/* I2C master-hub wrappers ("qcom,geni-se-i2c-master-hub") need the
+	 * same protocol firmware in their sequencers but aren't matched by
+	 * the compatible strings scanned above. */
+	struct udevice *hub_wrapper;
+	for (uclass_first_device(UCLASS_NOP, &hub_wrapper);
+	     hub_wrapper;
+	     uclass_next_device(&hub_wrapper)) {
+		if (ofnode_device_is_compatible(dev_ofnode(hub_wrapper),
+						"qcom,geni-se-i2c-master-hub")) {
+			dev_set_priv(hub_wrapper, fw_buf);
+			/* Probe children of this master-hub wrapper so they load firmware */
+			struct udevice *child;
+			device_foreach_child(child, hub_wrapper) {
+				device_probe(child);
+			}
+		}
+	}
+
 	return 0;
 }
 
