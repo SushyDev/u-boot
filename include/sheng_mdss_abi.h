@@ -207,6 +207,7 @@ void sheng_mdss_full_teardown(unsigned long dpu_base,
 struct sheng_diag_state *sheng_mdss_diag_state(void);
 long long sheng_mdss_gdsc_probe_result(void);
 unsigned int sheng_mdss_gdsc_collapse_us(void);
+u32 sheng_mdss_clk_fail_off(void);
 long long sheng_mdss_dsi_init_fail_info(void);
 const char *sheng_mdss_tmark_get(unsigned int i, unsigned long *us);
 unsigned int sheng_mdss_tmark_count(void);
@@ -226,7 +227,14 @@ extern int sheng_inherited;
 
 /* --- Implemented in board/qualcomm/sheng/sheng.c -------------------- */
 
-int sheng_ktz8866_set_bias(int enable);
+/* LCD_BIAS_EN is latched over I2C, independently of the chip's enable
+ * pins. Leave it set and the KTZ8866 holds the +/-5.8V rails up, the DDIC
+ * never loses power, and a reset pulse cannot clear its state -- so this
+ * is load-bearing for the panel power cycle, not a hint. Named rather
+ * than an int flag for that reason. */
+enum ktz8866_bias { KTZ8866_BIAS_OFF = 0, KTZ8866_BIAS_ON = 1 };
+
+int sheng_ktz8866_set_bias(enum ktz8866_bias state);
 void sheng_breadcrumb_u32(unsigned long addr, u32 value);
 
 /* Decided in qcom_board_init() from our own DTB, consumed by

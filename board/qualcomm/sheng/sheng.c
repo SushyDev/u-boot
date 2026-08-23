@@ -385,9 +385,10 @@ static int sheng_ktz8866_write_chip(const char *path)
  * device off. Linux hits the same wall when it inherits our rails, and
  * recovers only after a blank/unblank, which clears the bias over I2C.
  */
-int sheng_ktz8866_set_bias(int enable)
+int sheng_ktz8866_set_bias(enum ktz8866_bias state)
 {
-	u8 val = enable ? KTZ8866_LCD_BIAS_EN : KTZ8866_LCD_BIAS_OFF;
+	u8 val = state == KTZ8866_BIAS_ON ? KTZ8866_LCD_BIAS_EN
+					  : KTZ8866_LCD_BIAS_OFF;
 	unsigned int i;
 	int rc = 0;
 

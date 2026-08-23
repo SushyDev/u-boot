@@ -486,6 +486,37 @@ var g_dln0_phy_err_on_timeout: u32 = 0xFFFFFFFF; // sentinel: "never ran"
 
 const ETIMEDOUT: c_int = -110;
 
+/// Clock bring-up failures, as a type rather than a shared -110.
+///
+/// Every poll below used to return ETIMEDOUT, and clkBranchEnable() alone
+/// is reached for twelve different branches -- so "-110 recorded at
+/// STATUS_DISPCC" identified nothing beyond "a clock did not come up".
+/// The error names WHICH KIND of poll gave up; g_ctx.clk_fail_off records
+/// which register it was polling. Both reach Linux in the diag.
+const ClockError = error{
+    PllLockTimeout,
+    RcgUpdateTimeout,
+    BranchStuckOff,
+    PhyPllReadyTimeout,
+};
+
+/// Deliberately outside errno space: nothing maps these back through
+/// strerror, and colliding with a real errno would be worse than not
+/// resembling one. Callers only ever test against 0.
+const ERR_PLL_LOCK: c_int = -1001;
+const ERR_RCG_UPDATE: c_int = -1002;
+const ERR_BRANCH_HALT: c_int = -1003;
+const ERR_PHY_PLL: c_int = -1004;
+
+fn clockErrno(err: ClockError) c_int {
+    return switch (err) {
+        error.PllLockTimeout => ERR_PLL_LOCK,
+        error.RcgUpdateTimeout => ERR_RCG_UPDATE,
+        error.BranchStuckOff => ERR_BRANCH_HALT,
+        error.PhyPllReadyTimeout => ERR_PHY_PLL,
+    };
+}
+
 // Offsets/bits transcribed from drivers/clk/qcom/gdsc.c (mainline sm8550
 // kernel checkout) -- mdss_gdsc there is { .gdscr = 0x9000, .pwrsts =
 // PWRSTS_OFF_ON, .flags = POLL_CFG_GDSCR | HW_CTRL | RETAIN_FF_ENABLE },
@@ -690,7 +721,7 @@ const PLL_LOCK_POLL_TIMEOUT_US: u32 = 1500;
 /// instead of 0x00001210 -- while every configuration register still
 /// reads back correct and the INTF keeps counting frames, because INTF
 /// timing comes off the DSI PHY PLL and does not depend on mdp_clk.
-fn dispCcPll0Enable(dispcc_base: usize) c_int {
+fn dispCcPll0Enable(dispcc_base: usize) ClockError!void {
     mmioWrite32(dispcc_base, PLL_L_VAL_OFF, 0x50 |
         (TRION_PLL_CAL_VAL << LUCID_EVO_PLL_CAL_L_VAL_SHIFT) |
         (TRION_PLL_CAL_VAL << LUCID_OLE_PLL_RINGOSC_CAL_L_VAL_SHIFT));
@@ -720,12 +751,12 @@ fn dispCcPll0Enable(dispcc_base: usize) c_int {
         if ((mode & PLL_LOCK_DET) != 0) break;
         udelay(1);
     } else {
-        return ETIMEDOUT;
+        g_ctx.clk_fail_off = PLL_MODE_OFF;
+        return error.PllLockTimeout;
     }
 
     mmioSetBits32(dispcc_base, PLL_USER_CTL_OFF, PLL_OUT_MASK);
     mmioSetBits32(dispcc_base, PLL_MODE_OFF, PLL_OUTCTRL);
-    return 0;
 }
 
 // --- RCG2 (root clock generator) helper, from clk-rcg2.c's
@@ -745,7 +776,7 @@ const RCG_UPDATE_POLL_TIMEOUT_US: u32 = 500;
 /// `div_reg_val` is already converted (2*pre_div - 1), matching
 /// convert_to_reg_val() in clk-rcg2.c -- e.g. divider 1 -> 1, divider
 /// 3 -> 5.
-fn rcg2ConfigureHidOnly(dispcc_base: usize, cmd_rcgr: usize, src_sel: u32, div_reg_val: u32) c_int {
+fn rcg2ConfigureHidOnly(dispcc_base: usize, cmd_rcgr: usize, src_sel: u32, div_reg_val: u32) ClockError!void {
     var cfg = mmioRead32(dispcc_base, cmd_rcgr + RCG_CFG_OFF);
     cfg &= ~(RCG_CFG_SRC_SEL_MASK | RCG_CFG_SRC_DIV_MASK | RCG_CFG_MODE_MASK);
     cfg |= (src_sel << RCG_CFG_SRC_SEL_SHIFT) & RCG_CFG_SRC_SEL_MASK;
@@ -756,10 +787,11 @@ fn rcg2ConfigureHidOnly(dispcc_base: usize, cmd_rcgr: usize, src_sel: u32, div_r
     var waited: u32 = 0;
     while (waited < RCG_UPDATE_POLL_TIMEOUT_US) : (waited += 1) {
         const cmd = mmioRead32(dispcc_base, cmd_rcgr + RCG_CMD_OFF);
-        if ((cmd & RCG_CMD_UPDATE) == 0) return 0;
+        if ((cmd & RCG_CMD_UPDATE) == 0) return;
         udelay(1);
     }
-    return ETIMEDOUT;
+    g_ctx.clk_fail_off = cmd_rcgr;
+    return error.RcgUpdateTimeout;
 }
 
 // --- clk_branch2 helper, from clk-branch.c's clk_branch2_enable()/
@@ -770,15 +802,16 @@ const CBCR_ENABLE: u32 = 1 << 0;
 const CBCR_CLK_OFF: u32 = 1 << 31;
 const CBCR_POLL_TIMEOUT_US: u32 = 500;
 
-fn clkBranchEnable(dispcc_base: usize, cbcr_off: usize) c_int {
+fn clkBranchEnable(dispcc_base: usize, cbcr_off: usize) ClockError!void {
     mmioSetBits32(dispcc_base, cbcr_off, CBCR_ENABLE);
     var waited: u32 = 0;
     while (waited < CBCR_POLL_TIMEOUT_US) : (waited += 1) {
         const val = mmioRead32(dispcc_base, cbcr_off);
-        if ((val & CBCR_CLK_OFF) == 0) return 0;
+        if ((val & CBCR_CLK_OFF) == 0) return;
         udelay(1);
     }
-    return ETIMEDOUT;
+    g_ctx.clk_fail_off = cbcr_off;
+    return error.BranchStuckOff;
 }
 
 // Register offsets/freq-table entries transcribed from
@@ -891,16 +924,12 @@ const ESC_SRC_SEL_XO: u32 = 0;
 // flowing at all; not necessarily the exact panel-spec pixel rate.
 const DSI_CLK_DIV_REG_VAL_PASSTHROUGH: u32 = 1; // 2*1-1
 
-export fn sheng_mdss_dispcc_dsi_clks_init(dispcc_base: usize) callconv(.c) c_int {
-    var ret = rcg2ConfigureHidOnly(dispcc_base, PCLK0_CLK_SRC_CMD_RCGR, PCLK0_SRC_SEL_DSI0_DSICLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, PCLK0_CLK_CBCR);
-    if (ret != 0) return ret;
+fn dispCcDsiClksInit(dispcc_base: usize) ClockError!void {
+    try rcg2ConfigureHidOnly(dispcc_base, PCLK0_CLK_SRC_CMD_RCGR, PCLK0_SRC_SEL_DSI0_DSICLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    try clkBranchEnable(dispcc_base, PCLK0_CLK_CBCR);
 
-    ret = rcg2ConfigureHidOnly(dispcc_base, BYTE0_CLK_SRC_CMD_RCGR, BYTE0_SRC_SEL_DSI0_BYTECLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, BYTE0_CLK_CBCR);
-    if (ret != 0) return ret;
+    try rcg2ConfigureHidOnly(dispcc_base, BYTE0_CLK_SRC_CMD_RCGR, BYTE0_SRC_SEL_DSI0_BYTECLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    try clkBranchEnable(dispcc_base, BYTE0_CLK_CBCR);
     // byte_intf divider (/2) BEFORE enabling its branch -- see
     // BYTE0_DIV_CLK_SRC's comment.
     {
@@ -908,35 +937,32 @@ export fn sheng_mdss_dispcc_dsi_clks_init(dispcc_base: usize) callconv(.c) c_int
         d = (d & ~BYTE_DIV_WIDTH_MASK) | BYTE_DIV_BY_2;
         mmioWrite32(dispcc_base, BYTE0_DIV_CLK_SRC, d);
     }
-    ret = clkBranchEnable(dispcc_base, BYTE0_INTF_CLK_CBCR);
-    if (ret != 0) return ret;
+    try clkBranchEnable(dispcc_base, BYTE0_INTF_CLK_CBCR);
 
-    ret = rcg2ConfigureHidOnly(dispcc_base, ESC0_CLK_SRC_CMD_RCGR, ESC_SRC_SEL_XO, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, ESC0_CLK_CBCR);
-    if (ret != 0) return ret;
+    try rcg2ConfigureHidOnly(dispcc_base, ESC0_CLK_SRC_CMD_RCGR, ESC_SRC_SEL_XO, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    try clkBranchEnable(dispcc_base, ESC0_CLK_CBCR);
 
-    ret = rcg2ConfigureHidOnly(dispcc_base, PCLK1_CLK_SRC_CMD_RCGR, PCLK1_SRC_SEL_DSI1_DSICLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, PCLK1_CLK_CBCR);
-    if (ret != 0) return ret;
+    try rcg2ConfigureHidOnly(dispcc_base, PCLK1_CLK_SRC_CMD_RCGR, PCLK1_SRC_SEL_DSI1_DSICLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    try clkBranchEnable(dispcc_base, PCLK1_CLK_CBCR);
 
-    ret = rcg2ConfigureHidOnly(dispcc_base, BYTE1_CLK_SRC_CMD_RCGR, BYTE1_SRC_SEL_DSI1_BYTECLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, BYTE1_CLK_CBCR);
-    if (ret != 0) return ret;
+    try rcg2ConfigureHidOnly(dispcc_base, BYTE1_CLK_SRC_CMD_RCGR, BYTE1_SRC_SEL_DSI1_BYTECLK, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    try clkBranchEnable(dispcc_base, BYTE1_CLK_CBCR);
     {
         var d = mmioRead32(dispcc_base, BYTE1_DIV_CLK_SRC);
         d = (d & ~BYTE_DIV_WIDTH_MASK) | BYTE_DIV_BY_2;
         mmioWrite32(dispcc_base, BYTE1_DIV_CLK_SRC, d);
     }
-    ret = clkBranchEnable(dispcc_base, BYTE1_INTF_CLK_CBCR);
-    if (ret != 0) return ret;
+    try clkBranchEnable(dispcc_base, BYTE1_INTF_CLK_CBCR);
 
-    ret = rcg2ConfigureHidOnly(dispcc_base, ESC1_CLK_SRC_CMD_RCGR, ESC_SRC_SEL_XO, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
-    if (ret != 0) return ret;
-    return clkBranchEnable(dispcc_base, ESC1_CLK_CBCR);
+    try rcg2ConfigureHidOnly(dispcc_base, ESC1_CLK_SRC_CMD_RCGR, ESC_SRC_SEL_XO, DSI_CLK_DIV_REG_VAL_PASSTHROUGH);
+    try clkBranchEnable(dispcc_base, ESC1_CLK_CBCR);
 }
+
+export fn sheng_mdss_dispcc_dsi_clks_init(dispcc_base: usize) callconv(.c) c_int {
+    dispCcDsiClksInit(dispcc_base) catch |err| return clockErrno(err);
+    return 0;
+}
+
 
 // The MDSS wrapper node declares resets = <&dispcc
 // DISP_CC_MDSS_CORE_BCR>, a bit0 read-modify-write at dispcc+0x8000.
@@ -968,10 +994,14 @@ fn mdssCoreBcrReset(dispcc_base: usize) void {
 /// AHB_CLK_SRC parents from XO, so this needs no PLL bring-up, and it
 /// reconfigures nothing, so what gets sampled afterwards is genuinely
 /// ABL's state.
+fn dispCcAhbOnly(dispcc_base: usize) ClockError!void {
+    try rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
+    try clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
+}
+
 export fn sheng_mdss_dispcc_ahb_only(dispcc_base: usize) callconv(.c) c_int {
-    const ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-    return clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
+    dispCcAhbOnly(dispcc_base) catch |err| return clockErrno(err);
+    return 0;
 }
 
 /// Sample ABL's handoff state.
@@ -1009,32 +1039,28 @@ export fn sheng_mdss_abl_state3(phy0_base: usize, phy1_base: usize) callconv(.c)
         @as(i64, mmioRead32(phy1_base + PLL_BASE_OFFSET, PLL_COMMON_STATUS_ONE) & 0xffff);
 }
 
-export fn sheng_mdss_dispcc_init(dispcc_base: usize) callconv(.c) c_int {
+fn dispCcInit(dispcc_base: usize) ClockError!void {
     mdssCoreBcrReset(dispcc_base);
 
-    var ret = dispCcPll0Enable(dispcc_base);
-    if (ret != 0) return ret;
+    try dispCcPll0Enable(dispcc_base);
 
-    ret = rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
-    if (ret != 0) return ret;
+    try rcg2ConfigureHidOnly(dispcc_base, AHB_CLK_SRC_CMD_RCGR, AHB_CLK_SRC_SEL_XO, AHB_CLK_DIV_REG_VAL);
+    try clkBranchEnable(dispcc_base, AHB_CLK_CBCR);
 
-    ret = rcg2ConfigureHidOnly(dispcc_base, MDP_CLK_SRC_CMD_RCGR, MDP_CLK_SRC_SEL_PLL0, MDP_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, MDP_CLK_CBCR);
-    if (ret != 0) return ret;
+    try rcg2ConfigureHidOnly(dispcc_base, MDP_CLK_SRC_CMD_RCGR, MDP_CLK_SRC_SEL_PLL0, MDP_CLK_DIV_REG_VAL);
+    try clkBranchEnable(dispcc_base, MDP_CLK_CBCR);
 
-    ret = clkBranchEnable(dispcc_base, MDP_LUT_CLK_CBCR);
-    if (ret != 0) return ret;
+    try clkBranchEnable(dispcc_base, MDP_LUT_CLK_CBCR);
 
-    ret = rcg2ConfigureHidOnly(dispcc_base, VSYNC_CLK_SRC_CMD_RCGR, VSYNC_CLK_SRC_SEL_XO, VSYNC_CLK_DIV_REG_VAL);
-    if (ret != 0) return ret;
-    ret = clkBranchEnable(dispcc_base, VSYNC_CLK_CBCR);
-    if (ret != 0) return ret;
+    try rcg2ConfigureHidOnly(dispcc_base, VSYNC_CLK_SRC_CMD_RCGR, VSYNC_CLK_SRC_SEL_XO, VSYNC_CLK_DIV_REG_VAL);
+    try clkBranchEnable(dispcc_base, VSYNC_CLK_CBCR);
+}
 
+export fn sheng_mdss_dispcc_init(dispcc_base: usize) callconv(.c) c_int {
+    dispCcInit(dispcc_base) catch |err| return clockErrno(err);
     return 0;
 }
+
 
 // --- DSI PHY. SM8550 uses the "7nm" driver code despite the DT label
 // saying 4nm, on the V5_2 quirk path.
@@ -1269,16 +1295,17 @@ fn dsiPhyPllConfigure(phy_base: usize) void {
 /// bit0) and wait for lock. Master-PHY-only -- the slave receives its
 /// bit clock over the sync-dual-dsi hardware link once the master is
 /// running, it has no PLL of its own to start.
-fn dsiPhyPllStart(phy_base: usize) c_int {
+fn dsiPhyPllStart(phy_base: usize) ClockError!void {
     mmioWrite32(phy_base, CMN_PLL_CNTRL, 0x1);
 
     var waited: u32 = 0;
     while (waited < PLL_LOCK_POLL2_TIMEOUT_US) : (waited += 100) {
         const status = mmioRead32(phy_base + PLL_BASE_OFFSET, PLL_COMMON_STATUS_ONE);
-        if ((status & PLL_LOCK_STATUS_BIT) != 0) return 0;
+        if ((status & PLL_LOCK_STATUS_BIT) != 0) return;
         udelay(100);
     }
-    return ETIMEDOUT;
+    g_ctx.clk_fail_off = CMN_PLL_CNTRL;
+    return error.PhyPllReadyTimeout;
 }
 
 /// dsi_pll_phy_dig_reset() + dsi_pll_enable_global_clk() +
@@ -1327,8 +1354,7 @@ export fn sheng_mdss_dsi_phy_start_dual(phy0_base: usize, phy1_base: usize) call
     dsiPhyPllBias(phy0_base);
     dsiPhyPllBias(phy1_base);
 
-    const ret = dsiPhyPllStart(phy0_base);
-    if (ret != 0) return ret;
+    dsiPhyPllStart(phy0_base) catch |err| return clockErrno(err);
 
     dsiPhyDigReset(phy0_base);
     dsiPhyDigReset(phy1_base);
@@ -1828,7 +1854,7 @@ fn dsiWait4VideoEngBusy(dsi_base: usize) void {
         // Early return: video engine idle, no BLLP to wait for. Logged
         // because "we never even waited" and "we waited and it worked" are
         // completely different situations that both look like success.
-        if (debug_enabled and g_vwait_logged < 8 and dsi_base == 0x0ae94004) {
+        if (debug_enabled and g_vwait_logged < 8 and dsi_base == DSI0) {
             g_vwait_logged += 1;
             bbStr("vwait: skip (video idle) st=");
             bbHex(st, 8);
@@ -1859,7 +1885,7 @@ fn dsiWait4VideoEngBusy(dsi_base: usize) void {
     // Ack the event and mask VIDEO_DONE off again, matching the kernel's
     // dsi_intr_ctrl(..., 0) on the way out.
     const vd_intr = mmioRead32(dsi_base, DSI_INTR_CTRL);
-    if (debug_enabled and g_vwait_logged < 8 and dsi_base == 0x0ae94004) {
+    if (debug_enabled and g_vwait_logged < 8 and dsi_base == DSI0) {
         g_vwait_logged += 1;
         bbStr("vwait: waited_us=");
         bbDec(waited);
@@ -2046,7 +2072,7 @@ fn dsiCmdDmaTrigger(dsi_base: usize, dma_addr: usize, len: usize) void {
     // note: real logical offset, not the physical-unshifted 0x038 the
     // request used; LANE_CTRL=0x01000000 at this exact register post-
     // shift-fix, not the older 0x00001F00 pre-fix value).
-    if (debug_enabled and !g_pretrigger_snapshot_done and dsi_base == 0x0ae94004) {
+    if (debug_enabled and !g_pretrigger_snapshot_done and dsi_base == DSI0) {
         g_snap_ctrl = mmioRead32(dsi_base, DSI_CTRL);
         g_snap_lane_swap = mmioRead32(dsi_base, DSI_LANE_SWAP_CTRL);
         g_snap_lane_ctrl = mmioRead32(dsi_base, DSI_LANE_CTRL);
@@ -2083,7 +2109,7 @@ fn dsiCmdDmaTrigger(dsi_base: usize, dma_addr: usize, len: usize) void {
     // read misses the now-invalidated line and pulls a fresh copy from
     // physical DRAM. Expected for command #0: byte0=0xFF, byte1=0x26,
     // byte2=0x15 (DCS short write, 1 param), byte3=0x80 (VC0 + ECC).
-    if (debug_enabled and !g_dmabuf_diag_done and dsi_base == 0x0ae94004) {
+    if (debug_enabled and !g_dmabuf_diag_done and dsi_base == DSI0) {
         const src: [*]volatile u8 = @ptrFromInt(dma_addr);
         var rb: u64 = 0;
         var b: usize = 0;
@@ -2102,7 +2128,7 @@ fn dsiCmdDmaTrigger(dsi_base: usize, dma_addr: usize, len: usize) void {
     // Linux's own live, proven-working IOVA choice exactly) to this
     // exact physical buffer.
     const iova: usize = SMMU_MAPPED_IOVA + (dma_addr - @as(usize, @intCast(SHENG_MDSS_DSI_DMA_SCRATCH_PHYS)));
-    if (debug_enabled and !g_iova_diag_done and dsi_base == 0x0ae94004) {
+    if (debug_enabled and !g_iova_diag_done and dsi_base == DSI0) {
         g_iova_written = @truncate(iova);
         g_iova_dma_addr = dma_addr;
         g_iova_l3_readback = smmu_l3_table[1];
@@ -2130,7 +2156,7 @@ fn dsiCmdDmaTrigger(dsi_base: usize, dma_addr: usize, len: usize) void {
     // few commands. Bit1 set means the engine genuinely went busy and our
     // wait is meaningful. All-clear means every "successful" command in
     // this driver's history has been a no-op.
-    if (debug_enabled and g_trigger_probe_n < 4 and dsi_base == 0x0ae94004) {
+    if (debug_enabled and g_trigger_probe_n < 4 and dsi_base == DSI0) {
         const st = mmioRead32(dsi_base, DSI_STATUS0);
         g_trigger_probe = (g_trigger_probe << 8) | @as(u32, @truncate(st & 0xff));
         g_trigger_probe_n += 1;
@@ -2202,7 +2228,7 @@ fn dsiCmdDmaWait(dsi_base: usize) c_int {
     // covered by the earlier err_status diagnostic (ACK_ERR_STATUS/
     // TIMEOUT_STATUS only) and are the most direct place to see WHY a
     // real DMA transaction never completes.
-    if (dsi_base == 0x0ae94004) {
+    if (dsi_base == DSI0) {
         g_fifo_status_on_timeout = mmioRead32(dsi_base, DSI_FIFO_STATUS);
         g_dln0_phy_err_on_timeout = mmioRead32(dsi_base, DSI_DLN0_PHY_ERR);
     }
@@ -2271,7 +2297,7 @@ fn dsiCmdDmaWait(dsi_base: usize) c_int {
         bbStr("   DLN0_PHY_ERR=0x");
         bbHex(mmioRead32(dsi_base, DSI_DLN0_PHY_ERR), 8);
         bbStr(" PHY0_STATUS=0x");
-        bbHex(mmioRead32(0x0ae95000, 0x140), 8);
+        bbHex(mmioRead32(DSI0_PHY, CMN_PHY_STATUS), 8);
         bbByte('\n');
         bbSeal();
     }
@@ -2558,10 +2584,9 @@ export fn sheng_mdss_dsi_read_power_mode_single(dsi0_base: usize, dma_scratch: u
     // that arrived early was destroyed rather than observed.
     dsiIntrCtrlRmw(dsi0_base, 0, 0, INTR_BTA_DONE);
 
-    const dsi1_base: usize = 0x0ae96004; // SM8550_MDSS_DSI1_BASE + shift
-    dsiCmdDmaTrigger(dsi1_base, dma_scratch, 4);
+    dsiCmdDmaTrigger(DSI1, dma_scratch, 4);
     dsiCmdDmaTrigger(dsi0_base, dma_scratch, 4);
-    _ = dsiCmdDmaWait(dsi1_base);
+    _ = dsiCmdDmaWait(DSI1);
     ret = dsiCmdDmaWait(dsi0_base);
     if (ret != 0) return -2;
 
@@ -4795,7 +4820,9 @@ fn mdelay(msec: c_ulong) void {
     while (left > 0) : (left -= 1) udelay(1000);
 }
 extern fn cmd_db_read_addr(id: [*:0]const u8) callconv(.c) u32;
-extern fn sheng_ktz8866_set_bias(enable: c_int) callconv(.c) c_int;
+/// Mirrors `enum ktz8866_bias` in include/sheng_mdss_abi.h.
+const Ktz8866Bias = enum(c_int) { off = 0, on = 1 };
+extern fn sheng_ktz8866_set_bias(state: Ktz8866Bias) callconv(.c) c_int;
 
 /// Framebuffer the caller should hand to the video uclass.
 pub const ShengFb = extern struct {
@@ -4995,11 +5022,23 @@ const ShengDisplayCtx = struct {
     diag: ShengDiag = .{},
     gdsc_probe: [3]u32 = .{0} ** 3,
     gdsc_collapse_us: u32 = 0xffffffff,
+
+    /// Register offset the last clock poll gave up on. Pairs with the
+    /// ClockError kind: the error says which sort of poll timed out, this
+    /// says which register it was watching -- clkBranchEnable() alone is
+    /// reached for twelve different CBCRs.
+    clk_fail_off: usize = 0,
     dsi: DsiState = .{},
     tmark: TmarkLog = .{},
 };
 
 var g_ctx: ShengDisplayCtx = .{};
+
+/// Register offset of the last clock poll that gave up. Meaningful only
+/// when a stage recorded one of the ERR_* codes above.
+export fn sheng_mdss_clk_fail_off() callconv(.c) u32 {
+    return @truncate(g_ctx.clk_fail_off);
+}
 
 export fn sheng_mdss_diag_state() callconv(.c) *ShengDiag {
     return &g_ctx.diag;
@@ -5008,7 +5047,7 @@ export fn sheng_mdss_diag_state() callconv(.c) *ShengDiag {
 /// Panel rails up, then nt36532e's reset pulse. Reset is active-low, so
 /// a logical assert is physical LOW.
 fn panelPowerAndReset() void {
-    _ = sheng_ktz8866_set_bias(1);
+    _ = sheng_ktz8866_set_bias(.on);
     panelRails(.on);
     mdelay(PANEL_RAIL_RAMP_MS); // regulator-enable-ramp-delay is 233us on both
 
@@ -5160,7 +5199,7 @@ export fn sheng_mdss_bringup(splash_live: c_int, fb: *ShengFb) callconv(.c) c_in
         shengTmark("host+abl sleep");
 
         sheng_mdss_panel_power_off();
-        _ = sheng_ktz8866_set_bias(0);
+        _ = sheng_ktz8866_set_bias(.off);
 
         // The rails need an off window long enough to discharge, or the
         // DDIC keeps its state across the power cycle. A panel killed

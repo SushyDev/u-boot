@@ -88,7 +88,7 @@ int sheng_mdss_diag_fmt(char *buf, int len)
 
 	return snprintf(buf, len,
 			"fastpath=%d probes=%u panel_init_first=%d panel_init=%d"
-			" gdsc[%012llx] collapse_us=%d"
+			" gdsc[%012llx] collapse_us=%d clkfail=%04x"
 			" status0=%08x fifo=%08x fifo_late=%08x lane=%08x"
 			" ackerr=%08x timeout=%08x pll_l=%08x"
 			" frames=%u->%u pm=%012llx pm_val=%02x"
@@ -98,6 +98,7 @@ int sheng_mdss_diag_fmt(char *buf, int len)
 			d->panel_init_ret,
 			(unsigned long long)sheng_mdss_gdsc_probe_result(),
 			(int)sheng_mdss_gdsc_collapse_us(),
+			sheng_mdss_clk_fail_off(),
 			d->status0, d->fifo, d->fifo_late, d->lane,
 			d->ackerr, d->timeout, d->pll_l,
 			d->frames_early, d->frames_late,
