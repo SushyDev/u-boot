@@ -4556,3 +4556,359 @@ export fn sheng_regulator_vote(addr: u32, millivolts: u32) callconv(.c) c_int {
     return sheng_rsc_send_active_write(addr + REG_ENABLE, 1);
 }
 
+
+
+// Stage relay and boot timing.
+//
+// No console during probe, so these are the only way a failure reports
+// itself. D-cache is on, so each slot is flushed as it is written: a hang
+// on the next instruction would otherwise leave it in a dirty line that a
+// post-mortem scrape never sees.
+const STATUS_ADDR: usize = 0x81200000 + 0x3000; // CONFIG_PRE_CON_BUF_ADDR
+const STATUS_NOT_REACHED: c_int = 0x7fffffff;
+
+const STATUS_MDSS_RESET: u32 = 0;
+const STATUS_GDSC: u32 = 1;
+const STATUS_BCM_MM0: u32 = 2;
+const STATUS_DISPCC: u32 = 3;
+const STATUS_DSI0_PHY: u32 = 4;
+const STATUS_DSI1_PHY: u32 = 5;
+const STATUS_DSI_PHY_START: u32 = 6;
+const STATUS_DSI_LINK_CLKS: u32 = 7;
+const STATUS_DSI_PANEL: u32 = 8;
+const STATUS_DPU: u32 = 9;
+const STATUS_PROBE: u32 = 10;
+const STATUS_COUNT: u32 = 11;
+
+fn shengStage(stage: u32, ret: c_int) void {
+    const slots: [*]volatile c_int = @ptrFromInt(STATUS_ADDR);
+    slots[stage] = ret;
+    const at = STATUS_ADDR + stage * @sizeOf(c_int);
+    flush_dcache_range(at, at + @sizeOf(c_int));
+}
+
+fn shengStageInit() void {
+    var i: u32 = 0;
+    while (i < STATUS_COUNT) : (i += 1) shengStage(i, STATUS_NOT_REACHED);
+}
+
+const TMARK_MAX: u32 = 16;
+var g_tmark_us: [TMARK_MAX]c_ulong = .{0} ** TMARK_MAX;
+var g_tmark_name: [TMARK_MAX]?[*:0]const u8 = .{null} ** TMARK_MAX;
+var g_tmark_n: u32 = 0;
+
+fn shengTmark(name: [*:0]const u8) void {
+    if (g_tmark_n >= TMARK_MAX) return;
+    g_tmark_name[g_tmark_n] = name;
+    g_tmark_us[g_tmark_n] = timer_get_us();
+    g_tmark_n += 1;
+}
+
+/// Marks, for the C side to format. Returns the count; `name` and `us`
+/// are filled for indices below it.
+export fn sheng_mdss_tmark_get(i: u32, us: *c_ulong) callconv(.c) ?[*:0]const u8 {
+    if (i >= g_tmark_n) return null;
+    us.* = g_tmark_us[i];
+    return g_tmark_name[i];
+}
+
+export fn sheng_mdss_tmark_count() callconv(.c) u32 {
+    return g_tmark_n;
+}
+
+// =====================================================================
+// Bring-up
+//
+// The whole probe sequence. C keeps only the DM plumbing: it calls this,
+// then applies the returned framebuffer description to the video uclass.
+// Nothing here touches a U-Boot struct, so a U-Boot bump cannot silently
+// change a layout underneath it.
+// =====================================================================
+
+// U-Boot's mdelay is a static inline, so there is no symbol to call.
+// Same shape: a loop of udelay(1000), which cannot overflow.
+fn mdelay(msec: c_ulong) void {
+    var left = msec;
+    while (left > 0) : (left -= 1) udelay(1000);
+}
+extern fn cmd_db_read_addr(id: [*:0]const u8) callconv(.c) u32;
+extern fn sheng_ktz8866_set_bias(enable: c_int) callconv(.c) c_int;
+
+/// Framebuffer the caller should hand to the video uclass.
+pub const ShengFb = extern struct {
+    base: usize,
+    size: usize,
+    xsize: u32,
+    ysize: u32,
+    stride: u32,
+    /// 1 when ABL's live pipeline was adopted rather than rebuilt.
+    inherited: c_int,
+};
+
+const PANEL_HACTIVE: u32 = 3048;
+const PANEL_VACTIVE: u32 = 2032;
+
+// 144Hz, nt36532e. Matches the DPU crtc-0 modeline.
+const PANEL_HFRONT_PORCH: u32 = 142;
+const PANEL_HSYNC_WIDTH: u32 = 4;
+const PANEL_HBACK_PORCH: u32 = 92;
+const PANEL_VFRONT_PORCH: u32 = 26;
+const PANEL_VSYNC_WIDTH: u32 = 2;
+const PANEL_VBACK_PORCH: u32 = 138;
+
+// Aligned stride: the DPU fetches at ALIGN(3048,32)*4.
+const FB_ADDR: usize = 0xa3200000;
+const FB_STRIDE: u32 = 12288;
+const DSI_DMA_SCRATCH: usize = 0xa3100000;
+
+// ABL's splash buffer. Stride is TIGHT 3048*4; using ours shears lines.
+const ABL_FB_ADDR: usize = 0xb8000000;
+const ABL_FB_STRIDE: u32 = 12192;
+
+const DISPCC: usize = 0x0af00000;
+const MDSS: usize = 0x0ae00000;
+const DPU: usize = 0x0ae01000;
+const DSI0: usize = 0x0ae94000 + 4;
+const DSI1: usize = 0x0ae96000 + 4;
+const DSI0_PHY: usize = 0x0ae95000;
+const DSI1_PHY: usize = 0x0ae97000;
+
+const GPIO_PANEL_AVDD: u32 = 30;
+const GPIO_PANEL_AVEE: u32 = 31;
+const GPIO_PANEL_RESET: u32 = 133;
+
+/// State the C side formats into /chosen. One struct beats a getter per
+/// field.
+pub const ShengDiag = extern struct {
+    panel_pm: i64 = 0,
+    panel_pm_pre: i64 = 0,
+    fastpath: c_int = 0,
+    fastpath_state_ok: c_int = 0,
+    panel_init_ret: c_int = 0,
+    panel_init_ret_first: c_int = 0x7fffffff,
+    probe_count: u32 = 0,
+    reg: [9]u32 = .{0} ** 9,
+};
+
+var g_diag: ShengDiag = .{};
+
+export fn sheng_mdss_diag_state() callconv(.c) *ShengDiag {
+    return &g_diag;
+}
+
+/// Panel rails up, then nt36532e's reset pulse. Reset is active-low, so
+/// a logical assert is physical LOW.
+fn panelPowerAndReset() void {
+    _ = sheng_ktz8866_set_bias(1);
+    sheng_gpio_set(GPIO_PANEL_AVDD, true);
+    sheng_gpio_set(GPIO_PANEL_AVEE, true);
+    mdelay(1); // regulator-enable-ramp-delay is 233us on both
+
+    sheng_gpio_set(GPIO_PANEL_RESET, false);
+    mdelay(11);
+    sheng_gpio_set(GPIO_PANEL_RESET, true);
+    mdelay(4);
+    sheng_gpio_set(GPIO_PANEL_RESET, false);
+    mdelay(4);
+    sheng_gpio_set(GPIO_PANEL_RESET, true);
+    mdelay(16);
+}
+
+/// cmd-db lookup then the vote. Returns -ENODEV when the resource is
+/// absent.
+fn bcmVote(name: [*:0]const u8) c_int {
+    const addr = cmd_db_read_addr(name);
+    if (addr == 0) return -19;
+    return sheng_bcm_vote(addr);
+}
+
+/// vdds for the DSI PHY and vddio for the panel. Nothing in the DTS marks
+/// them boot-on, so ABL is not guaranteed to leave them up. A PHY without
+/// its analog supply still reports PLL lock while the HS pads never swing:
+/// frames stream, no pixels, no fault.
+fn regulatorVote(name: [*:0]const u8, millivolts: u32) c_int {
+    const addr = cmd_db_read_addr(name);
+    if (addr == 0) return -19;
+    return sheng_regulator_vote(addr, millivolts);
+}
+
+fn fillFramebuffer() void {
+    const words: usize = 3072 * PANEL_VACTIVE; // ALIGN(3048,32)
+    const fb: [*]volatile u32 = @ptrFromInt(FB_ADDR);
+    for (0..words) |i| fb[i] = 0xff000000;
+    flush_dcache_range(FB_ADDR, FB_ADDR + words * 4);
+}
+
+/// Runs the whole bring-up. Returns 0 and fills `fb`, or a negative errno.
+export fn sheng_mdss_bringup(splash_live: c_int, fb: *ShengFb) callconv(.c) c_int {
+    shengStageInit();
+    g_diag.probe_count += 1;
+
+    // Sample ABL's handoff before the cold start destroys it. MDSS reads
+    // are only safe once MDSS_GDSC is powered and the DISPCC AHB clock
+    // runs; reading before that wedges the CPU with no backlight and no
+    // boot. Enable exactly those two -- not dispcc_init(), whose core
+    // reset would wipe the state being sampled.
+    var ret = sheng_mdss_gdsc_enable(DISPCC);
+    if (ret == 0) ret = sheng_mdss_dispcc_ahb_only(DISPCC);
+
+    // Adopt ABL's live pipeline: draw into the buffer it is already
+    // scanning and touch nothing else. Rebuilding it kills a live stream
+    // mid-frame and wedges the DDIC.
+    //
+    // Liveness comes from our own DTB, never from an MDSS register: every
+    // block that could answer "am I streaming?" needs clocks that only run
+    // while it streams, so the read wedges the AHB bus in exactly the case
+    // it exists to detect.
+    if (ret == 0 and splash_live != 0) {
+        fb.* = .{
+            .base = ABL_FB_ADDR,
+            .size = @as(usize, ABL_FB_STRIDE) * PANEL_VACTIVE,
+            .xsize = PANEL_HACTIVE,
+            .ysize = PANEL_VACTIVE,
+            .stride = ABL_FB_STRIDE,
+            .inherited = 1,
+        };
+        shengStage(STATUS_PROBE, 0);
+        return 0;
+    }
+
+    // Stop the controller, not just its power domain. Bringing this
+    // hardware up on top of a live controller does not work. Collapsing
+    // the GDSC and pulsing core reset is not equivalent: it never stops
+    // the DPU timing engines or powers down the PHYs. Do it while GDSC and
+    // AHB are still up, so the registers are reachable.
+    if (ret == 0) sheng_mdss_dsi_phys_off(DSI0_PHY, DSI1_PHY);
+
+    shengTmark("entry");
+
+    _ = sheng_mdss_gdsc_probe(DISPCC, 0);
+    sheng_mdss_gdsc_disable(DISPCC);
+    _ = sheng_mdss_gdsc_probe(DISPCC, 1);
+    mdelay(1);
+    sheng_mdss_core_reset(DISPCC);
+    shengStage(STATUS_MDSS_RESET, 0);
+
+    ret = sheng_mdss_gdsc_enable(DISPCC);
+    shengStage(STATUS_GDSC, ret);
+    if (ret != 0) return ret;
+
+    shengStage(STATUS_BCM_MM0, bcmVote("MM0"));
+    _ = sheng_gcc_disp_hf_axi_enable();
+    shengTmark("gdsc+reset");
+
+    ret = sheng_mdss_dispcc_init(DISPCC);
+    shengStage(STATUS_DISPCC, ret);
+    sheng_mdss_ubwc_init(MDSS);
+    shengTmark("dispcc+ubwc");
+    if (ret != 0) return ret;
+
+    _ = regulatorVote("ldoe1", 880);
+    _ = regulatorVote("ldoe3", 1200);
+    _ = regulatorVote("smpg3", 600);
+    shengTmark("regulators");
+
+    sheng_mdss_dsi_reset_both_phys(DSI0, DSI1);
+
+    ret = sheng_mdss_dsi_phy_init(DSI0_PHY, true);
+    shengStage(STATUS_DSI0_PHY, ret);
+    if (ret != 0) return ret;
+
+    ret = sheng_mdss_dsi_phy_init(DSI1_PHY, false);
+    shengStage(STATUS_DSI1_PHY, ret);
+    if (ret != 0) return ret;
+
+    ret = sheng_mdss_dsi_phy_start_dual(DSI0_PHY, DSI1_PHY);
+    shengStage(STATUS_DSI_PHY_START, ret);
+    shengTmark("dsi phys");
+    if (ret != 0) return ret;
+
+    ret = sheng_mdss_dispcc_dsi_clks_init(DISPCC);
+    shengStage(STATUS_DSI_LINK_CLKS, ret);
+    shengTmark("link clks");
+    if (ret != 0) return ret;
+
+    sheng_mdss_dsi_host_video_prepare(DSI0, DSI1);
+    sheng_mdss_smmu_setup();
+
+    g_diag.panel_pm_pre = sheng_mdss_dsi_read_power_mode_single(DSI0, DSI_DMA_SCRATCH);
+
+    // Fast path: ABL already sent Display Off + Sleep In, so the DDIC
+    // reads 0x08 and is in a known quiet state. Skipping our own sleep and
+    // the rail power-cycle is worth ~335ms.
+    //
+    // Requires the payload 0x08 AND a trustworthy read (CTRL 0x01f7 =
+    // CMD_MODE_EN asserted, BTA issued). Anything else takes the full
+    // power-cycle: never skip work on a measurement that may not have
+    // happened.
+    const pm_pre = g_diag.panel_pm_pre;
+    const quiet = (pm_pre & 0xff) == 0x08 and ((pm_pre >> 16) & 0xffff) == 0x01f7;
+    g_diag.fastpath_state_ok = @intFromBool(quiet);
+    g_diag.fastpath = g_diag.fastpath_state_ok;
+
+    if (!quiet) {
+        sheng_mdss_dsi_panel_sleep(DSI0, DSI1, DSI_DMA_SCRATCH);
+        shengTmark("host+abl sleep");
+
+        sheng_gpio_set(GPIO_PANEL_RESET, false);
+        sheng_gpio_set(GPIO_PANEL_AVEE, false);
+        sheng_gpio_set(GPIO_PANEL_AVDD, false);
+        _ = sheng_ktz8866_set_bias(0);
+
+        // The rails need an off window long enough to discharge, or the
+        // DDIC keeps its state across the power cycle. A panel killed
+        // mid-scan needs the long one.
+        mdelay(1080);
+    }
+
+    panelPowerAndReset();
+    shengTmark("panel pwr cycle");
+
+    ret = sheng_mdss_dsi_panel_init(DSI0, DSI1, DSI_DMA_SCRATCH, true);
+    shengTmark("panel DCS init");
+    g_diag.panel_init_ret = ret;
+    if (g_diag.panel_init_ret_first == 0x7fffffff) g_diag.panel_init_ret_first = ret;
+    shengStage(STATUS_DSI_PANEL, ret);
+    if (ret != 0) return ret;
+
+    sheng_mdss_dsi_trig_ctrl_restore(DSI0, DSI1);
+
+    fillFramebuffer();
+    shengTmark("fb clear");
+
+    ret = sheng_mdss_dpu_start(
+        DPU, DSI0, DSI1, FB_ADDR,
+        PANEL_HACTIVE, PANEL_VACTIVE,
+        PANEL_HFRONT_PORCH, PANEL_HBACK_PORCH, PANEL_HSYNC_WIDTH,
+        PANEL_VFRONT_PORCH, PANEL_VBACK_PORCH, PANEL_VSYNC_WIDTH,
+        true,
+    );
+    shengTmark("dpu start");
+
+    const intf1 = DPU + 0x35000;
+    g_diag.reg[0] = mmioRead32(DSI0, 0x004);
+    g_diag.reg[1] = mmioRead32(DSI0, 0x008);
+    g_diag.reg[2] = mmioRead32(DSI0, 0x0a4);
+    g_diag.reg[3] = mmioRead32(DSI0, 0x064);
+    g_diag.reg[4] = mmioRead32(DSI0, 0x0bc);
+    g_diag.reg[5] = mmioRead32(DISPCC, 0x010);
+    g_diag.reg[6] = mmioRead32(intf1, 0x0ac);
+    mdelay(8);
+    g_diag.reg[7] = mmioRead32(intf1, 0x0ac);
+    g_diag.reg[8] = mmioRead32(DSI0, 0x008);
+
+    g_diag.panel_pm = sheng_mdss_dsi_read_power_mode_single(DSI0, DSI_DMA_SCRATCH);
+    shengStage(STATUS_DPU, ret);
+    if (ret != 0) return ret;
+
+    fb.* = .{
+        .base = FB_ADDR,
+        .size = @as(usize, FB_STRIDE) * PANEL_VACTIVE,
+        .xsize = PANEL_HACTIVE,
+        .ysize = PANEL_VACTIVE,
+        .stride = FB_STRIDE,
+        .inherited = 0,
+    };
+    shengStage(STATUS_PROBE, 0);
+    return 0;
+}
