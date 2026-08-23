@@ -893,7 +893,7 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3000),
 				    11 * 4);
 			fdt_setprop(blob, nodeoff, "sheng,uclass-get-device-ret",
-				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3020),
+				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3040),
 				    4);
 			/* Log ring: a u32 entry count then up to 64 (tag,
 			 * value) pairs, 516 bytes. Relay the whole fixed
@@ -1017,11 +1017,12 @@ void qcom_late_init(void)
 		int vret;
 
 		vret = uclass_get_device(UCLASS_VIDEO, 0, &vdev);
-		/* Separate slot from the driver's own stage array, so it is
-		 * populated even when probe() is never entered: tells "no
-		 * video device bound" (-ENODEV) from "bound, probe failed". */
+		/* Clear of the stage array at 0x3000, which is 11 slots and
+		 * runs to 0x302b. Populated even when probe() is never
+		 * entered, so "no video device bound" (-ENODEV) is
+		 * distinguishable from "bound, probe failed". */
 		if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
-			*(volatile int *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3020) = vret;
+			*(volatile int *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3040) = vret;
 	}
 
 	log_debug("sheng: late_init done at %lu ms\n", timer_get_us() / 1000);

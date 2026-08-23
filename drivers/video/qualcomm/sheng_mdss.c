@@ -284,8 +284,6 @@ static void sheng_mdss_panel_power_and_reset(void)
 	sheng_gpio_set(TLMM_PANEL_AVEE_GPIO, true);
 	mdelay(1); /* regulator-enable-ramp-delay is 233us on both */
 
-	SHENG_DBG_PIN("avdd", TLMM_PANEL_AVDD_GPIO);
-	SHENG_DBG_PIN("avee", TLMM_PANEL_AVEE_GPIO);
 
 	/* nt36532e_reset(). The reset line is active-low, so a logical
 	 * assert is physical LOW. Delays are the panel driver's. */
@@ -295,16 +293,12 @@ static void sheng_mdss_panel_power_and_reset(void)
 	 * always worked; left alone rather than churn the panel path,
 	 * which has a known intermittent init. */
 	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, false);
-	SHENG_DBG_PIN("rst assert1", TLMM_PANEL_RESET_GPIO);
 	mdelay(11);
 	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, true);
-	SHENG_DBG_PIN("rst deassert1", TLMM_PANEL_RESET_GPIO);
 	mdelay(4);
 	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, false);
-	SHENG_DBG_PIN("rst assert2", TLMM_PANEL_RESET_GPIO);
 	mdelay(4);
 	sheng_gpio_set(TLMM_PANEL_RESET_GPIO, true);
-	SHENG_DBG_PIN("rst deassert2", TLMM_PANEL_RESET_GPIO);
 	mdelay(16);
 }
 
@@ -314,7 +308,6 @@ static int sheng_mdss_bcm_vote(const char *bcm_name)
 {
 	u32 addr = cmd_db_read_addr(bcm_name);
 
-	SHENG_DBG_LOG(SHENG_LOG_CMDDB_MM0_ADDR, addr);
 	if (!addr)
 		return -ENODEV;
 
@@ -493,6 +486,10 @@ static int sheng_mdss_probe(struct udevice *dev)
 	int bias_ret;
 	int ret;
 
+	/* Before anything can return: the inherit path below exits early,
+	 * and an uninitialised array reports stale DRAM as stage codes. */
+	sheng_mdss_stage_init();
+
 	/* Sample ABL's handoff state before the cold start below destroys
 	 * it. ABL uses continuous splash, so it hands over with DPU, DSI,
 	 * PHY and panel all running.
@@ -506,22 +503,9 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * GDSC enable is idempotent, and dispcc_ahb_only() parents AHB from
 	 * XO, so neither disturbs ABL's DSI/PHY configuration. */
 	ret = sheng_mdss_gdsc_enable(SM8550_DISPCC_BASE);
-	BBS("abl_gdsc_enable_ret", ret);
-	SHENG_DBG_ENV("sheng_mdss_abl_gdsc", (unsigned long)ret);
 	if (!ret) {
 		ret = sheng_mdss_dispcc_ahb_only(SM8550_DISPCC_BASE);
 		if (!ret) {
-			SHENG_DBG_ENV("sheng_mdss_abl1",
-				    (unsigned long)sheng_mdss_abl_state1(
-					    SM8550_MDSS_DSI0_BASE));
-			SHENG_DBG_ENV("sheng_mdss_abl2",
-				    (unsigned long)sheng_mdss_abl_state2(
-					    SM8550_MDSS_DSI0_BASE,
-					    SM8550_MDSS_DSI1_BASE));
-			SHENG_DBG_ENV("sheng_mdss_abl3",
-				    (unsigned long)sheng_mdss_abl_state3(
-					    SM8550_MDSS_DSI0_PHY_BASE,
-					    SM8550_MDSS_DSI1_PHY_BASE));
 
 			/* Continuous-splash inherit.
 			 *
@@ -609,18 +593,11 @@ static int sheng_mdss_probe(struct udevice *dev)
 
 	/* Panel GPIOs as ABL left them. TLMM is always clocked, so these
 	 * reads are safe this early -- MDSS registers are not. */
-	SHENG_DBG_PIN("abl rst", TLMM_PANEL_RESET_GPIO);
-	SHENG_DBG_PIN("abl avdd", TLMM_PANEL_AVDD_GPIO);
-	SHENG_DBG_PIN("abl avee", TLMM_PANEL_AVEE_GPIO);
 
-	sheng_mdss_stage_init();
 	sheng_probe_count++;
 	sheng_tmark("entry");
 
 	priv->mdss_base = dev_read_addr(dev);
-	SHENG_DBG_START();
-	BBM("probe entry");
-	BBV("mdss_base", priv->mdss_base);
 	if (priv->mdss_base == FDT_ADDR_T_NONE)
 		return -EINVAL;
 
@@ -631,7 +608,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * it left mid-configured. */
 	sheng_mdss_gdsc_probe(SM8550_DISPCC_BASE, 0);
 	sheng_mdss_gdsc_disable(SM8550_DISPCC_BASE);
-	BBM("gdsc collapsed");
 	sheng_mdss_gdsc_probe(SM8550_DISPCC_BASE, 1);
 	mdelay(1);
 
@@ -639,7 +615,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * the GDSC or any clock is parsed. It resets the whole MDSS wrapper;
 	 * each host's own DSI_RESET only covers that host. */
 	sheng_mdss_core_reset(SM8550_DISPCC_BASE);
-	BBM("mdss core reset pulsed");
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_MDSS_RESET, 0);
 
 	ret = sheng_mdss_gdsc_enable(SM8550_DISPCC_BASE);
@@ -656,7 +631,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * the AXI gate for MASTER_MDP closed. */
 	ret = sheng_mdss_bcm_vote("MM0");
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_BCM_MM0, ret);
-	SHENG_DBG_ENV("sheng_mdss_bcm_mm0", (unsigned long)ret);
 
 	/* GCC_DISP_HF_AXI_CLK must be on before any DSI command DMA: it is
 	 * the AXI path the engine fetches packets over. Gated, the engine
@@ -666,12 +640,9 @@ static int sheng_mdss_probe(struct udevice *dev)
 	/* Keep the call OUT of the macro: with debug off the macro discards
 	 * its arguments and the clock would never be enabled. */
 	axi_cbcr = sheng_gcc_disp_hf_axi_enable();
-	SHENG_DBG_LOG(SHENG_LOG_GCC_HF_AXI_READBACK, axi_cbcr);
 	sheng_tmark("gdsc+reset");
 
 	ret = sheng_mdss_dispcc_init(SM8550_DISPCC_BASE);
-	BBS("dispcc_init_ret", ret);
-	BBB("DISPCC after init", SM8550_DISPCC_BASE, 0x000, 64);
 	sheng_mdss_phy144_mark(1, SM8550_MDSS_DSI0_PHY_BASE);
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DISPCC, ret);
 	/* UBWC block config, immediately after the MDSS core reset inside
@@ -679,16 +650,12 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * Must precede any DSI/DPU programming, matching msm_mdss_enable(). */
 	sheng_mdss_ubwc_init(SM8550_MDSS_BASE);
 	sheng_tmark("dispcc+ubwc");
-	SHENG_DBG_ENV("sheng_mdss_dispcc", (unsigned long)ret);
 	if (ret)
 		return ret;
 
 	/* dispcc_init() only proves the CBCR halt-poll passed, not that the
 	 * RCG CFG landed. Expect src_sel=1 (PLL0_OUT_MAIN, bits [10:8]) and
 	 * src_div=5 (2*3-1 for /3, bits [4:0]) for 514MHz. */
-	SHENG_DBG_LOG(SHENG_LOG_MDP_RCG_CFG_READBACK,
-		      readl((void __iomem *)(uintptr_t)
-			    (SM8550_DISPCC_BASE + MDP_CLK_SRC_CFG_RCGR)));
 
 	/* Real analog supply rails for the DSI PHYs/hosts/panel logic --
 	 * see sheng_mdss_regulator_vote()'s comment. Both DSI PHYs share
@@ -701,14 +668,10 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * by the DTS label. vreg_l1e_0p88 is ldoe1, vreg_l3e_1p2 is ldoe3,
 	 * vreg_s3g_0p7 is smpg3. */
 	ret = sheng_mdss_regulator_vote("ldoe1", 880);
-	SHENG_DBG_ENV("sheng_mdss_vreg_l1e", (unsigned long)ret);
 	ret = sheng_mdss_regulator_vote("ldoe3", 1200);
-	SHENG_DBG_ENV("sheng_mdss_vreg_l3e", (unsigned long)ret);
 	ret = sheng_mdss_regulator_vote("smpg3", 600);
-	BBS("regulator_votes_ret", ret);
 	sheng_mdss_phy144_mark(2, SM8550_MDSS_DSI0_PHY_BASE);
 	sheng_tmark("regulators");
-	SHENG_DBG_ENV("sheng_mdss_vreg_s3g", (unsigned long)ret);
 
 	/* Dual-DSI split-link panel: DSI0 is master (drives its own PLL),
 	 * DSI1 is slave (sources its bit clock from DSI0 over
@@ -716,17 +679,13 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * in sheng_mdss_hw.zig. Both must succeed. */
 	sheng_mdss_dsi_reset_both_phys(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE);
 	ret = sheng_mdss_dsi_phy_init(SM8550_MDSS_DSI0_PHY_BASE, true);
-	BBS("phy0_init_ret", ret);
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI0_PHY, ret);
-	SHENG_DBG_ENV("sheng_mdss_dsi0_phy", (unsigned long)ret);
 	if (ret)
 		return ret;
 
 	ret = sheng_mdss_dsi_phy_init(SM8550_MDSS_DSI1_PHY_BASE, false);
-	BBS("phy1_init_ret", ret);
 	sheng_mdss_phy144_mark(3, SM8550_MDSS_DSI0_PHY_BASE);
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI1_PHY, ret);
-	SHENG_DBG_ENV("sheng_mdss_dsi1_phy", (unsigned long)ret);
 	if (ret)
 		return ret;
 
@@ -739,10 +698,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	ret = sheng_mdss_dsi_phy_start_dual(SM8550_MDSS_DSI0_PHY_BASE,
 					     SM8550_MDSS_DSI1_PHY_BASE);
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI_PHY_START, ret);
-	SHENG_DBG_ENV("sheng_mdss_phy_start", (unsigned long)ret);
-	BBS("phy_start_dual_ret", ret);
-	BBR("PHY0 STATUS", SM8550_MDSS_DSI0_PHY_BASE, 0x140);
-	BBR("PHY1 STATUS", SM8550_MDSS_DSI1_PHY_BASE, 0x140);
 	sheng_mdss_phy144_mark(4, SM8550_MDSS_DSI0_PHY_BASE);
 	sheng_tmark("dsi phys");
 	if (ret)
@@ -756,7 +711,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI_LINK_CLKS, ret);
 	sheng_mdss_phy144_mark(5, SM8550_MDSS_DSI0_PHY_BASE);
 	sheng_tmark("link clks");
-	SHENG_DBG_ENV("sheng_mdss_dsi_clks", (unsigned long)ret);
 	if (ret)
 		return ret;
 
@@ -784,24 +738,15 @@ static int sheng_mdss_probe(struct udevice *dev)
 	sheng_panel_pm_pre = sheng_mdss_dsi_read_power_mode_single(
 				SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH);
 
-	/* FAST PATH: ABL already slept the panel for us.
+	/* Fast path: ABL already sent Display Off + Sleep In, so the DDIC
+	 * reads 0x08 and is in a known quiet state. Our own sleep (87ms) and
+	 * the rail power-cycle (248ms) exist to recover an UNKNOWN state, so
+	 * both can be skipped -- worth ~335ms of the black gap.
 	 *
-	 * Measured (b367): ABL hands the DDIC over reading 0x08 -- sleep-in,
-	 * display-off. It does not merely stop feeding a live panel, it
-	 * sends Display Off + Sleep In itself. So our own Display Off +
-	 * Sleep In (87ms) is re-sleeping an already-slept panel, and the
-	 * rail power-cycle (248ms) exists to recover a DDIC in an UNKNOWN
-	 * state -- which this demonstrably is not.
-	 *
-	 * A cleanly-slept DDIC plus the reset pulse below should accept a
-	 * fresh init without ever losing power. Worth ~335ms of the ~1.2s
-	 * black gap between the Xiaomi logo and U-Boot's first pixels.
-	 *
-	 * Guarded on BOTH the payload being exactly 0x08 AND the read being
-	 * trustworthy (CTRL 0x01f7 = CMD_MODE_EN asserted, BTA genuinely
-	 * issued). A null or untrustworthy read falls through to the proven
-	 * full power-cycle -- never skip work on the strength of a
-	 * measurement that might not have happened.
+	 * Requires BOTH the payload 0x08 and a trustworthy read (CTRL 0x01f7
+	 * = CMD_MODE_EN asserted, BTA issued). Anything else falls through
+	 * to the full power-cycle: never skip work on a measurement that
+	 * might not have happened.
 	 */
 	sheng_fastpath_state_ok = ((sheng_panel_pm_pre & 0xff) == 0x08) &&
 				  (((sheng_panel_pm_pre >> 16) & 0xffff) == 0x01f7);
@@ -823,51 +768,25 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * Load-bearing, so the call stays out of the macro: with debug off
 	 * the macro discards its arguments. */
 	bias_ret = sheng_ktz8866_set_bias(0);
-	BBS("bias OFF over i2c", bias_ret);
 
 	/* The rails need an off window long enough to discharge, or the DDIC
-	 * keeps its state across the power cycle. Sampled twice on the way:
-	 * both must read 0.
+	 * keeps its state across the power cycle. Sampled twice; both must
+	 * read 0.
 	 *
-	 * BIGGEST BOOT-TIME KNOB IN THE DRIVER, and the one most worth
-	 * distrusting. The old 1080ms total was tuned in the era when
-	 * LCD_BIAS_EN was still latched over I2C, so the rails never
-	 * collapsed at all and NO window would have worked -- "shorter than
-	 * ~1s fails" was measuring the latch, not a discharge time. Now that
-	 * sheng_ktz8866_set_bias(0) genuinely drops them, what is left is an
-	 * actual RC discharge, which is far shorter.
-	 *
-	 * 200ms is a guess with margin, not a measurement. Soak it
-	 * (soak.sh) before trusting it, and if panel init goes intermittent
-	 * raise this before touching either pacing knob. */
+	 * Biggest boot-time knob here. 200ms carries margin but is not a
+	 * measured discharge time -- soak it before trusting it, and raise
+	 * it first if panel init goes intermittent. */
 	{
-		/* ADAPTIVE, because the right value depends on what ABL
-		 * handed us:
-		 *
-		 *   0x08 (cleanly slept)  -> 200ms is proven good (b353-b374,
-		 *        many boots). ABL sent Display Off + Sleep In itself,
-		 *        so the DDIC is already in a known, quiet state.
-		 *
-		 *   anything else -> use the original 1080ms. Once
-		 *        /reserved-memory/splash_region is advertised, ABL
-		 *        hands over a LIVE, STREAMING panel instead (b375:
-		 *        pm_pre_val=00, bias 0x9f, different GDSC state), and
-		 *        200ms did NOT recover it -- no picture at all. A
-		 *        panel killed mid-scan is the case the long window was
-		 *        tuned for.
-		 *
-		 * Erring long on the unknown path costs boot time only when we
-		 * cannot prove the panel was quiescent, which is the right way
-		 * round.
+		/* Depends on what ABL handed over. A cleanly slept DDIC
+		 * (0x08) recovers in 200ms. Anything else may be a panel
+		 * killed mid-scan, which 200ms does not recover -- give it
+		 * the full 1080ms. Erring long costs boot time only when the
+		 * panel cannot be proven quiescent.
 		 */
 		const unsigned int discharge_ms = sheng_fastpath_state_ok ? 200 : 1080;
 
 		mdelay(20);
-		SHENG_DBG_PIN("avdd during off", TLMM_PANEL_AVDD_GPIO);
-		SHENG_DBG_PIN("avee during off", TLMM_PANEL_AVEE_GPIO);
 		mdelay(60);
-		SHENG_DBG_PIN("avdd late in off", TLMM_PANEL_AVDD_GPIO);
-		SHENG_DBG_PIN("avee late in off", TLMM_PANEL_AVEE_GPIO);
 		mdelay(discharge_ms - 80);
 	}
 	} /* !sheng_fastpath */
@@ -878,7 +797,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * actually prepares it for a fresh init. */
 	sheng_mdss_panel_power_and_reset();
 	sheng_tmark("panel pwr cycle");
-	BBM("panel powered + reset pulsed");
 	sheng_mdss_phy144_mark(6, SM8550_MDSS_DSI0_PHY_BASE);
 
 	/* CLK_STATUS (0x11c) reports which clocks are physically active.
@@ -894,13 +812,7 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * Sampled before the first command and again at end of probe, so a
 	 * clock that starts late is distinguishable from one that never
 	 * runs. */
-	SHENG_DBG_ENV("sheng_mdss_clkstat_pre",
-		    (unsigned long)*(volatile u32 *)(uintptr_t)(SM8550_MDSS_DSI0_BASE + 0x11c));
 
-	SHENG_DBG_ENV("sheng_mdss_preaud",
-		    (unsigned long)sheng_mdss_dsi_audit(SM8550_MDSS_DSI0_BASE));
-	SHENG_DBG_ENV("sheng_mdss_preaud1",
-		    (unsigned long)sheng_mdss_dsi1_audit(SM8550_MDSS_DSI1_BASE));
 
 	ret = sheng_mdss_dsi_panel_init(SM8550_MDSS_DSI0_BASE, SM8550_MDSS_DSI1_BASE,
 					 SHENG_MDSS_DSI_DMA_SCRATCH, true);
@@ -908,17 +820,8 @@ static int sheng_mdss_probe(struct udevice *dev)
 	sheng_panel_init_ret = ret;
 	if (sheng_panel_init_ret_first == 0x7fffffff)
 		sheng_panel_init_ret_first = ret;
-	BBS("panel_init_ret", ret);
-	BBR("DSI0 CTRL", SM8550_MDSS_DSI0_BASE, 0x000);
-	BBR("DSI0 STATUS0", SM8550_MDSS_DSI0_BASE, 0x004);
-	BBR("DSI0 FIFO", SM8550_MDSS_DSI0_BASE, 0x008);
-	BBR("DSI0 LANE_STATUS", SM8550_MDSS_DSI0_BASE, 0x0a4);
-	BBR("DSI0 ACK_ERR", SM8550_MDSS_DSI0_BASE, 0x068);
-	BBR("DSI0 TIMEOUT", SM8550_MDSS_DSI0_BASE, 0x0bc);
 	sheng_mdss_phy144_mark(7, SM8550_MDSS_DSI0_PHY_BASE);
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DSI_PANEL, ret);
-	SHENG_DBG_ENV("sheng_mdss_panel", (unsigned long)ret);
-	SHENG_DBG_POST_PANEL_REPORT();
 	if (ret)
 		return ret;
 
@@ -950,9 +853,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 		flush_dcache_range(SHENG_MDSS_FB_ADDR,
 				    SHENG_MDSS_FB_ADDR + fb_words * 4);
 		dsb();
-		SHENG_DBG_ENV("sheng_mdss_fb_readback",
-			    (((unsigned long)fb[0]) << 32) |
-			    (unsigned long)fb[fb_words - 1]);
 	}
 	sheng_tmark("fb clear");
 
@@ -1006,28 +906,18 @@ static int sheng_mdss_probe(struct udevice *dev)
 				SM8550_MDSS_DSI0_BASE, SHENG_MDSS_DSI_DMA_SCRATCH);
 
 	SHENG_DBG_STAGE(SHENG_MDSS_STATUS_DPU, ret);
-	SHENG_DBG_ENV("sheng_mdss_dpu_start", (unsigned long)ret);
-	BBM("dpu_start done");
-	BBR("DSI0 STATUS0 post-dpu", SM8550_MDSS_DSI0_BASE, 0x004);
-	BBR("DSI0 LANE_STATUS post-dpu", SM8550_MDSS_DSI0_BASE, 0x0a4);
 	/* FIFO_STATUS reports a starved link directly: 0x00001210 is healthy,
 	 * 0x11111210 sets all four DLN*_HS_FIFO_EMPTY bits and means mdp_clk
 	 * is running slow. */
-	BBR("DSI0 FIFO_STATUS post-dpu", SM8550_MDSS_DSI0_BASE, 0x008);
-	BBR("DSI1 FIFO_STATUS post-dpu", SM8550_MDSS_DSI1_BASE, 0x008);
 	/* PLL0 rate readback. Expect L_VAL 0x44440050, ALPHA 0x00005000.
 	 * Anything else means the write did not stick because the PLL was
 	 * locked, and the rate change needs a disable-reconfigure-relock. */
-	BBR("DISPCC PLL0 L_VAL", SM8550_DISPCC_BASE, 0x010);
-	BBR("DISPCC PLL0 ALPHA", SM8550_DISPCC_BASE, 0x014);
-	BBR("INTF1 FRAME_COUNT", SM8550_MDSS_DPU_BASE + 0x35000, 0x0ac);
 	if (ret)
 		return ret;
 
 	/* Everything past dpu_start is instrumentation. Costs a 550ms
 	 * settle and many MMIO reads of live blocks; compiled out
 	 * unless CONFIG_VIDEO_SHENG_MDSS_DEBUG=y. */
-	SHENG_DBG_POST_DPU_REPORT();
 
 	/* Hand the framebuffer to the video uclass. All of this must run
 	 * BEFORE probe returns -- anything below the return is dead code and
@@ -1060,7 +950,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 		ret = lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &fb, len, LMB_NONE);
 		if (ret)
 			log_warning("sheng_mdss: framebuffer not reserved (%d)\n", ret);
-		SHENG_DBG_ENV("sheng_mdss_fb_reserve", (unsigned long)ret);
 	}
 
 	uc_priv->xsize = SHENG_PANEL_HACTIVE;
@@ -1089,7 +978,6 @@ static int sheng_mdss_probe(struct udevice *dev)
 	 * that is a 24MB flush per character. */
 	video_set_flush_dcache(dev, true);
 
-	SHENG_DBG_FINAL_DUMP();
 
 	sheng_tmark("handoff");
 	sheng_tmark_report();
