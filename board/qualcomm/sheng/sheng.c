@@ -98,23 +98,14 @@ static u32 sheng_backlight_gpio_enable(void)
 	return sheng_backlight_gpio_set(1);
 }
 
-/* What state ABL left the display in, sampled at board_init() -- before
- * anything of ours has touched it.
+/* Display state as ABL left it, sampled at board_init() before anything
+ * of ours touches it. bit0 is the pin level, bit1 the driven value.
  *
- * This decides where the black gap between the Xiaomi logo and U-Boot's
- * log actually begins. If the backlight EN and the panel rails are still
- * high here, ABL handed over a lit panel and the gap starts ~20ms later
- * when our probe collapses the MDSS GDSC. If they are already low, ABL
- * blanked on its way out and the gap additionally covers U-Boot's whole
- * pre-video init, which no amount of trimming inside the probe can
- * recover.
+ * TLMM is always clocked, so these reads are safe this early. MDSS
+ * registers are not.
  *
- * Read-only MMIO on TLMM, which is always clocked, so this is safe this
- * early -- MDSS registers would not be. bit0 of each is the actual pin
- * level, bit1 the driven value.
- *
- * Duplicated GPIO numbers rather than including sheng_mdss_regs.h: this
- * file must still build with CONFIG_VIDEO_SHENG_MDSS off.
+ * GPIO numbers are duplicated rather than including sheng_mdss_regs.h:
+ * this file must still build with CONFIG_VIDEO_SHENG_MDSS off.
  */
 #define SHENG_PANEL_AVDD_GPIO	30
 #define SHENG_PANEL_AVEE_GPIO	31
@@ -129,20 +120,9 @@ static u32 sheng_tlmm_io_read(unsigned int gpio)
 		(SHENG_TLMM_BASE + 0x4 + SHENG_TLMM_GPIO_REG_SIZE * gpio);
 }
 
-/* KTZ8866 state as ABL left it: BL_EN, brightness, and the LCD bias
- * enable, read before anything of ours writes to the chip.
- *
- * HOW DID ABL BLANK THE PANEL? It leaves the rails and EN high but the
- * screen dark, and there are three candidate mechanisms with very
- * different consequences:
- *
- *   brightness 0, BL_EN set  -> it dimmed the backlight. The DDIC may
- *                               still be initialised and even scanning;
- *                               restoring could be a single I2C write.
- *   BL_EN clear              -> it disabled the current sinks.
- *   both look live           -> it blanked over DCS (display-off /
- *                               sleep-in) or stopped the DPU, and
- *                               pm_pre_val will say which.
+/* KTZ8866 state as ABL left it, read before anything of ours writes to
+ * the chip. Diagnostic only: LCD_BIAS_CFG1 reflects whoever programmed
+ * the chip last, which on a warm reboot is Linux, not ABL.
  *
  * Packed: BL_EN << 24 | BRT_MSB << 16 | BRT_LSB << 8 | LCD_BIAS_CFG1.
  */
@@ -502,21 +482,15 @@ static void sheng_ktz8866_backlight_init(void)
 	sheng_ktz8866_status_set(1, ret);
 }
 
-/* XBL/ABL's own log, scraped out of the reserved region it writes into.
+/* XBL/ABL's own log, scraped from the region it writes into.
  *
- * xbl-dt-log-region@81a00000 (256KB) is declared in this board's DTS and
- * is where the earlier boot stages log. Linux CANNOT read it -- it is
- * no-map, so /dev/mem returns EFAULT (measured) -- but U-Boot has plain
- * access, so relaying it through /chosen is the only way to ever see
- * what ABL said.
+ * xbl-dt-log-region@81a00000 is no-map, so Linux cannot read it --
+ * /dev/mem returns EFAULT. U-Boot has plain access, so relaying it
+ * through /chosen is the only way to see what ABL said.
  *
- * Worth having because ABL blanks the panel before handing over and we
- * have no idea why. If it logs anything about display teardown, it is
- * sitting in DRAM on every single boot, free.
- *
- * Scans for the first printable ASCII run of at least MINRUN characters
- * and copies from there, so a region full of binary or zeros costs a
- * scan and yields an empty property rather than garbage.
+ * Scans for the first printable ASCII run of at least MINRUN characters,
+ * so a region of binary or zeros yields an empty property rather than
+ * garbage.
  */
 #define SHENG_XBL_LOG_ADDR	0x81a00000
 #define SHENG_XBL_LOG_SIZE	0x40000
@@ -695,28 +669,17 @@ static int sheng_xbl_log_scrape(char *out, int outlen)
 	return n + 1;
 }
 
-/* PON (power-on) register dump, for working out WHY the board booted.
+/* Dump both PON peripherals, to tell a power-key boot from a cable
+ * insert.
  *
- * Plugging in a charger boots this device, because ABL has an
- * offline-charging path we do not implement -- its own binary carries
- * "PON Reason is %d cold_boot:%d charger path: %d" and
- * "androidboot.mode=charger". To do the same, U-Boot has to distinguish
- * a power-key boot from a cable-insert boot, then shut down on the
- * latter.
- *
- * This is the MEASUREMENT step, deliberately separated from any fix.
- * The PON reason register offsets differ between PON generations, and
- * this is a GEN3 part (qcom,pmk8350-pon). Writing a shutdown sequence
- * based on a guessed offset is how "boots when you plug in" becomes
- * "reboot-loops when you plug in", which is strictly worse and needs
- * fastboot to escape. So: dump both PON peripherals read-only, compare a
- * key boot against a charger boot, and only then write code.
- *
- * pmk8550 is pmic@0 (usid 0). U-Boot's qcom PMIC addresses registers as
+ * pmk8550 is pmic@0. U-Boot's qcom PMIC addresses registers as
  * (PID << 8) | offset, so pon@1300's HLOS half is PID 0x13 and the PBS
- * half at 0x800 is PID 0x08 -- the reason registers live in one of them.
+ * half at 0x800 is PID 0x08.
  *
- * READ-ONLY. Nothing here writes to the PMIC.
+ * READ-ONLY. The reason offsets differ between PON generations and this
+ * is a GEN3 part; a shutdown written against a guessed offset turns
+ * "boots when you plug in" into "reboot-loops when you plug in", which
+ * only fastboot escapes.
  */
 static int sheng_pon_dump(char *out, int outlen)
 {
@@ -895,12 +858,14 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 			fdt_setprop(blob, nodeoff, "sheng,uclass-get-device-ret",
 				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3040),
 				    4);
-			/* Log ring: a u32 entry count then up to 64 (tag,
-			 * value) pairs, 516 bytes. Relay the whole fixed
-			 * region; the count says how much is valid. */
-			fdt_setprop(blob, nodeoff, "sheng,mdss-log",
-				    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3100),
-				    4 + 64 * 8);
+			/* Log ring: a u32 count then up to 64 (tag, value)
+			 * pairs. Only sheng_mdss_debug.c writes it, so
+			 * without that build it is 516 bytes of zeros in
+			 * the device tree. */
+			if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS_DEBUG))
+				fdt_setprop(blob, nodeoff, "sheng,mdss-log",
+					    (void *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3100),
+					    4 + 64 * 8);
 			/* Per-chip KTZ8866 status, [chip_a, chip_b], same
 			 * convention as mdss-status. Sits clear of the log
 			 * ring, which ends at 0x3304. */
