@@ -161,23 +161,18 @@ static int sheng_fastpath_state_ok;
 static u32 sheng_diag[SHENG_DIAG_N];
 static int sheng_panel_init_ret;
 
-/* THE PROBE CAN RUN TWICE, and that is the intermittent-glitch bug.
+/* The probe can run twice, which corrupts a half-configured DDIC.
  *
- * qcom_late_init() force-probes the video device with
- * uclass_get_device(). stdio_add_devices() already probed it at initcall
- * 729. Normally DM returns the cached, activated device and the second
- * call is free -- but if probe #1 FAILED, the device was never
- * activated, so that call runs the ENTIRE probe again: second GDSC
- * collapse, second MDSS core reset, second panel power-cycle, second
- * 94-command init, on a DDIC left mid-bring-up by the first attempt.
+ * stdio_add_devices() probes the video device, then qcom_late_init()
+ * force-probes it again. Normally DM returns the cached device and the
+ * second call is free. But if probe #1 FAILED the device was never
+ * activated, so the second call reruns everything: another GDSC
+ * collapse, core reset, panel power-cycle and 94-command init, on a
+ * panel left mid-bring-up.
  *
- * The retry then overwrites all 11 stage codes with 0 and panel_init
- * with its own success, which is why every existing instrument reported
- * a clean boot -- including soak.sh, which called 6/6 boots good while
- * the panel was visibly corrupt.
- *
- * Keep the FIRST attempt's result separately; it is the one that says
- * why the panel is broken.
+ * The retry also overwrites all 11 stage codes with 0, so a failed boot
+ * reports clean. Keep the FIRST attempt's result; it says why the panel
+ * is broken.
  */
 /* Did we inherit ABL's live display instead of rebuilding it? Drives the
  * handover to Linux in board_preboot_os(). */
@@ -528,44 +523,28 @@ static int sheng_mdss_probe(struct udevice *dev)
 					    SM8550_MDSS_DSI0_PHY_BASE,
 					    SM8550_MDSS_DSI1_PHY_BASE));
 
-			/* CONTINUOUS-SPLASH INHERIT.
+			/* Continuous-splash inherit.
 			 *
 			 * With /reserved-memory/splash_region advertised, ABL
-			 * stops blanking ~2s before handover and hands over a
-			 * LIVE, STREAMING display. Do not rebuild it: draw
-			 * into the buffer it is already scanning and touch
-			 * nothing else. That removes the entire black gap
-			 * between the Xiaomi logo and U-Boot's first pixels,
-			 * and it avoids the failure that made every rebuild
-			 * attempt fail -- the teardown below kills a live
-			 * stream mid-frame and wedges the DDIC beyond
-			 * recovery.
+			 * hands over a live, streaming display. Draw into the
+			 * buffer it is already scanning and touch nothing else.
+			 * That removes the black gap after the Xiaomi logo, and
+			 * avoids the teardown below killing a live stream
+			 * mid-frame, which wedges the DDIC beyond recovery.
 			 *
-			 * NO MDSS REGISTER MAY BE READ TO DECIDE THIS.
+			 * NO MDSS REGISTER MAY BE READ TO DECIDE THIS. Every block
+			 * that could report "am I streaming?" needs clocks that
+			 * only run WHILE IT STREAMS, so the read answers correctly
+			 * when live and WEDGES THE AHB BUS in the case it exists
+			 * to detect. Recovery is fastboot. That rules out DPU
+			 * INTF/SSPP and DSI CLK_STATUS alike.
 			 *
-			 * Every block that could report "am I streaming?"
-			 * needs clocks that only run WHEN IT IS STREAMING, so
-			 * such a probe answers correctly in the live case and
-			 * WEDGES THE AHB BUS in the case it exists to detect
-			 * -- no backlight, no boot, fastboot recovery. Three
-			 * of them: DPU INTF/SSPP (b386), the same behind a
-			 * clock-status gate (b387), and DSI0 CLK_STATUS
-			 * (b392), which is no safer for being a DSI register.
+			 * Liveness comes from sheng_abl_splash_live, decided in
+			 * qcom_board_init() from our own DTB.
 			 *
-			 * Liveness comes from sheng_abl_splash_live instead,
-			 * decided in qcom_board_init() from a KTZ8866 register
-			 * over I2C -- independent of MDSS and always readable.
-			 * See its comment there for why 0x9f/0x98, and why the
-			 * test is deliberately conservative.
-			 *
-			 * The buffer geometry is known rather than probed:
-			 *   0xb8000000  = splash_region's base, the address
-			 *                 ABL was measured scanning from
-			 *                 (VIG0 SRC0_ADDR, b383)
-			 *   12192       = VIG0 YSTRIDE0, a TIGHT 3048*4.
-			 *                 NOT this driver's own 12288
-			 *                 (ALIGN(3048,32)*4) -- using that
-			 *                 would shear every line.
+			 * Geometry is known, not probed. The stride is ABL's
+			 * TIGHT 3048*4, not this driver's aligned 12288; using
+			 * ours shears every line.
 			 */
 			if (sheng_abl_splash_live) {
 				plat->base = SHENG_ABL_FB_ADDR;
