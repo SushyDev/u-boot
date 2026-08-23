@@ -108,11 +108,20 @@ static int sheng_ktz8866_read_handover(const char *path)
 		return ret;
 
 	/* Read-only. Writing anything here would destroy the very state we
-	 * are trying to observe. */
-	dm_i2c_read(chip, 0x08, &en, 1);	/* BL_EN */
-	dm_i2c_read(chip, 0x05, &msb, 1);	/* BL_BRT_MSB */
-	dm_i2c_read(chip, 0x04, &lsb, 1);	/* BL_BRT_LSB */
-	dm_i2c_read(chip, 0x09, &bias, 1);	/* LCD_BIAS_CFG1 */
+	 * are trying to observe.
+	 *
+	 * Every read is checked. sheng_ktz8866_backlight_init()'s fast path
+	 * decides from these bits whether to skip the twelve-register init,
+	 * so a partial read must not be mistaken for a live chip: one failed
+	 * transfer here used to leave its 0xff default in place and still
+	 * report success. Fail the whole sample instead -- the caller's
+	 * 0xffffffff sentinel then forces the full path.
+	 */
+	if (dm_i2c_read(chip, 0x08, &en, 1) ||		/* BL_EN */
+	    dm_i2c_read(chip, 0x05, &msb, 1) ||		/* BL_BRT_MSB */
+	    dm_i2c_read(chip, 0x04, &lsb, 1) ||		/* BL_BRT_LSB */
+	    dm_i2c_read(chip, 0x09, &bias, 1))		/* LCD_BIAS_CFG1 */
+		return -EIO;
 
 	sheng_handover_blregs = ((u32)en << 24) | ((u32)msb << 16) |
 				((u32)lsb << 8) | (u32)bias;
@@ -158,22 +167,33 @@ void qcom_board_init(void)
 	 * Either way the answer was in the DTB, not in this file. */
 }
 
-/* Raw MMIO breadcrumb, same pattern (and same reason) as sheng_mdss.c's
- * sheng_mdss_breadcrumb_flush(): D-cache is on for this board, so a
- * plain volatile store here can sit dirty in a cache line indefinitely
- * -- must flush + dsb after every write for it to survive to a
- * subsequent boot/warm-reset reliably. */
-static void sheng_ktz8866_status_set(unsigned int slot, int ret)
+/* THE ONLY WAY TO WRITE A BREADCRUMB FROM THIS FILE.
+ *
+ * D-cache is on for this board, so a plain volatile store can sit dirty
+ * in a cache line indefinitely -- and the whole point of a breadcrumb is
+ * to survive a hang on the very next instruction. Every write must be
+ * followed by flush + dsb, so no caller open-codes the store.
+ *
+ * Two sites used to do it by hand and both forgot the flush: the
+ * OUTP/OUTN handover sample in sheng_ktz8866_write_chip(), and the
+ * uclass_get_device() result in qcom_late_init(). Neither value was
+ * reliably reaching DRAM, which made them useless exactly when a boot
+ * hung -- the case they exist for.
+ */
+void sheng_breadcrumb_u32(unsigned long addr, u32 value)
 {
-	volatile int *slots = (volatile int *)(uintptr_t)SHENG_KTZ8866_STATUS_ADDR;
-
 	if (!IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
 		return;
 
-	slots[slot] = ret;
-	flush_dcache_range(SHENG_KTZ8866_STATUS_ADDR + slot * sizeof(*slots),
-			    SHENG_KTZ8866_STATUS_ADDR + (slot + 1) * sizeof(*slots));
+	*(volatile u32 *)(uintptr_t)addr = value;
+	flush_dcache_range(addr, addr + sizeof(value));
 	dsb();
+}
+
+static void sheng_ktz8866_status_set(unsigned int slot, int ret)
+{
+	sheng_breadcrumb_u32(SHENG_KTZ8866_STATUS_ADDR + slot * sizeof(u32),
+			     (u32)ret);
 }
 
 static int sheng_ktz8866_write_chip(const char *path)
@@ -230,10 +250,13 @@ static int sheng_ktz8866_write_chip(const char *path)
 	 * (OUTP << 8) | OUTN. */
 	{
 		u8 pre_outp = 0xff, pre_outn = 0xff;
-		dm_i2c_read(chip, 0x0d, &pre_outp, 1);
-		dm_i2c_read(chip, 0x0e, &pre_outn, 1);
-		*(volatile u32 *)(uintptr_t)(SHENG_KTZ8866_STATUS_ADDR + 0x10) =
-			((u32)pre_outp << 8) | (u32)pre_outn;
+
+		if (dm_i2c_read(chip, 0x0d, &pre_outp, 1))
+			pre_outp = 0xff;
+		if (dm_i2c_read(chip, 0x0e, &pre_outn, 1))
+			pre_outn = 0xff;
+		sheng_breadcrumb_u32(SHENG_KTZ8866_STATUS_ADDR + 0x10,
+				     ((u32)pre_outp << 8) | (u32)pre_outn);
 	}
 
 	/* Bias configuration, written explicitly rather than inherited.
@@ -943,8 +966,7 @@ void qcom_late_init(void)
 		 * runs to 0x302b. Populated even when probe() is never
 		 * entered, so "no video device bound" (-ENODEV) is
 		 * distinguishable from "bound, probe failed". */
-		if (IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
-			*(volatile int *)(uintptr_t)(CONFIG_PRE_CON_BUF_ADDR + 0x3040) = vret;
+		sheng_breadcrumb_u32(CONFIG_PRE_CON_BUF_ADDR + 0x3040, (u32)vret);
 	}
 
 	log_debug("sheng: late_init done at %lu ms\n", timer_get_us() / 1000);

@@ -183,11 +183,21 @@ fn mmioWrite32(base: usize, offset: usize, value: u32) void {
     ptr.* = value;
 }
 
+/// PLAIN CONTROL REGISTERS ONLY. Both of these write back the full
+/// read-back word, so they are only correct where every bit is an
+/// ordinary read/write control bit -- GDSC, BCR, PLL, RCG, CBCR, PHY
+/// CTRL, GCC and RSC, which is all they are used on.
+///
+/// NEVER use them on a register that interleaves write-1-to-clear status
+/// bits with its control bits: the writeback acknowledges whatever was
+/// pending. DSI_INTR_CTRL is the one such register here and it has a
+/// dedicated single writer, dsiIntrCtrlRmw().
 fn mmioSetBits32(base: usize, offset: usize, mask: u32) void {
     const val = mmioRead32(base, offset);
     mmioWrite32(base, offset, val | mask);
 }
 
+/// Plain control registers only -- see mmioSetBits32().
 fn mmioClearBits32(base: usize, offset: usize, mask: u32) void {
     const val = mmioRead32(base, offset);
     mmioWrite32(base, offset, val & ~mask);
@@ -1757,6 +1767,42 @@ const INTR_MASK_VIDEO_DONE: u32 = 1 << 17;
 /// and BTA_DONE as a side effect.
 const INTR_MASK_BITS: u32 = (1 << 1) | (1 << 9) | (1 << 17) | (1 << 21) | (1 << 25);
 
+/// Write-1-to-clear STATUS bits in INTR_CTRL. Named so an ack site says
+/// which event it is acknowledging instead of open-coding a shift.
+const INTR_BTA_DONE: u32 = 1 << 20;
+
+/// One frame at 144Hz is 6.9ms, so 70ms is ~10 frames of headroom. Matches
+/// the kernel's wait_for_completion_timeout in dsi_wait4video_done().
+const VIDEO_DONE_TIMEOUT_US: u32 = 70000;
+/// Panel turnaround budget for a DCS read's BTA.
+const BTA_DONE_TIMEOUT_US: u32 = 20000;
+/// "delay 4 ms to skip BLLP" -- land the next command inside the blanking
+/// interval rather than mid-frame.
+const BLLP_SKIP_US: u32 = 4000;
+
+/// THE ONLY WRITER FOR DSI_INTR_CTRL. Do not call mmioWrite32() on this
+/// register directly, and do not reach it through mmioSetBits32() /
+/// mmioClearBits32() -- both write back the full read-back word.
+///
+/// The register interleaves write-1-to-clear STATUS bits with the enable
+/// MASK bits (INTR_MASK_BITS). A plain read-modify-write therefore writes
+/// every status bit that happened to be pending back as a 1 and silently
+/// acknowledges it. Four sites used to do exactly that, and one of them
+/// (dsiCmdDmaWait) ran immediately before the BTA_DONE poll in
+/// sheng_mdss_dsi_read_power_mode_single() -- so a panel that replied
+/// promptly had its BTA_DONE erased by our own disarm, and the poll then
+/// spun the full 20ms waiting for an event that had already happened and
+/// been destroyed. That corrupts panel_pm_pre, which decides the probe
+/// fast path, which is worth ~335ms and a 1080ms rail discharge.
+///
+/// `set_masks` / `clear_masks` adjust enables. `ack_status` is the only
+/// value permitted to reach a status bit, and it must name the event
+/// being acknowledged -- never a whole read-back word.
+fn dsiIntrCtrlRmw(dsi_base: usize, set_masks: u32, clear_masks: u32, ack_status: u32) void {
+    const cur = mmioRead32(dsi_base, DSI_INTR_CTRL);
+    mmioWrite32(dsi_base, DSI_INTR_CTRL, ((cur & INTR_MASK_BITS) & ~clear_masks) | set_masks | ack_status);
+}
+
 /// Wait for VIDEO_DONE, then sleep 4ms to land inside BLLP, which is
 /// where the host will inject a command packet into the video stream.
 ///
@@ -1789,14 +1835,14 @@ fn dsiWait4VideoEngBusy(dsi_base: usize) void {
     // the mask, and on this hardware the status bit does not latch while
     // the source is masked off -- so the poll could never succeed, spun the
     // full 70ms, and the command went out at an arbitrary point anyway.
-    var intr = mmioRead32(dsi_base, DSI_INTR_CTRL);
-    mmioWrite32(dsi_base, DSI_INTR_CTRL,
-        (intr & INTR_MASK_BITS) | INTR_MASK_VIDEO_DONE | INTR_VIDEO_DONE);
+    // Ack any stale VIDEO_DONE as we arm, or the poll below can return
+    // instantly on the previous frame's event.
+    dsiIntrCtrlRmw(dsi_base, INTR_MASK_VIDEO_DONE, 0, INTR_VIDEO_DONE);
 
     // 70ms, matching the kernel's wait_for_completion_timeout. One frame at
     // 144Hz is 6.9ms, so this is ~10 frames of headroom.
     var waited: u32 = 0;
-    while (waited < 70000) : (waited += 10) {
+    while (waited < VIDEO_DONE_TIMEOUT_US) : (waited += 10) {
         if ((mmioRead32(dsi_base, DSI_INTR_CTRL) & INTR_VIDEO_DONE) != 0) break;
         udelay(10);
     }
@@ -1820,11 +1866,9 @@ fn dsiWait4VideoEngBusy(dsi_base: usize) void {
         bbSeal();
     }
 
-    intr = mmioRead32(dsi_base, DSI_INTR_CTRL);
-    mmioWrite32(dsi_base, DSI_INTR_CTRL,
-        (intr & INTR_MASK_BITS & ~INTR_MASK_VIDEO_DONE) | INTR_VIDEO_DONE);
+    dsiIntrCtrlRmw(dsi_base, 0, INTR_MASK_VIDEO_DONE, INTR_VIDEO_DONE);
 
-    udelay(4000); // "delay 4 ms to skip BLLP"
+    udelay(BLLP_SKIP_US);
 }
 const CLK_CTRL_ENABLE_CLKS: u32 = 0x3f | (1 << 9); // AHBS/AHBM/PCLK/DSICLK/BYTECLK/ESCCLK on + FORCE_ON_DYN_AHBM_HCLK
 const TRIG_CTRL_DMA_TRIGGER_SW: u32 = 4; // dsi_cmd_trigger.TRIGGER_SW, low 3 bits
@@ -1881,11 +1925,7 @@ fn dsiHostBringUp(dsi_base: usize) void {
     mmioWrite32(dsi_base, DSI_CLKOUT_TIMING_CTRL, CLKOUT_TIMING_CTRL_VALUE);
     mmioWrite32(dsi_base, DSI_EOT_PACKET_CTRL, EOT_PACKET_CTRL_VALUE);
     mmioWrite32(dsi_base, DSI_ERR_INT_MASK0, DSI_ERR_INT_MASK0_VALUE);
-    {
-        var intr_ctrl = mmioRead32(dsi_base, DSI_INTR_CTRL);
-        intr_ctrl |= DSI_IRQ_MASK_ERROR;
-        mmioWrite32(dsi_base, DSI_INTR_CTRL, intr_ctrl);
-    }
+    dsiIntrCtrlRmw(dsi_base, DSI_IRQ_MASK_ERROR, 0, 0);
     mmioWrite32(dsi_base, DSI_CLK_CTRL, CLK_CTRL_ENABLE_CLKS);
     mmioWrite32(dsi_base, DSI_LANE_SWAP_CTRL, LANE_SWAP_CTRL_VALUE);
 
@@ -2016,9 +2056,7 @@ fn dsiCmdDmaTrigger(dsi_base: usize, dma_addr: usize, len: usize) void {
     // driver before. Replicated here per-trigger since this function is
     // the real driver's cmd_xfer_commit equivalent; the wait side clears
     // it in dsiCmdDmaWait().
-    var intr_ctrl_pre = mmioRead32(dsi_base, DSI_INTR_CTRL);
-    intr_ctrl_pre |= DSI_IRQ_MASK_CMD_DMA_DONE;
-    mmioWrite32(dsi_base, DSI_INTR_CTRL, intr_ctrl_pre);
+    dsiIntrCtrlRmw(dsi_base, DSI_IRQ_MASK_CMD_DMA_DONE, 0, 0);
 
     flush_dcache_range(dma_addr, dma_addr + ((len + 63) & ~@as(usize, 63)));
 
@@ -2134,17 +2172,18 @@ fn dsiCmdDmaWait(dsi_base: usize) c_int {
     while (waited < DMA_BUSY_POLL_TIMEOUT_US) : (waited += 10) {
         const status = mmioRead32(dsi_base, DSI_STATUS0);
         if ((status & STATUS0_CMD_MODE_DMA_BUSY) == 0) {
-            // Capture INTR_CTRL BEFORE the clearing read-modify-write below.
-            // Status bits here are write-1-to-clear, so writing back the
-            // read-back value erases BTA_DONE (bit20) as a side effect --
-            // meaning every previous look at BTA_DONE was taken AFTER our
-            // own code had already wiped it. That is exactly the class of
-            // self-inflicted blindness that made the silent read look like
-            // evidence about the panel for months.
+            // Disarm the CMD_DMA_DONE mask, acknowledging NOTHING.
+            //
+            // This site used to write the full read-back word, which
+            // erased BTA_DONE (bit20) as a side effect -- and this
+            // function runs immediately before the BTA_DONE poll in
+            // sheng_mdss_dsi_read_power_mode_single(). A panel that
+            // replied promptly lost its reply here, so the poll spun its
+            // full 20ms and the readback came back garbage. The old
+            // comment described that hazard correctly; the code below it
+            // did not act on it.
             g_intr_at_dma_done = mmioRead32(dsi_base, DSI_INTR_CTRL);
-            var intr_ctrl_post = mmioRead32(dsi_base, DSI_INTR_CTRL);
-            intr_ctrl_post &= ~DSI_IRQ_MASK_CMD_DMA_DONE;
-            mmioWrite32(dsi_base, DSI_INTR_CTRL, intr_ctrl_post);
+            dsiIntrCtrlRmw(dsi_base, 0, DSI_IRQ_MASK_CMD_DMA_DONE, 0);
             return 0;
         }
         udelay(10);
@@ -2227,9 +2266,7 @@ fn dsiCmdDmaWait(dsi_base: usize) c_int {
         bbByte('\n');
         bbSeal();
     }
-    var intr_ctrl_post = mmioRead32(dsi_base, DSI_INTR_CTRL);
-    intr_ctrl_post &= ~DSI_IRQ_MASK_CMD_DMA_DONE;
-    mmioWrite32(dsi_base, DSI_INTR_CTRL, intr_ctrl_post);
+    dsiIntrCtrlRmw(dsi_base, 0, DSI_IRQ_MASK_CMD_DMA_DONE, 0);
     return ETIMEDOUT;
 }
 
@@ -2506,6 +2543,15 @@ export fn sheng_mdss_dsi_read_power_mode_single(dsi0_base: usize, dma_scratch: u
     dst[2] = 0x06;
     dst[3] = 0x80 | 0x20; // BIT5 = read
 
+    // Ack any stale BTA_DONE BEFORE the read goes out. The poll below
+    // cannot tell last transfer's turnaround from this one's, so an
+    // unacked leftover makes it return immediately and sample RDBK_DATA0
+    // before the panel has said anything. Nothing acked this previously:
+    // the disarm inside dsiCmdDmaWait() happened to clear it as a side
+    // effect of writing back the whole word, which also meant a reply
+    // that arrived early was destroyed rather than observed.
+    dsiIntrCtrlRmw(dsi0_base, 0, 0, INTR_BTA_DONE);
+
     const dsi1_base: usize = 0x0ae96004; // SM8550_MDSS_DSI1_BASE + shift
     dsiCmdDmaTrigger(dsi1_base, dma_scratch, 4);
     dsiCmdDmaTrigger(dsi0_base, dma_scratch, 4);
@@ -2518,8 +2564,8 @@ export fn sheng_mdss_dsi_read_power_mode_single(dsi0_base: usize, dma_scratch: u
     // the instant our packet finished going OUT, before the panel could
     // have replied -- and reading 0 there means nothing.
     var waited: u32 = 0;
-    while (waited < 20000) : (waited += 20) {
-        if ((mmioRead32(dsi0_base, DSI_INTR_CTRL) & (1 << 20)) != 0) break;
+    while (waited < BTA_DONE_TIMEOUT_US) : (waited += 20) {
+        if ((mmioRead32(dsi0_base, DSI_INTR_CTRL) & INTR_BTA_DONE) != 0) break;
         udelay(20);
     }
 
