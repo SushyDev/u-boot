@@ -1757,28 +1757,14 @@ const INTR_MASK_VIDEO_DONE: u32 = 1 << 17;
 /// and BTA_DONE as a side effect.
 const INTR_MASK_BITS: u32 = (1 << 1) | (1 << 9) | (1 << 17) | (1 << 21) | (1 << 25);
 
-/// REAL BUG FOUND (SPEC.md task #5 log): this waited for the WRONG EVENT.
+/// Wait for VIDEO_DONE, then sleep 4ms to land inside BLLP, which is
+/// where the host will inject a command packet into the video stream.
 ///
-/// dsi_wait4video_done() waits on the VIDEO_DONE interrupt, which fires at
-/// the END OF A FRAME -- the start of vertical blanking -- and then sleeps
-/// 4ms to land inside BLLP, where the host is willing to inject a command
-/// packet into the video stream.
-///
-/// This function instead polled STATUS0.VIDEO_MODE_ENGINE_BUSY waiting for
-/// it to go CLEAR. On a continuously streaming video-mode link that bit
-/// essentially never clears: the engine is always busy. So every call
-/// spun the full 70ms timeout and then fired the command at an arbitrary
-/// point mid-frame.
-///
-/// Measured consequence (b71, SHENG_PANEL_AFTER_DPU=1, i.e. the first
-/// build to send the init sequence while the DPU was actually streaming):
-/// sheng.panel = -10000, meaning command #0 failed outright, and
-/// sheng.rd1 = -1, the Set-Maximum-Return-Packet-Size DMA failing before
-/// the read even started. With the DPU stopped the same code reported
-/// success -- but the panel never received anything, so that "success"
-/// was the engine draining its FIFO with no video context to inject into.
-/// A command engine that reports done without transmitting is exactly the
-/// symptom this whole investigation has been chasing.
+/// Do NOT poll STATUS0.VIDEO_MODE_ENGINE_BUSY for clear: on a streaming
+/// video-mode link it never clears, so the wait burns its full timeout
+/// and the command fires mid-frame. The command engine then reports
+/// success while transmitting nothing -- it drained its FIFO with no
+/// video context to inject into.
 var g_vwait_logged: u32 = 0;
 
 fn dsiWait4VideoEngBusy(dsi_base: usize) void {
@@ -2438,81 +2424,52 @@ export fn sheng_mdss_dsi_timeout_diag() callconv(.c) i64 {
 }
 
 
-/// Sends one DCS command to both DSI0 and DSI1 from the SAME DMA
-/// buffer -- qcom,sync-dual-dsi mirrors every command to both
-/// controllers rather than splitting the buffer, matching how the
-/// real panel driver only ever issues commands to dsi[0] and relies
-/// on hardware mirroring (see nt36532e_init_sequence's comment in
-/// this file and sheng_tianma_init_sequence() in the kernel panel
-/// driver).
-/// Inverse of the wake-up half of sheng_mdss_dsi_panel_init(): Display
-/// Off (0x28) then Sleep In (0x10), mirroring nt36532e's real
-/// .disable()/.unprepare() DCS sequence. Must be sent host-side (DSI
-/// still in/switched back to command mode) before the PHY/DISPCC/GPIO
-/// teardown below removes the panel's ability to receive commands at
-/// all. Best-effort: DSI is being torn down regardless, so a failure
-/// here doesn't abort the rest of the teardown.
-/// Ask the DDIC what mode it is actually in (DCS 0x0A, Get Power Mode).
+/// Sends one DCS command to DSI0 and DSI1 from the SAME DMA buffer.
+/// qcom,sync-dual-dsi mirrors commands to both controllers rather than
+/// splitting the buffer, so the panel driver only ever issues to dsi[0].
+/// Display Off (0x28) then Sleep In (0x10), the inverse of the wake-up
+/// in sheng_mdss_dsi_panel_init(). Must go out before the PHY/DISPCC/GPIO
+/// teardown below, which removes the panel's ability to receive anything.
+/// Best-effort: DSI is being torn down either way.
+/// Ask the DDIC what mode it is in (DCS 0x0A, Get Power Mode).
 ///
-/// THE ONLY VALID INSTRUMENT for this question. Do not judge the panel
-/// from Linux -- Linux's own DSI/PHY bring-up wedges it, which is what
-/// made a whole earlier round of conclusions invalid. U-Boot must read
-/// it itself, at the end of its own probe.
+/// Read it here, at the end of our own probe. Judging the panel from
+/// Linux is invalid: Linux's own DSI/PHY bring-up wedges it.
 ///
-/// Restored from cbd53976^ after the Zig cleanup deleted it, minus the
-/// blackbox logging and the BTA-timeout calibration that were scaffolding
-/// for an investigation that has since concluded. The mechanics that
-/// matter are kept exactly:
+/// Three things the sequence depends on:
 ///
 ///   * Set Maximum Return Packet Size (0x37) first, master only.
-///   * Hold CMD_MODE_EN across the WHOLE read, not per-DMA: the panel
-///     turns the bus around ~milliseconds after our packet goes out, and
-///     a per-DMA restore drops back to video mode before the reply
-///     arrives.
-///   * Trigger BOTH hosts but prepare only DSI0, matching the
-///     xfer_prepare the kernel skips for a read. A stitched panel
-///     expects synchronised SOT across both links.
+///   * Hold CMD_MODE_EN across the WHOLE read, not per-DMA. The panel
+///     turns the bus around milliseconds later, and a per-DMA restore
+///     drops to video mode before the reply lands.
+///   * Trigger both hosts, prepare only DSI0. A stitched panel expects
+///     synchronised SOT across both links.
 ///
-/// Return value packs the state the read ran in, because the raw
-/// register alone is ambiguous:
-///   63:32  RDBK_DATA0 raw. Bytes are REVERSED vs the register: 31:24 is
-///          data_id, 23:16 the payload. A good reply is 0x219C0000 --
-///          reporting `resp & 0xff` alone shows 0, indistinguishable
-///          from a silent panel. That trap cost real time before.
-///   31:16  DSI_CTRL low half during the read. 0x01F7 = CMD_MODE_EN was
-///          asserted and the BTA genuinely issued; 0x01F3 = it was not,
-///          and the result says nothing about the panel.
+/// The raw register alone is ambiguous, so the result is packed:
+///   63:32  RDBK_DATA0 raw. Bytes are REVERSED: 31:24 is data_id, 23:16
+///          the payload. A good reply is 0x219C0000, so `resp & 0xff`
+///          reads 0 and looks identical to a silent panel.
+///   31:16  DSI_CTRL low half. 0x01F7 = CMD_MODE_EN asserted and the BTA
+///          issued; 0x01F3 = it was not, and the result means nothing.
 ///   15:8   TIMEOUT_STATUS low byte.
-///    7:0   decoded payload. **0x9C on a correctly initialised panel**
-///          -- but note the VENDOR's own ESD check expects 0x9D
-///          (qcom,mdss-dsi-panel-status-value, see
-///          VENDOR-PANEL-REFERENCE.md). Both have been observed here;
-///          do not treat 0x9C as the only healthy value.
-///          (DISPLAY_ON | NORMAL_MODE | SLEEP_OUT); 0x08 is sleep-in,
-///          display-off, i.e. an init that did not take.
-/// GENTLE STOP, for handing a pipeline we did NOT build over to Linux.
+///    7:0   payload. 0x9C is healthy, and so is 0x9D -- the vendor ESD
+///          check expects that one. 0x08 is sleep-in/display-off, an
+///          init that did not take.
+/// Stop the INTF timing engines and nothing else: clocks stay on, the
+/// GDSC stays powered, nothing is reset or cleared. The panel just stops
+/// being fed.
 ///
-/// Stops the INTF timing engines and nothing else: clocks stay on, the
-/// GDSC stays powered, no block is reset, no register is cleared. The
-/// panel simply stops being fed.
+/// Needed when U-Boot inherited ABL's live pipeline. Both alternatives
+/// fail there:
 ///
-/// This exists because neither existing option works when U-Boot has
-/// INHERITED ABL's live display rather than building its own:
+///   no teardown  -> Linux boots to a black panel. drm/msm has no
+///                   continuous-splash support and cannot adopt a
+///                   running pipeline.
+///   full teardown-> hangs into fastboot. It unclocks MDSS and then
+///                   touches DPU registers, fatal on a live stream.
 ///
-///   skip sheng_mdss_teardown()  -> Linux boots to a black panel.
-///        drm/msm has no continuous-splash support upstream; it always
-///        does a full bring-up and cannot adopt a running pipeline.
-///   run  sheng_mdss_teardown()  -> hangs the board into fastboot. That
-///        function unclocks MDSS and then touches DPU registers, which
-///        is fine on a pipeline we built and stopped, and fatal on one
-///        still streaming.
-///
-/// Halting the timing engine leaves MDSS quiescent but intact, which is
-/// what Linux's own bring-up expects to find.
-///
-/// Deliberately does NOT read anything back: after this the DPU is idle
-/// but still clocked, and there is no status here worth the risk of an
-/// extra MMIO access on a block mid-transition.
+/// Reads nothing back: the DPU is idle but still clocked, and no status
+/// here is worth an extra MMIO access on a block mid-transition.
 export fn sheng_mdss_intf_stop(dpu_base: usize) callconv(.c) void {
     const intf1_base = dpu_base + 0x35000; // DSI0 (master)
     const intf2_base = dpu_base + 0x36000; // DSI1 (slave)
@@ -2720,28 +2677,19 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
     const ENABLE_SETTLE_US: c_ulong = 250000;
     udelay(ENABLE_SETTLE_US);
 
-    // Pace the init table.
+    // No pacing. Xiaomi's own qcom,mdss-dsi-on-command for this panel has
+    // a per-command wait field that is zero on all 95 commands except
+    // sleep-out (120ms). See VENDOR-PANEL-REFERENCE.md.
     //
-    // The kernel emits these ~2ms apart, but that 2ms is not a
-    // deliberate delay in the panel driver -- it is the cost of its
-    // per-transfer path: mutex, per-transfer link clock
-    // enable/disable, IRQ completion wait. Here a command is a DMA
-    // trigger plus a busy-poll that clears in microseconds.
+    // The kernel emits these ~2ms apart, but that is the cost of its
+    // per-transfer path (mutex, link clock enable/disable, IRQ wait), not
+    // a deliberate delay. Here a command is a DMA trigger plus a busy-poll
+    // that clears in microseconds.
     //
-    // What actually needs settling time is the 0xff PAGE SWITCH: it
-    // changes which register bank every following write lands in, and a
-    // DDIC that has not finished switching drops them while every
-    // command still reports success. So keep the full 2ms after a page
-    // switch and pace the other 81 commands, which are plain writes
-    // within an already-selected bank, far tighter.
-    //
-    // BOOT-TIME KNOB: 87 x 2ms = 174ms becomes ~52ms. If init goes
-    // intermittent, put PAGE_SWITCH_PACING_US's value back into
-    // INIT_CMD_PACING_US to restore the old uniform behaviour.
-    // NO PACING. Xiaomi's own qcom,mdss-dsi-on-command for this panel
-    // has an explicit per-command wait field that is ZERO on all 95
-    // commands except sleep-out (120ms). See VENDOR-PANEL-REFERENCE.md.
-    // Verified on hardware (b382): panel still inits, pm_val=9c.
+    // If init goes intermittent, the thing that needs settling time is the
+    // 0xff PAGE SWITCH: it changes which register bank later writes land
+    // in, and a DDIC mid-switch drops them while every command still
+    // reports success.
     const INIT_CMD_PACING_US: c_ulong = 0;
     const PAGE_SWITCH_PACING_US: c_ulong = 0;
     const DCS_PAGE_SELECT: u8 = 0xff;
@@ -2778,39 +2726,20 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
         ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0x9d, &[_]u8{0x01});
         if (ret != 0) return -20003;
 
-        // 0xb2 = 0x00 / 0xb3 = 0x00. THESE ARE THE 144Hz VALUES AND MUST
-        // NOT BE "CORRECTED" TO THE VENDOR'S.
+        // 0xb2/0xb3 are framerate control, and 0x00/0x00 are the 144Hz
+        // values. Do NOT "correct" them to the vendor's 0x91/0x40.
         //
-        // These are framerate control. The kernel driver branches on
-        // cur_vrefresh: 120/60 -> 0x91/0x40, 90/50/48/30 -> 0x00/0x80,
-        // else -> 0x00/0x00. nt36532e_get_current_mode() returns the
-        // 144Hz mode when connector->state->crtc is NULL, which is our
-        // first-boot case, and 144 matches neither explicit branch --
-        // hence the else branch, 0x00/0x00.
+        // The kernel driver branches on cur_vrefresh: 120/60 -> 0x91/0x40,
+        // 90/50/48/30 -> 0x00/0x80, else -> 0x00/0x00.
+        // nt36532e_get_current_mode() returns the 144Hz mode when
+        // connector->state->crtc is NULL, which is the first-boot case,
+        // and 144 hits neither explicit branch.
         //
-        // Xiaomi's own table shows 0x91/0x40, which looks like a parity
-        // gap and is not: that node is the 120Hz timing
-        // (qcom,mdss-dsi-panel-framerate = 0x78), i.e. exactly the
-        // branch that ships 0x91/0x40.
+        // Xiaomi's table shows 0x91/0x40, which looks like a parity gap
+        // and is not: that node is the 120Hz timing
+        // (qcom,mdss-dsi-panel-framerate = 0x78), the 120/60 branch.
         //
-        // Tried on hardware 2026-08-22 (b397): with 0x91/0x40 the boot
-        // came up BLACK WITH NO BACKLIGHT, which was initially recorded
-        // as proof that these values are wrong at 144Hz.
-        //
-        // THAT ATTRIBUTION WAS TOO STRONG. The soak captured
-        // panel_init_first=-10084 on that build -- the init aborted at
-        // table index 84 (the 0x3b timing command), three commands
-        // BEFORE 0xb2/0xb3 were ever sent. So the black panel is
-        // explained by that abort, not necessarily by these values.
-        //
-        // The values still stand on the documented reasoning: the vendor
-        // node shipping 0x91/0x40 is the 120Hz timing
-        // (qcom,mdss-dsi-panel-framerate = 0x78), i.e. exactly the
-        // 120/60 branch. What is NOT established is that 0x91/0x40 is
-        // harmful at 144Hz -- it has never had a clean test.
-        //
-        // See VENDOR-PANEL-REFERENCE.md for the other vendor deltas and
-        // which of them are genuine.
+        // See VENDOR-PANEL-REFERENCE.md for the other vendor deltas.
         ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb2, &[_]u8{0x00});
         if (ret != 0) return -20004;
         ret = dsiSendDcs(dsi0_base, dsi1_base, dma_scratch, 0xb3, &[_]u8{0x00});
@@ -2847,7 +2776,7 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
 
 
 // ---------------------------------------------------------------------
-// DPU pixel pipeline (task #5)
+// DPU pixel pipeline
 //
 // One SSPP (sspp_8 = SSPP_DMA0, a DMA-type pipe at +0x24000) in
 // multirect mode -- rect_0 the left half of the framebuffer, rect_1 the
@@ -2863,13 +2792,13 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
 // = DSI0) and INTF_2 (+0x36000, controller_id 1 = DSI1).
 //
 // Offsets and sequencing come from dpu_hw_{sspp,lm,pingpong,intf,ctl}.c
-// and dpu_hw_dsc_1_2.c -- the hard-slice DSC variant, which dpu_rm.c
-// selects for core_major_ver >= 7. Specialised to this one case: single
-// plane XRGB8888, one blend stage, dual hard-slice DSC, video-mode DSI.
-// Not a general port of the DPU object model.
+// and dpu_hw_dsc_1_2.c, the hard-slice DSC variant dpu_rm.c selects for
+// core_major_ver >= 7. Specialised to one case: single plane XRGB8888,
+// one blend stage, dual hard-slice DSC, video-mode DSI. Not a general
+// port of the DPU object model.
 //
-// The panel is video mode, so the INTF timing engine drives DSI
-// continuously and there is no TE/vsync wiring here.
+// Video mode, so the INTF timing engine drives DSI continuously and
+// there is no TE/vsync wiring.
 
 const SSPP_SRC_SIZE: usize = 0x00;
 const SSPP_SRC_XY: usize = 0x08;
@@ -3144,32 +3073,18 @@ const INTF_CFG2_DATA_HCTL_EN: u32 = 1 << 4;
 /// other than 8-bit while feeding it 8-bit data.
 const INTF_PANEL_FORMAT_RGB888: u32 = (0x21 << 8) | (0x3) | (0x3 << 2) | (0x3 << 4);
 
-/// Programmable fetch start. Easy to enable without programming.
+/// Programmable fetch start. Write this BEFORE setting INTF_CONFIG
+/// BIT(31), which is what enables it.
 ///
-/// dpu_hw_intf_setup_prg_fetch():
+/// Both interfaces: INTF_CONFIG 0x00800000 from timing setup, then
+/// 0x80800000 with BIT(31) OR'd in, and INTF_PROG_FETCH_START =
+/// 0x0014CA28 in between.
 ///
-///     fetch_enable = DPU_REG_READ(c, INTF_CONFIG);
-///     if (fetch->enable) {
-///             fetch_enable |= BIT(31);
-///             DPU_REG_WRITE(c, INTF_PROG_FETCH_START, fetch->fetch_start);
-///     } else {
-///             fetch_enable &= ~BIT(31);
-///     }
-///     DPU_REG_WRITE(c, INTF_CONFIG, fetch_enable);
-///
-/// On both interfaces: INTF_CONFIG 0x00800000 from the timing setup,
-/// then 0x80800000 once BIT(31) is OR'd in, with
-/// INTF_PROG_FETCH_START = 0x0014CA28 written in between.
-///
-/// Copying the FINAL INTF_CONFIG from a live read enables programmable
-/// fetch without ever setting the line it starts from, leaving that at
-/// whatever ABL or POR left. An interface prefetching from an arbitrary
-/// point relative to vsync delivers no coherent frame and reports no
-/// error.
-///
-/// A live-value copy hides a missing write like this every time: the
-/// enable bit survives into the readback, the value register does not
-/// announce itself.
+/// Copying the final INTF_CONFIG from a live read enables fetch without
+/// ever setting the line it starts from. The interface then prefetches
+/// from an arbitrary point relative to vsync, delivers no coherent
+/// frame, and reports no error. The enable bit survives into a readback;
+/// the value register does not announce itself.
 const INTF_PROG_FETCH_START: usize = 0x170;
 const INTF_PROG_FETCH_START_VALUE: u32 = 0x0014CA28;
 
@@ -4149,28 +4064,22 @@ export fn sheng_mdss_dsi_video_readback2(dsi0_base: usize, dsi1_base: usize) cal
         @as(i64, mmioRead32(dsi1_base, DSI_STATUS0));
 }
 
-/// DSC ENCODER STATUS (SPEC.md task #5 log). dpu_hw_dsc_1_2.c names
-/// these as read-only status, not config -- so there is nothing to
-/// write, but they are a direct window into whether the DSC encoder is
-/// actually RUNNING, which no other instrument here provides.
+/// DSC encoder status. Read-only in dpu_hw_dsc_1_2.c, and the only
+/// window onto whether the encoder is actually running.
 ///
-/// Live, working Linux on this exact panel reads:
+/// The DSI test pattern generator injects pixels DOWNSTREAM of these
+/// encoders, so on a DSC-mandatory panel it can never produce a
+/// decodable stream and tells you nothing.
+///
+/// Live Linux on this panel reads:
 ///   ENC_GENERAL_STATUS (0x04) = 0x00000003
 ///   ENC_HSLICE_STATUS  (0x08) = 0x00140000
 ///   ENC_OUT_STATUS     (0x0C) = 0x002E0000
 ///   ENC_INT_STAT       (0x10) = 0x000007B0
 ///
-/// This matters because the panel is DSC-mandatory: the DSI test
-/// pattern generator injects pixels DOWNSTREAM of these encoders, so it
-/// can never produce a decodable stream here and both TPG results were
-/// uninformative. The encoder's own status is the instrument that TPG
-/// could not be.
-///
-///   all zero -> the DSC encoder never ran. Everything upstream can be
-///     bit-perfect and nothing decodable ever reaches the panel, which
-///     fits every observation so far.
-///   matching live -> the encoder is producing output, and the fault is
-///     downstream of it (INTF/DSI/panel).
+/// All zero means the encoder never ran: everything upstream can be
+/// bit-perfect and nothing decodable reaches the panel. Matching live
+/// means the fault is downstream (INTF/DSI/panel).
 export fn sheng_mdss_dsc_status1(dpu_base: usize) callconv(.c) i64 {
     const enc0 = dpu_base + 0x80000 + 0x100;
     return (@as(i64, mmioRead32(enc0, 0x04)) << 32) | @as(i64, mmioRead32(enc0, 0x08));
