@@ -431,7 +431,7 @@ void qcom_set_serialno(void)
  * variants that are all supported by a single U-Boot image will require implementing device-
  * specific detection.
  */
-static void __maybe_unused configure_env(void)
+static void configure_env(void)
 {
 	const char *first_compat, *last_compat;
 	char *tmp;
@@ -663,7 +663,7 @@ static void build_mem_map(void)
 #endif
 }
 
-u64 __maybe_unused get_page_table_size(void)
+u64 get_page_table_size(void)
 {
 	return SZ_1M;
 }
@@ -768,7 +768,7 @@ static void carve_out_reserved_memory(void)
 /* This function open-codes setup_all_pgtables() so that we can
  * insert additional mappings *before* turning on the MMU.
  */
-void __maybe_unused enable_caches(void)
+void enable_caches(void)
 {
 	u64 tlb_addr = gd->arch.tlb_addr;
 	u64 tlb_size = gd->arch.tlb_size;

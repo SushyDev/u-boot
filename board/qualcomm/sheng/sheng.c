@@ -37,7 +37,6 @@ DECLARE_GLOBAL_DATA_PTR;
  * CONFIG_VIDEO_SHENG_MDSS off. */
 #define SHENG_DPU_BASE			0x0ae01000
 
-
 /* Time the backlight actually came on, microseconds since power-on.
  * Recorded in qcom_late_init() and relayed in ft_board_setup(), which
  * runs later still (at booti time). */
@@ -84,83 +83,6 @@ static int sheng_handover_blret;
  * sheng_mdss_probe() to decide inherit vs cold bring-up. */
 int sheng_abl_splash_live;
 
-static int sheng_ktz8866_read_handover(const char *path)
-{
-	struct udevice *bus, *chip;
-	ofnode i2c_node;
-	u8 en = 0xff, lsb = 0xff, msb = 0xff, bias = 0xff;
-	int ret;
-
-	i2c_node = ofnode_path(path);
-	if (!ofnode_valid(i2c_node))
-		return -ENOENT;
-	ret = uclass_get_device_by_ofnode(UCLASS_I2C, i2c_node, &bus);
-	if (ret)
-		return ret;
-	ret = dm_i2c_probe(bus, 0x11, 0, &chip);
-	if (ret)
-		return ret;
-
-	/* Read-only. Writing anything here would destroy the very state we
-	 * are trying to observe.
-	 *
-	 * Every read is checked. sheng_ktz8866_backlight_init()'s fast path
-	 * decides from these bits whether to skip the twelve-register init,
-	 * so a partial read must not be mistaken for a live chip: one failed
-	 * transfer here used to leave its 0xff default in place and still
-	 * report success. Fail the whole sample instead -- the caller's
-	 * 0xffffffff sentinel then forces the full path.
-	 */
-	if (dm_i2c_read(chip, 0x08, &en, 1) ||		/* BL_EN */
-	    dm_i2c_read(chip, 0x05, &msb, 1) ||		/* BL_BRT_MSB */
-	    dm_i2c_read(chip, 0x04, &lsb, 1) ||		/* BL_BRT_LSB */
-	    dm_i2c_read(chip, 0x09, &bias, 1))		/* LCD_BIAS_CFG1 */
-		return -EIO;
-
-	sheng_handover_blregs = ((u32)en << 24) | ((u32)msb << 16) |
-				((u32)lsb << 8) | (u32)bias;
-	return 0;
-}
-
-void qcom_board_init(void)
-{
-	sheng_handover_bl = sheng_gpio_read(SHENG_BACKLIGHT_GPIO);
-	sheng_handover_avdd = sheng_gpio_read(SHENG_PANEL_AVDD_GPIO);
-	sheng_handover_avee = sheng_gpio_read(SHENG_PANEL_AVEE_GPIO);
-	sheng_handover_rst = sheng_gpio_read(SHENG_PANEL_RESET_GPIO);
-	sheng_handover_blret =
-		sheng_ktz8866_read_handover("/soc@0/geniqup@ac0000/i2c@a84000");
-
-	/* Does ABL hand over a live display? Decided from our own DTB, never
-	 * by reading an MDSS register.
-	 *
-	 * Asking the DPU or DSI host whether it is streaming is a trap: those
-	 * blocks need clocks that only run WHILE ABL IS STREAMING, so the read
-	 * answers correctly when live and WEDGES THE AHB BUS in exactly the
-	 * case it exists to detect. Recovery is fastboot.
-	 *
-	 * The KTZ8866 is on I2C and always readable, but LCD_BIAS_CFG1
-	 * reflects whoever programmed the chip last, which on a warm reboot is
-	 * Linux, not ABL. It is recorded in the diag, not used as a test.
-	 *
-	 * Whether ABL keeps the panel alive is decided by whether we advertise
-	 * /reserved-memory/splash_region. We control both sides of that, and
-	 * reading our own device tree cannot wedge a bus.
-	 *
-	 * If ABL ever ignores the node we inherit a dead pipeline and U-Boot
-	 * shows a dark panel. Linux still boots.
-	 */
-	sheng_abl_splash_live =
-		ofnode_valid(ofnode_path("/reserved-memory/splash_region"));
-
-	/* Measured 2026-08-22: WITHOUT /reserved-memory/splash_region, a 3s
-	 * hold here shows an already-black panel with backlight EN and both
-	 * rails still high -- ABL does not cut power, it blanks and hands
-	 * over dark. WITH the node present it does not blank at all and
-	 * hands over a live pipeline, which sheng_mdss_probe() inherits.
-	 * Either way the answer was in the DTB, not in this file. */
-}
-
 /* THE ONLY WAY TO WRITE A BREADCRUMB FROM THIS FILE.
  *
  * D-cache is on for this board, so a plain volatile store can sit dirty
@@ -192,11 +114,147 @@ static void sheng_ktz8866_status_set(unsigned int slot, int ret)
 			     (u32)ret);
 }
 
-static int sheng_ktz8866_write_chip(const char *path)
-{
-	struct udevice *bus, *chip;
-	ofnode i2c_node;
+/* KTZ8866 registers. Named once: five functions in this file used to
+ * address them by bare hex, so a typo in one was invisible against the
+ * others. */
+#define KTZ8866_BL_CFG1			0x02
+#define KTZ8866_BL_CFG2			0x03
+#define KTZ8866_BL_BRT_LSB		0x04
+#define KTZ8866_BL_BRT_MSB		0x05
+#define KTZ8866_BL_EN			0x08
+#define KTZ8866_LCD_BIAS_CFG1		0x09
+#define KTZ8866_LCD_BIAS_CFG2		0x0a
+#define KTZ8866_LCD_BOOST_CFG		0x0c
+#define KTZ8866_OUTP_CFG		0x0d
+#define KTZ8866_OUTN_CFG		0x0e
+#define KTZ8866_BL_OPTION1		0x10
+#define KTZ8866_BL_OPTION2		0x11
+#define KTZ8866_BL_DIMMING		0x14
+
+/* BL_EN: only 5 of 6 current sinks are wired (`current-num-sinks = <5>`)
+ * and many LED drivers fault-protect on an open sink -- some disable
+ * output entirely. So 0x1f then 0x5f, NEVER 0x7f. Live reference reads
+ * 0x5f. */
+#define KTZ8866_BL_EN_SINKS_ONLY	0x1f
+#define KTZ8866_BL_EN_SINKS_PLUS_MASTER	0x5f
+
+/* LCD_BIAS_CFG1. LOAD-BEARING -- see sheng_ktz8866_set_bias(). */
+#define KTZ8866_LCD_BIAS_EN		0x9f
+#define KTZ8866_LCD_BIAS_OFF		0x1f
+
+/* Both chips, at address 0x11 on separate buses. There is no ordering
+ * requirement between them; they drive different halves of the panel. */
+static const char * const sheng_ktz8866_paths[] = {
+	"/soc@0/geniqup@ac0000/i2c@a84000",
+	"/soc@0/geniqup@9c0000/i2c@988000",
+};
+
+struct ktz8866_write {
+	u8 reg;
 	u8 val;
+	const char *what;
+};
+
+/* Soft start, mirroring the real driver's init/update_status split:
+ * sinks on without the master-enable bit and brightness at 0, so no
+ * current flows while the configuration below is written. Slamming max
+ * brightness the instant the chip enables is peak inrush on a rail that
+ * may already be marginal. */
+static const struct ktz8866_write ktz8866_soft_start[] = {
+	{ KTZ8866_BL_EN,      KTZ8866_BL_EN_SINKS_ONLY, "BL_EN sinks only" },
+	{ KTZ8866_BL_BRT_LSB, 0x00,                     "brightness 0 (lsb)" },
+	{ KTZ8866_BL_BRT_MSB, 0x00,                     "brightness 0 (msb)" },
+};
+
+/* Bias configuration, written explicitly rather than inherited.
+ *
+ * Linux writes only BL_EN, BL_CFG2, BL_DIMMING and LCD_BIAS_CFG1 and
+ * inherits the rest from ABL. These are the live values, so on a normal
+ * boot they are a no-op -- but they cost nothing and make the
+ * configuration explicit instead of dependent on what ABL left.
+ *
+ * ORDER MATTERS: OUTP_CFG/OUTN_CFG set the +/-5.8V rails feeding the
+ * panel's avdd/avee and must be written BEFORE LCD_BIAS_CFG1 enables the
+ * bias, so the rails come up already configured rather than being enabled
+ * without a voltage. */
+static const struct ktz8866_write ktz8866_config[] = {
+	{ KTZ8866_BL_CFG1,       0xfa, "BL_CFG1" },
+	{ KTZ8866_LCD_BIAS_CFG2, 0x11, "LCD_BIAS_CFG2" },
+	{ KTZ8866_LCD_BOOST_CFG, 0x28, "LCD_BOOST_CFG" },
+	{ KTZ8866_OUTP_CFG,      0x1e, "OUTP_CFG: +5.8V rail (panel avdd)" },
+	{ KTZ8866_OUTN_CFG,      0x1c, "OUTN_CFG: -5.8V rail (panel avee)" },
+	{ KTZ8866_BL_OPTION1,    0x80, "BL_OPTION1" },
+	{ KTZ8866_BL_OPTION2,    0x77, "BL_OPTION2" },
+	/* LCD_BIAS_EN, matching the real driver's ktz8866_init(). */
+	{ KTZ8866_LCD_BIAS_CFG1, KTZ8866_LCD_BIAS_EN, "LCD_BIAS_CFG1: bias on" },
+	/* kinetic,current-ramp-delay-ms=256 in the real DT ->
+	 * BIT(7) | ((5 + 256/64) << 3) | PWM_HYST(0x5) = 0xcd, per
+	 * ktz8866_init()'s >128ms branch. Confirmed against a live register
+	 * dump (0x03 already reads 0xcd from Linux's own driver). */
+	{ KTZ8866_BL_CFG2,       0xcd, "BL_CFG2: current ramp 256ms" },
+	/* kinetic,led-enable-ramp-delay-ms=8 -> ramp_off_time=ilog2(8)+1=4,
+	 * ramp_on_time=4<<4=0x40, OR'd = 0x44. Confirmed against a live
+	 * register dump. */
+	{ KTZ8866_BL_DIMMING,    0x44, "BL_DIMMING: enable ramp 8ms" },
+};
+
+/* Master-enable at zero brightness first -- minimal inrush, matching
+ * ktz8866_backlight_update_status()'s own update_bits(BL_EN, BL_EN_BIT)
+ * -- then the brightness pair.
+ *
+ * Do not ramp. This chip's output feeds the panel bias, so a ramp is a
+ * real behavioural difference, not cosmetic. Live reads 0x04/0xbb (1500).
+ */
+static const struct ktz8866_write ktz8866_enable[] = {
+	{ KTZ8866_BL_EN,      KTZ8866_BL_EN_SINKS_PLUS_MASTER, "BL_EN + master" },
+	{ KTZ8866_BL_BRT_LSB, SHENG_KTZ8866_BRIGHTNESS & 0x07,        "brightness lsb" },
+	{ KTZ8866_BL_BRT_MSB, (SHENG_KTZ8866_BRIGHTNESS >> 3) & 0xff, "brightness msb" },
+};
+
+/* Apply one table. On failure the register is named, which is the
+ * question a bare return code could never answer -- twelve open-coded
+ * write-and-check pairs all returned the same anonymous -errno. */
+static int sheng_ktz8866_apply(struct udevice *chip,
+			       const struct ktz8866_write *seq, size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++) {
+		u8 val = seq[i].val;
+		int ret = dm_i2c_write(chip, seq[i].reg, &val, 1);
+
+		if (ret) {
+			log_warning("sheng: ktz8866 write %s (reg 0x%02x) failed: %d\n",
+				    seq[i].what, seq[i].reg, ret);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+/* OUTP_CFG/OUTN_CFG as found, before the config table overwrites them.
+ * 0x1e/0x1c means ABL's bias config survived and those writes are a
+ * no-op; anything else means something reset the chip. */
+static void sheng_ktz8866_record_outcfg(struct udevice *chip)
+{
+	u8 pre_outp = 0xff, pre_outn = 0xff;
+
+	if (dm_i2c_read(chip, KTZ8866_OUTP_CFG, &pre_outp, 1))
+		pre_outp = 0xff;
+	if (dm_i2c_read(chip, KTZ8866_OUTN_CFG, &pre_outn, 1))
+		pre_outn = 0xff;
+
+	sheng_breadcrumb_u32((unsigned long)(uintptr_t)
+			     &SHENG_BLACKBOX->ktz8866_outcfg,
+			     ((u32)pre_outp << 8) | (u32)pre_outn);
+}
+
+/* Resolve one KTZ8866 by its parent I2C node path. Both chips sit at
+ * address 0x11 on different buses. */
+static int sheng_ktz8866_get(const char *path, struct udevice **chip)
+{
+	struct udevice *bus;
+	ofnode i2c_node;
 	int ret;
 
 	i2c_node = ofnode_path(path);
@@ -211,136 +269,105 @@ static int sheng_ktz8866_write_chip(const char *path)
 		return ret;
 	}
 
-	ret = dm_i2c_probe(bus, 0x11, 0, &chip);
-	if (ret) {
+	ret = dm_i2c_probe(bus, 0x11, 0, chip);
+	if (ret)
 		log_warning("sheng: ktz8866 chip probe failed (%s): %d\n", path, ret);
-		return ret;
-	}
+	return ret;
+}
 
-	/* BL_EN is 0x1f then 0x5f, NEVER 0x7f. Only 5 of 6 current sinks
-	 * are wired (`current-num-sinks = <5>`), and many LED drivers
-	 * fault-protect on an open sink -- some disable output entirely.
-	 * Live reference reads 0x5f.
+static int sheng_ktz8866_read_handover(const char *path)
+{
+	struct udevice *chip;
+	u8 en = 0xff, lsb = 0xff, msb = 0xff, bias = 0xff;
+	int ret;
+
+	ret = sheng_ktz8866_get(path, &chip);
+	if (ret)
+		return ret;
+
+	/* Read-only. Writing anything here would destroy the very state we
+	 * are trying to observe.
 	 *
-	 * Soft start, mirroring the real driver's init/update_status
-	 * split: sinks on without the master-enable bit, config and bias
-	 * written with brightness still 0 so no current flows, then the
-	 * master-enable bit as brightness ramps up. Slamming max
-	 * brightness the instant the chip enables is peak inrush on a rail
-	 * that may already be marginal. */
-	val = 0x1f; /* BL_EN: 5 current sinks, no master enable yet */
-	ret = dm_i2c_write(chip, 0x08, &val, 1);
-	if (ret)
-		return ret;
-	val = 0x00; /* BL_BRT_LSB: brightness 0 */
-	ret = dm_i2c_write(chip, 0x04, &val, 1);
-	if (ret)
-		return ret;
-	val = 0x00; /* BL_BRT_MSB: brightness 0 */
-	ret = dm_i2c_write(chip, 0x05, &val, 1);
-	if (ret)
-		return ret;
-	/* OUTP_CFG/OUTN_CFG as found, before the writes below. 0x1e/0x1c
-	 * means ABL's bias config survived and the writes are a no-op;
-	 * anything else means something reset the chip. Packed
-	 * (OUTP << 8) | OUTN. */
-	{
-		u8 pre_outp = 0xff, pre_outn = 0xff;
+	 * Every read is checked. sheng_ktz8866_backlight_init()'s fast path
+	 * decides from these bits whether to skip the twelve-register init,
+	 * so a partial read must not be mistaken for a live chip: one failed
+	 * transfer here used to leave its 0xff default in place and still
+	 * report success. Fail the whole sample instead -- the caller's
+	 * 0xffffffff sentinel then forces the full path.
+	 */
+	if (dm_i2c_read(chip, KTZ8866_BL_EN, &en, 1) ||
+	    dm_i2c_read(chip, KTZ8866_BL_BRT_MSB, &msb, 1) ||
+	    dm_i2c_read(chip, KTZ8866_BL_BRT_LSB, &lsb, 1) ||
+	    dm_i2c_read(chip, KTZ8866_LCD_BIAS_CFG1, &bias, 1))
+		return -EIO;
 
-		if (dm_i2c_read(chip, 0x0d, &pre_outp, 1))
-			pre_outp = 0xff;
-		if (dm_i2c_read(chip, 0x0e, &pre_outn, 1))
-			pre_outn = 0xff;
-		sheng_breadcrumb_u32((unsigned long)(uintptr_t)
-				     &SHENG_BLACKBOX->ktz8866_outcfg,
-				     ((u32)pre_outp << 8) | (u32)pre_outn);
-	}
-
-	/* Bias configuration, written explicitly rather than inherited.
-	 *
-	 * Linux writes only BL_EN, BL_CFG2, BL_DIMMING and LCD_BIAS_CFG1 and
-	 * inherits the rest from ABL. These are the live values, so on a
-	 * normal boot they are a no-op -- but they cost nothing and make the
-	 * configuration explicit instead of dependent on what ABL left.
-	 *
-	 * OUTP_CFG/OUTN_CFG set the +/-5.8V rails feeding the panel's
-	 * avdd/avee. Written BEFORE LCD_BIAS_CFG1 enables the bias, so the
-	 * rails come up already configured rather than being enabled without
-	 * a voltage. */
-	val = 0xfa; /* BL_CFG1 */
-	ret = dm_i2c_write(chip, 0x02, &val, 1);
-	if (ret)
-		return ret;
-	val = 0x11; /* LCD_BIAS_CFG2 */
-	ret = dm_i2c_write(chip, 0x0a, &val, 1);
-	if (ret)
-		return ret;
-	val = 0x28; /* LCD_BOOST_CFG */
-	ret = dm_i2c_write(chip, 0x0c, &val, 1);
-	if (ret)
-		return ret;
-	val = 0x1e; /* OUTP_CFG: +5.8V rail (panel avdd) */
-	ret = dm_i2c_write(chip, 0x0d, &val, 1);
-	if (ret)
-		return ret;
-	val = 0x1c; /* OUTN_CFG: -5.8V rail (panel avee) */
-	ret = dm_i2c_write(chip, 0x0e, &val, 1);
-	if (ret)
-		return ret;
-	val = 0x80; /* BL_OPTION1 */
-	ret = dm_i2c_write(chip, 0x10, &val, 1);
-	if (ret)
-		return ret;
-	val = 0x77; /* BL_OPTION2 */
-	ret = dm_i2c_write(chip, 0x11, &val, 1);
-	if (ret)
-		return ret;
-
-	val = 0x9f; /* LCD_BIAS_CFG1: LCD_BIAS_EN, matches real driver's ktz8866_init() */
-	ret = dm_i2c_write(chip, 0x09, &val, 1);
-	if (ret)
-		return ret;
-	/* BL_CFG2: kinetic,current-ramp-delay-ms=256 in the real DT ->
-	 * BIT(7) | ((5 + 256/64) << 3) | PWM_HYST(0x5) = 0xcd, per
-	 * ktz8866_init()'s >128ms branch. Confirmed against live register
-	 * dump (0x03 already reads 0xcd from Linux's own driver). */
-	val = 0xcd;
-	ret = dm_i2c_write(chip, 0x03, &val, 1);
-	if (ret)
-		return ret;
-	/* BL_DIMMING: kinetic,led-enable-ramp-delay-ms=8 in the real DT ->
-	 * ramp_off_time=ilog2(8)+1=4, ramp_on_time=4<<4=0x40, OR'd =
-	 * 0x44. Confirmed against live register dump (0x14 already reads
-	 * 0x44 from Linux's own driver). */
-	val = 0x44;
-	ret = dm_i2c_write(chip, 0x14, &val, 1);
-	if (ret)
-		return ret;
-
-	/* Add the master-enable bit now, at zero brightness -- minimal
-	 * inrush, matching ktz8866_backlight_update_status()'s own
-	 * update_bits(BL_EN, BL_EN_BIT, BL_EN_BIT) call. */
-	val = 0x5f;
-	ret = dm_i2c_write(chip, 0x08, &val, 1);
-	if (ret)
-		return ret;
-	/* One write pair, no ramp, same value Linux uses.
-	 * ktz8866_backlight_update_status() writes BL_BRT_LSB =
-	 * brightness & 0x7 and BL_BRT_MSB = (brightness >> 3) & 0xff, and
-	 * nothing else. Live reads 0x04/0xbb, i.e. 1500.
-	 *
-	 * Do not ramp. This chip's output feeds the panel bias, so a ramp
-	 * is a real behavioural difference, not cosmetic. */
-	val = SHENG_KTZ8866_BRIGHTNESS & 0x07;
-	ret = dm_i2c_write(chip, 0x04, &val, 1);
-	if (ret)
-		return ret;
-	val = (SHENG_KTZ8866_BRIGHTNESS >> 3) & 0xff;
-	ret = dm_i2c_write(chip, 0x05, &val, 1);
-	if (ret)
-		return ret;
-
+	sheng_handover_blregs = ((u32)en << 24) | ((u32)msb << 16) |
+				((u32)lsb << 8) | (u32)bias;
 	return 0;
+}
+
+void qcom_board_init(void)
+{
+	sheng_handover_bl = sheng_gpio_read(SHENG_BACKLIGHT_GPIO);
+	sheng_handover_avdd = sheng_gpio_read(SHENG_PANEL_AVDD_GPIO);
+	sheng_handover_avee = sheng_gpio_read(SHENG_PANEL_AVEE_GPIO);
+	sheng_handover_rst = sheng_gpio_read(SHENG_PANEL_RESET_GPIO);
+	sheng_handover_blret =
+		sheng_ktz8866_read_handover(sheng_ktz8866_paths[0]);
+
+	/* Does ABL hand over a live display? Decided from our own DTB, never
+	 * by reading an MDSS register.
+	 *
+	 * Asking the DPU or DSI host whether it is streaming is a trap: those
+	 * blocks need clocks that only run WHILE ABL IS STREAMING, so the read
+	 * answers correctly when live and WEDGES THE AHB BUS in exactly the
+	 * case it exists to detect. Recovery is fastboot.
+	 *
+	 * The KTZ8866 is on I2C and always readable, but LCD_BIAS_CFG1
+	 * reflects whoever programmed the chip last, which on a warm reboot is
+	 * Linux, not ABL. It is recorded in the diag, not used as a test.
+	 *
+	 * Whether ABL keeps the panel alive is decided by whether we advertise
+	 * /reserved-memory/splash_region. We control both sides of that, and
+	 * reading our own device tree cannot wedge a bus.
+	 *
+	 * If ABL ever ignores the node we inherit a dead pipeline and U-Boot
+	 * shows a dark panel. Linux still boots.
+	 */
+	sheng_abl_splash_live =
+		ofnode_valid(ofnode_path("/reserved-memory/splash_region"));
+
+	/* Measured 2026-08-22: WITHOUT /reserved-memory/splash_region, a 3s
+	 * hold here shows an already-black panel with backlight EN and both
+	 * rails still high -- ABL does not cut power, it blanks and hands
+	 * over dark. WITH the node present it does not blank at all and
+	 * hands over a live pipeline, which sheng_mdss_probe() inherits.
+	 * Either way the answer was in the DTB, not in this file. */
+}
+
+static int sheng_ktz8866_write_chip(const char *path)
+{
+	struct udevice *chip;
+	int ret;
+
+	ret = sheng_ktz8866_get(path, &chip);
+	if (ret)
+		return ret;
+
+	ret = sheng_ktz8866_apply(chip, ktz8866_soft_start,
+				  ARRAY_SIZE(ktz8866_soft_start));
+	if (ret)
+		return ret;
+
+	sheng_ktz8866_record_outcfg(chip);
+
+	ret = sheng_ktz8866_apply(chip, ktz8866_config,
+				  ARRAY_SIZE(ktz8866_config));
+	if (ret)
+		return ret;
+
+	return sheng_ktz8866_apply(chip, ktz8866_enable,
+				   ARRAY_SIZE(ktz8866_enable));
 }
 
 /* Drive LCD_BIAS_CFG1 (0x09) on both KTZ8866s. 0x9F sets LCD_BIAS_EN,
@@ -360,21 +387,15 @@ static int sheng_ktz8866_write_chip(const char *path)
  */
 int sheng_ktz8866_set_bias(int enable)
 {
-	static const char * const paths[] = {
-		"/soc@0/geniqup@ac0000/i2c@a84000",
-		"/soc@0/geniqup@9c0000/i2c@988000",
-	};
-	u8 val = enable ? 0x9f : 0x1f;
-	int i, rc = 0;
+	u8 val = enable ? KTZ8866_LCD_BIAS_EN : KTZ8866_LCD_BIAS_OFF;
+	unsigned int i;
+	int rc = 0;
 
-	for (i = 0; i < 2; i++) {
-		struct udevice *bus, *chip;
-		ofnode node = ofnode_path(paths[i]);
+	for (i = 0; i < ARRAY_SIZE(sheng_ktz8866_paths); i++) {
+		struct udevice *chip;
 
-		if (!ofnode_valid(node) ||
-		    uclass_get_device_by_ofnode(UCLASS_I2C, node, &bus) ||
-		    dm_i2c_probe(bus, 0x11, 0, &chip) ||
-		    dm_i2c_write(chip, 0x09, &val, 1))
+		if (sheng_ktz8866_get(sheng_ktz8866_paths[i], &chip) ||
+		    dm_i2c_write(chip, KTZ8866_LCD_BIAS_CFG1, &val, 1))
 			rc = -1;
 	}
 	return rc;
@@ -384,32 +405,21 @@ int sheng_ktz8866_set_bias(int enable)
  * and enabled. See the fast path in sheng_ktz8866_backlight_init(). */
 static int sheng_ktz8866_set_brightness(const char *path)
 {
-	struct udevice *bus, *chip;
-	ofnode i2c_node;
-	u8 val;
+	struct udevice *chip;
 	int ret;
 
-	i2c_node = ofnode_path(path);
-	if (!ofnode_valid(i2c_node))
-		return -ENOENT;
-	ret = uclass_get_device_by_ofnode(UCLASS_I2C, i2c_node, &bus);
-	if (ret)
-		return ret;
-	ret = dm_i2c_probe(bus, 0x11, 0, &chip);
+	ret = sheng_ktz8866_get(path, &chip);
 	if (ret)
 		return ret;
 
-	val = SHENG_KTZ8866_BRIGHTNESS & 0x7;
-	ret = dm_i2c_write(chip, 0x04, &val, 1);
-	if (ret)
-		return ret;
-	val = (SHENG_KTZ8866_BRIGHTNESS >> 3) & 0xff;
-	return dm_i2c_write(chip, 0x05, &val, 1);
+	/* The last two entries of ktz8866_enable[] are exactly this pair, so
+	 * the fast path and the full path cannot drift apart. */
+	return sheng_ktz8866_apply(chip, &ktz8866_enable[1], 2);
 }
 
 static void sheng_ktz8866_backlight_init(void)
 {
-	int ret;
+	unsigned int i;
 
 	/* FAST PATH: ABL already configured and enabled this chip.
 	 *
@@ -430,33 +440,27 @@ static void sheng_ktz8866_backlight_init(void)
 	    ((sheng_handover_blregs >> 24) & 0x40) &&
 	    (sheng_handover_blregs & 0x80)) {
 		sheng_backlight_enable();
-		ret = sheng_ktz8866_set_brightness("/soc@0/geniqup@ac0000/i2c@a84000");
-		sheng_ktz8866_status_set(0, ret);
-		ret = sheng_ktz8866_set_brightness("/soc@0/geniqup@9c0000/i2c@988000");
-		sheng_ktz8866_status_set(1, ret);
+		for (i = 0; i < ARRAY_SIZE(sheng_ktz8866_paths); i++)
+			sheng_ktz8866_status_set(i,
+				sheng_ktz8866_set_brightness(sheng_ktz8866_paths[i]));
 		return;
 	}
-	sheng_ktz8866_status_set(0, SHENG_MDSS_STATUS_NOT_REACHED);
-	sheng_ktz8866_status_set(1, SHENG_MDSS_STATUS_NOT_REACHED);
+	for (i = 0; i < ARRAY_SIZE(sheng_ktz8866_paths); i++)
+		sheng_ktz8866_status_set(i, SHENG_MDSS_STATUS_NOT_REACHED);
 
-	/* EN must be high before either chip will ACK on I2C. 2ms is
-	 * generous for EN-to-I2C-ready; the DT's
-	 * kinetic,led-enable-ramp-delay-ms bounds the LED current ramp, not
-	 * I2C readiness.
+	/* EN must be high before either chip will ACK on I2C.
 	 *
-	 * ENABLE-ONLY, DELIBERATELY. Never drive EN low here. This is
-	 * INITCALL 758; the video probe ran at 729 and the panel is already
-	 * scanning out, so dropping EN removes its AVDD/AVEE and kills the
-	 * DDIC. Everything drawn afterwards, the startup log included, goes
-	 * to a dead panel. */
+	 * This is INITCALL 758; the video probe ran at 729 and the panel is
+	 * already scanning out, so EN must never go LOW here -- it gates the
+	 * chip's AVDD/AVEE and dropping it kills the DDIC, sending everything
+	 * drawn afterwards (the startup log included) to a dead panel.
+	 * sheng_backlight_enable() has no way to express that. */
 	sheng_backlight_enable();
 	mdelay(SHENG_KTZ8866_EN_TO_I2C_MS);
 
-	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@ac0000/i2c@a84000");
-	sheng_ktz8866_status_set(0, ret);
-
-	ret = sheng_ktz8866_write_chip("/soc@0/geniqup@9c0000/i2c@988000");
-	sheng_ktz8866_status_set(1, ret);
+	for (i = 0; i < ARRAY_SIZE(sheng_ktz8866_paths); i++)
+		sheng_ktz8866_status_set(i,
+			sheng_ktz8866_write_chip(sheng_ktz8866_paths[i]));
 }
 
 /* XBL/ABL's own log, scraped from the region it writes into.
@@ -472,6 +476,11 @@ static void sheng_ktz8866_backlight_init(void)
 #define SHENG_XBL_LOG_ADDR	0x81a00000
 #define SHENG_XBL_LOG_SIZE	0x40000
 #define SHENG_XBL_LOG_COPY	768
+/* How far past the last log marker to keep copying, so the final line is
+ * not truncated mid-message. */
+#define SHENG_LOG_TAIL_TRAIL	200
+/* Longest line the keyword scan will back up over to find its start. */
+#define SHENG_LOG_LINE_MAX	80
 
 /* Keywords worth finding. Dumping from the start of the region just
  * shows PBL/XBL boot banners (verified b367) -- anything ABL says about
@@ -505,109 +514,70 @@ static bool sheng_mem_match(const volatile u8 *p, unsigned int off,
  * the rest rather than relocating PRE_CON_BUF_ADDR, which would have
  * been the risky way to answer the same question.
  */
-static int sheng_log_tail(const volatile u8 *p, unsigned int size,
+/* Copy the tail of a bootloader text log.
+ *
+ * Finds the END of the text first, then walks back. Dumping from the
+ * start shows PBL/XBL banners; keyword-searching forward hits the binary
+ * devcfg tables that follow the text (NAMEDNODE_Display / SIDMappings --
+ * SID mapping data, not a log). Both were tried (b367/b368). The LATEST
+ * boot stage is at the END of the text, so that is where the interesting
+ * lines are, including anything said about tearing the display down.
+ *
+ * "B - " / "S - " / "D - " are the log's own line prefixes and mark
+ * genuine text, rather than trusting any printable byte. Match the WHOLE
+ * prefix: an earlier version tested for " - " at i AND p[i] being B/S/D,
+ * which cannot both hold, so the tail scan was silently dead.
+ *
+ * Returns bytes written including the NUL, or 0 if no log text was found.
+ */
+static int sheng_log_tail(const volatile u8 *log, unsigned int size,
 			  char *out, int outlen)
 {
-	unsigned int i, j, last_text = 0;
-	int n = 0;
+	unsigned int scan_off, copy_off, start, last_text = 0;
+	int out_len = 0;
 
-	for (i = 0; i < size; i++) {
-		if (sheng_mem_match(p, i, size, "B - ") ||
-		    sheng_mem_match(p, i, size, "S - ") ||
-		    sheng_mem_match(p, i, size, "D - "))
-			last_text = i;
+	for (scan_off = 0; scan_off < size; scan_off++) {
+		if (sheng_mem_match(log, scan_off, size, "B - ") ||
+		    sheng_mem_match(log, scan_off, size, "S - ") ||
+		    sheng_mem_match(log, scan_off, size, "D - "))
+			last_text = scan_off;
 	}
 	if (!last_text)
 		return 0;
 
-	{
-		unsigned int start = last_text > SHENG_XBL_LOG_COPY ?
-					last_text - SHENG_XBL_LOG_COPY : 0;
+	/* Back up a block of lines so the tail arrives in context, then
+	 * forward to the next newline so the copy starts line-aligned. */
+	start = last_text > SHENG_XBL_LOG_COPY ? last_text - SHENG_XBL_LOG_COPY : 0;
+	while (start < size && log[start] != '\n')
+		start++;
 
-		while (start < size && p[start] != '\n')
-			start++;
+	for (copy_off = start;
+	     copy_off < size && out_len < outlen - 2 &&
+	     copy_off < last_text + SHENG_LOG_TAIL_TRAIL;
+	     copy_off++) {
+		u8 c = log[copy_off];
 
-		for (j = start; j < size && n < outlen - 2 &&
-				j < last_text + 200; j++) {
-			u8 c = p[j];
-
-			out[n++] = ((c >= 0x20 && c < 0x7f) || c == '\n')
+		out[out_len++] = ((c >= 0x20 && c < 0x7f) || c == '\n')
 					? (char)c : '.';
-		}
 	}
-	out[n] = '\0';
-	return n + 1;
+	out[out_len] = '\0';
+	return out_len + 1;
 }
 
-#define SHENG_ABL_LOG_ADDR	(CONFIG_PRE_CON_BUF_ADDR + CONFIG_PRE_CON_BUF_SZ)
-#define SHENG_ABL_LOG_SIZE	(0x280000 - CONFIG_PRE_CON_BUF_SZ)
-
-static int sheng_xbl_log_scrape(char *out, int outlen)
+/* Fallback when a region has no "B - "-style log text: pull whole lines
+ * containing any interesting keyword. */
+static int sheng_log_keyword_scan(const volatile u8 *log, unsigned int size,
+				  char *out, int outlen)
 {
-	const volatile u8 *p = (const volatile u8 *)(uintptr_t)SHENG_XBL_LOG_ADDR;
-	unsigned int i, j;
-	int n = 0;
+	unsigned int scan_off, copy_off, key;
+	int out_len = 0;
 
-	/* Find the END of the text log first, then walk back.
-	 *
-	 * Dumping from the start shows PBL/XBL banners; keyword-searching
-	 * forward hits the binary devcfg tables that follow the text
-	 * (NAMEDNODE_Display / SIDMappings -- SID mapping data, not a log).
-	 * Both were tried (b367/b368). The LATEST boot stage is at the END
-	 * of the text, so that is where ABL's own lines are, including
-	 * anything it says about tearing the display down.
-	 */
-	{
-		unsigned int last_text = 0;
-
-		for (i = 0; i < SHENG_XBL_LOG_SIZE; i++) {
-			/* "B - " / "S - " / "D - " line prefixes are the
-			 * log's own format; use them as the marker for
-			 * genuine log text rather than any printable byte.
-			 *
-			 * Match the WHOLE prefix at i. The previous version
-			 * tested for " - " at i AND p[i] being B/S/D, which
-			 * cannot both hold -- so last_text stayed 0 and this
-			 * whole block was dead, silently falling through to
-			 * the keyword scan. */
-			if (sheng_mem_match(p, i, SHENG_XBL_LOG_SIZE, "B - ") ||
-			    sheng_mem_match(p, i, SHENG_XBL_LOG_SIZE, "S - ") ||
-			    sheng_mem_match(p, i, SHENG_XBL_LOG_SIZE, "D - "))
-				last_text = i;
-		}
-
-		if (last_text) {
-			unsigned int start = last_text;
-			unsigned int back = 0;
-
-			/* Walk back ~SHENG_XBL_LOG_COPY bytes of lines so we
-			 * get the tail in context, not just the final line. */
-			while (start > 0 && back < SHENG_XBL_LOG_COPY) {
-				start--;
-				back++;
-			}
-			while (start < SHENG_XBL_LOG_SIZE && p[start] != '\n')
-				start++;
-
-			for (j = start; j < SHENG_XBL_LOG_SIZE &&
-					n < outlen - 2 &&
-					j < last_text + 200; j++) {
-				u8 c = p[j];
-
-				out[n++] = ((c >= 0x20 && c < 0x7f) || c == '\n')
-						? (char)c : '.';
-			}
-			out[n] = '\0';
-			return n + 1;
-		}
-	}
-
-	for (i = 0; i < SHENG_XBL_LOG_SIZE && n < outlen - 2; i++) {
+	for (scan_off = 0; scan_off < size && out_len < outlen - 2; scan_off++) {
 		bool hit = false;
+		unsigned int start, back;
 
-		for (j = 0; j < ARRAY_SIZE(sheng_xbl_keys); j++) {
-			if (sheng_mem_match(p, i, SHENG_XBL_LOG_SIZE,
-					    sheng_xbl_keys[j])) {
+		for (key = 0; key < ARRAY_SIZE(sheng_xbl_keys); key++) {
+			if (sheng_mem_match(log, scan_off, size, sheng_xbl_keys[key])) {
 				hit = true;
 				break;
 			}
@@ -618,32 +588,42 @@ static int sheng_xbl_log_scrape(char *out, int outlen)
 		/* Back up to the start of the line so the timestamp and log
 		 * type come with it -- the format is
 		 * "B - <microsec> - <message>". */
-		{
-			unsigned int start = i;
-			unsigned int back = 0;
-
-			while (start > 0 && back < 80 && p[start - 1] != '\n') {
-				start--;
-				back++;
-			}
-
-			for (j = start; j < SHENG_XBL_LOG_SIZE &&
-					n < outlen - 2; j++) {
-				u8 c = p[j];
-
-				if (c == '\n')
-					break;
-				out[n++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
-			}
-			out[n++] = '\n';
-			i = j; /* resume past this line */
+		start = scan_off;
+		for (back = 0; start > 0 && back < SHENG_LOG_LINE_MAX; back++) {
+			if (log[start - 1] == '\n')
+				break;
+			start--;
 		}
+
+		for (copy_off = start;
+		     copy_off < size && out_len < outlen - 2; copy_off++) {
+			u8 c = log[copy_off];
+
+			if (c == '\n')
+				break;
+			out[out_len++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+		}
+		out[out_len++] = '\n';
+		scan_off = copy_off; /* resume past this line */
 	}
 
-	if (!n)
+	if (!out_len)
 		return 0;
-	out[n] = '\0';
-	return n + 1;
+	out[out_len] = '\0';
+	return out_len + 1;
+}
+
+#define SHENG_ABL_LOG_ADDR	(CONFIG_PRE_CON_BUF_ADDR + CONFIG_PRE_CON_BUF_SZ)
+#define SHENG_ABL_LOG_SIZE	(0x280000 - CONFIG_PRE_CON_BUF_SZ)
+
+static int sheng_xbl_log_scrape(char *out, int outlen)
+{
+	const volatile u8 *log = (const volatile u8 *)(uintptr_t)SHENG_XBL_LOG_ADDR;
+	int n = sheng_log_tail(log, SHENG_XBL_LOG_SIZE, out, outlen);
+
+	if (n > 0)
+		return n;
+	return sheng_log_keyword_scan(log, SHENG_XBL_LOG_SIZE, out, outlen);
 }
 
 /* Dump both PON peripherals, to tell a power-key boot from a cable
@@ -735,6 +715,8 @@ static int sheng_pon_dump(char *out, int outlen)
 #define SHENG_PON_HLOS_PID	0x13
 #define SHENG_PON_INT_RT_STS	0x10
 #define SHENG_PON_GEN3_KPDPWR	BIT(7)
+#define SHENG_PON_POLL_MS		100
+#define SHENG_PON_RELEASE_TIMEOUT_MS	10000
 
 static struct udevice *sheng_pon_pmic(void)
 {
@@ -750,10 +732,40 @@ static struct udevice *sheng_pon_pmic(void)
 	return uclass_get_device_by_ofnode(UCLASS_PMIC, node, &pmic) ? NULL : pmic;
 }
 
+/* Live KPDPWR pin state, the same bit button-qcom-pmic reads. */
+static bool sheng_kpdpwr_pressed(struct udevice *pmic)
+{
+	int sts = pmic_reg_read(pmic,
+				(SHENG_PON_HLOS_PID << 8) | SHENG_PON_INT_RT_STS);
+
+	return sts > 0 && (sts & SHENG_PON_GEN3_KPDPWR);
+}
+
+/* WAIT FOR RELEASE before returning, or the same press is still down when
+ * the boot menu starts polling stdin and instantly selects entry 0.
+ * button-kbd reports the live pin state, so a held key is
+ * indistinguishable from a fresh keystroke.
+ *
+ * Bounded so a stuck or shorted key cannot strand the boot here -- after
+ * SHENG_PON_RELEASE_TIMEOUT_MS give up and continue, which is the same
+ * outcome as before this wait existed.
+ */
+static void sheng_wait_kpdpwr_release(struct udevice *pmic)
+{
+	unsigned int waited_ms;
+
+	for (waited_ms = 0; waited_ms < SHENG_PON_RELEASE_TIMEOUT_MS;
+	     waited_ms += SHENG_PON_POLL_MS) {
+		if (!sheng_kpdpwr_pressed(pmic))
+			return;
+		mdelay(SHENG_PON_POLL_MS);
+	}
+}
+
 static void sheng_charger_boot_poweroff(void)
 {
 	struct udevice *pmic = sheng_pon_pmic();
-	int reason, i;
+	int reason;
 
 	if (!pmic)
 		return;
@@ -782,150 +794,134 @@ static void sheng_charger_boot_poweroff(void)
 	log_debug("sheng: charger-insert power-on (PON reason 0x%02x)\n", reason);
 	printf("sheng: charging. Press POWER to boot.\n");
 
-	for (i = 0; ; i++) {
-		int sts = pmic_reg_read(pmic,
-					(SHENG_PON_HLOS_PID << 8) | SHENG_PON_INT_RT_STS);
-
-		if (sts > 0 && (sts & SHENG_PON_GEN3_KPDPWR)) {
-			/* WAIT FOR RELEASE before returning, or the same
-			 * press is still down when the boot menu starts
-			 * polling stdin and instantly selects entry 0.
-			 * button-kbd reports the live pin state, so a held
-			 * key is indistinguishable from a fresh keystroke.
-			 *
-			 * Bounded so a stuck or shorted key cannot strand
-			 * the boot here -- after 10s give up and continue,
-			 * which is the same outcome as before this loop
-			 * existed. */
-			for (i = 0; i < 100; i++) {
-				sts = pmic_reg_read(pmic,
-						    (SHENG_PON_HLOS_PID << 8) |
-						    SHENG_PON_INT_RT_STS);
-				if (sts >= 0 && !(sts & SHENG_PON_GEN3_KPDPWR))
-					break;
-				mdelay(100);
-			}
+	/* Unbounded on purpose: this is the charging idle. */
+	for (;;) {
+		if (sheng_kpdpwr_pressed(pmic)) {
+			sheng_wait_kpdpwr_release(pmic);
 			return;
 		}
-		mdelay(100);
+		mdelay(SHENG_PON_POLL_MS);
 	}
 }
 
+/* Relay the binary breadcrumb slots.
+ *
+ * mdss-status is one 4-byte slot per stage, in SHENG_MDSS_STATUS_* order.
+ * Each slot is SHENG_MDSS_STATUS_NOT_REACHED for a stage never reached, 0
+ * on success, or -errno. The last slot is the probe result: anything but
+ * 0 there means an early return and therefore backlight with no picture,
+ * and the first non-zero slot before it names the stage that failed.
+ *
+ * Every length is a sizeof() over struct sheng_blackbox, so adding a
+ * stage or a log entry cannot leave a relay truncated.
+ */
+static void sheng_relay_breadcrumbs(void *blob, int nodeoff)
+{
+	volatile struct sheng_blackbox *bb = SHENG_BLACKBOX;
+
+	fdt_setprop(blob, nodeoff, "sheng,mdss-status",
+		    (void *)(uintptr_t)bb->stage, sizeof(bb->stage));
+	fdt_setprop(blob, nodeoff, "sheng,uclass-get-device-ret",
+		    (void *)(uintptr_t)&bb->uclass_get_device_ret,
+		    sizeof(bb->uclass_get_device_ret));
+
+	/* Log ring: a u32 count then up to SHENG_MDSS_LOG_MAX (tag, value)
+	 * pairs. Only sheng_mdss_debug.c writes it, so without that build it
+	 * would be zeros -- do not advertise it at all. */
+	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS_DEBUG))
+		fdt_setprop(blob, nodeoff, "sheng,mdss-log",
+			    (void *)(uintptr_t)&bb->log, sizeof(bb->log));
+
+	/* Per-chip KTZ8866 status, [chip_a, chip_b], same convention as
+	 * mdss-status. */
+	fdt_setprop(blob, nodeoff, "sheng,ktz8866-status",
+		    (void *)(uintptr_t)bb->ktz8866, sizeof(bb->ktz8866));
+}
+
+/* Boot timing and the display signature, as plain strings.
+ *
+ * The same timing block is printed to the panel during probe, but that is
+ * the only place it goes -- serial is absent and the pre-console buffer is
+ * unreadable from Linux (no-map region, /dev/mem gives EFAULT). Here it
+ * lands in /proc/device-tree/chosen/ where a normal SSH session can cat
+ * it.
+ *
+ * Two properties, not one: a boot that never reached the video probe must
+ * still relay its timing.
+ */
+static void sheng_relay_timing(void *blob, int nodeoff)
+{
+	char t[640];
+	int n;
+
+	n = sheng_mdss_timing_fmt(t, sizeof(t) - 32);
+	if (n > 0) {
+		n--; /* drop the NUL, append below */
+		n += snprintf(t + n, sizeof(t) - n,
+			      " abl=%lums relocdone=%lums backlight=%lums"
+			      " handover[bl=%x avdd=%x avee=%x rst=%x"
+			      " blregs=%08x/%d]",
+			      sheng_uboot_entry_us / 1000,
+			      sheng_board_init_us / 1000,
+			      sheng_backlight_us / 1000,
+			      sheng_handover_bl, sheng_handover_avdd,
+			      sheng_handover_avee, sheng_handover_rst,
+			      sheng_handover_blregs, sheng_handover_blret);
+		fdt_setprop(blob, nodeoff, "sheng,boot-timing", t, n + 1);
+	}
+
+	n = sheng_mdss_diag_fmt(t, sizeof(t));
+	if (n > 0)
+		fdt_setprop(blob, nodeoff, "sheng,display-diag", t, n);
+}
+
+/* The bootloader logs that precede us, and the PON reason.
+ *
+ * Separate buffer from the timing strings: these are larger and unrelated
+ * to the display driver, so they must not be gated on it.
+ */
+static void sheng_relay_bootloader_logs(void *blob, int nodeoff)
+{
+	static char buf[SHENG_XBL_LOG_COPY + 1];
+	int n;
+
+	n = sheng_xbl_log_scrape(buf, sizeof(buf));
+	if (n > 0)
+		fdt_setprop(blob, nodeoff, "sheng,xbl-log", buf, n);
+
+	/* Read-only, for the charger-boot investigation. */
+	n = sheng_pon_dump(buf, sizeof(buf));
+	if (n > 0)
+		fdt_setprop(blob, nodeoff, "sheng,pon", buf, n);
+
+	/* ABL's own log, if it lives in the ramdump region past our
+	 * pre-console buffer. */
+	n = sheng_log_tail((const volatile u8 *)(uintptr_t)SHENG_ABL_LOG_ADDR,
+			   SHENG_ABL_LOG_SIZE, buf, sizeof(buf));
+	if (n > 0)
+		fdt_setprop(blob, nodeoff, "sheng,abl-log", buf, n);
+}
+
+/*
+ * Relay the driver's side channels into /chosen, readable from Linux
+ * under /proc/device-tree/chosen/. There is no console during probe, so
+ * this is the only way the results get out.
+ */
 int ft_board_setup(void *blob, struct bd_info *bd)
 {
-	/* Relay the driver's side channels into /chosen, readable from
-	 * Linux under /proc/device-tree/chosen/. There is no console during
-	 * probe, so this is the only way the results get out.
-	 *
-	 * mdss-status is one 4-byte slot per stage, in SHENG_MDSS_STATUS_*
-	 * order. Each slot is SHENG_MDSS_STATUS_NOT_REACHED for a stage
-	 * never reached, 0 on success, or -errno.
-	 *
-	 * The last slot is the probe result. Anything but 0 there means an
-	 * early return and therefore backlight with no picture; the first
-	 * non-zero slot before it names the stage that failed.
-	 *
-	 * Every length below is a sizeof() over struct sheng_blackbox, so
-	 * adding a stage or a log entry cannot leave a relay truncated. The
-	 * stage count in particular used to be a literal `11 * 4` under a
-	 * comment saying it must track SHENG_MDSS_STATUS_COUNT.
-	 */
-	if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS) && IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER)) {
-		volatile struct sheng_blackbox *bb = SHENG_BLACKBOX;
-		int nodeoff = fdt_path_offset(blob, "/chosen");
+	int nodeoff;
 
-		if (nodeoff >= 0) {
-			fdt_setprop(blob, nodeoff, "sheng,mdss-status",
-				    (void *)(uintptr_t)bb->stage,
-				    sizeof(bb->stage));
-			fdt_setprop(blob, nodeoff, "sheng,uclass-get-device-ret",
-				    (void *)(uintptr_t)&bb->uclass_get_device_ret,
-				    sizeof(bb->uclass_get_device_ret));
-			/* Log ring: a u32 count then up to SHENG_MDSS_LOG_MAX
-			 * (tag, value) pairs. Only sheng_mdss_debug.c writes
-			 * it, so without that build it is zeros. */
-			if (IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS_DEBUG))
-				fdt_setprop(blob, nodeoff, "sheng,mdss-log",
-					    (void *)(uintptr_t)&bb->log,
-					    sizeof(bb->log));
-			/* Per-chip KTZ8866 status, [chip_a, chip_b], same
-			 * convention as mdss-status. */
-			fdt_setprop(blob, nodeoff, "sheng,ktz8866-status",
-				    (void *)(uintptr_t)bb->ktz8866,
-				    sizeof(bb->ktz8866));
+	if (!IS_ENABLED(CONFIG_VIDEO_SHENG_MDSS) ||
+	    !IS_ENABLED(CONFIG_PRE_CONSOLE_BUFFER))
+		return 0;
 
-			/* Boot timing, as a plain string. The same block is
-			 * printed to the panel during probe, but that is
-			 * the only place it goes -- serial is absent and
-			 * the pre-console buffer is unreadable from Linux
-			 * (no-map region, /dev/mem gives EFAULT). Here it
-			 * lands in /proc/device-tree/chosen/sheng,boot-timing
-			 * where a normal SSH session can cat it. */
-			{
-				char t[640];
-				int n = sheng_mdss_timing_fmt(t, sizeof(t) - 32);
+	nodeoff = fdt_path_offset(blob, "/chosen");
+	if (nodeoff < 0)
+		return 0;
 
-				if (n > 0) {
-					n--; /* drop the NUL, append below */
-					n += snprintf(t + n, sizeof(t) - n,
-						      " abl=%lums relocdone=%lums"
-						      " backlight=%lums"
-						      " handover[bl=%x avdd=%x"
-						      " avee=%x rst=%x"
-						      " blregs=%08x/%d]",
-						      sheng_uboot_entry_us / 1000,
-						      sheng_board_init_us / 1000,
-						      sheng_backlight_us / 1000,
-						      sheng_handover_bl,
-						      sheng_handover_avdd,
-						      sheng_handover_avee,
-						      sheng_handover_rst,
-						      sheng_handover_blregs,
-						      sheng_handover_blret);
-					fdt_setprop(blob, nodeoff,
-						    "sheng,boot-timing", t, n + 1);
-				}
-
-				/* Display signature, for classifying a
-				 * glitched boot from data instead of by
-				 * eye. Separate property so a boot that
-				 * never reached the video probe still
-				 * relays its timing. */
-				n = sheng_mdss_diag_fmt(t, sizeof(t));
-				if (n > 0)
-					fdt_setprop(blob, nodeoff,
-						    "sheng,display-diag", t, n);
-			}
-
-			/* XBL/ABL's log. Separate buffer: it is larger than
-			 * the diag strings and unrelated to the display
-			 * driver, so it must not be gated on it. */
-			{
-				static char xbl[SHENG_XBL_LOG_COPY + 1];
-				int n = sheng_xbl_log_scrape(xbl, sizeof(xbl));
-
-				if (n > 0)
-					fdt_setprop(blob, nodeoff,
-						    "sheng,xbl-log", xbl, n);
-
-				/* PON register dump -- read-only, for the
-				 * charger-boot investigation. */
-				n = sheng_pon_dump(xbl, sizeof(xbl));
-				if (n > 0)
-					fdt_setprop(blob, nodeoff,
-						    "sheng,pon", xbl, n);
-
-				/* ABL's own log, if it lives in the ramdump
-				 * region past our pre-console buffer. */
-				n = sheng_log_tail(
-					(const volatile u8 *)(uintptr_t)SHENG_ABL_LOG_ADDR,
-					SHENG_ABL_LOG_SIZE, xbl, sizeof(xbl));
-				if (n > 0)
-					fdt_setprop(blob, nodeoff,
-						    "sheng,abl-log", xbl, n);
-			}
-		}
-	}
+	sheng_relay_breadcrumbs(blob, nodeoff);
+	sheng_relay_timing(blob, nodeoff);
+	sheng_relay_bootloader_logs(blob, nodeoff);
 
 	return 0;
 }
