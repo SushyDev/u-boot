@@ -41,6 +41,19 @@ CONFIG_LOG_DEFAULT_LEVEL=4
 # CONFIG_DISPLAY_CPUINFO is not set
 CONFIG_CMD_UFS=y
 CONFIG_CMD_CAT=y
+# sysboot: bootmenu entry 0 hands the actual load off to pxe_utils, which
+# reads /boot/extlinux/extlinux.conf and gets the per-generation
+# init=/nix/store/... from its APPEND line. CONFIG_BOOTMETH_EXTLINUX and
+# CONFIG_PXE_UTILS are already y, so the parser is linked in regardless;
+# this only adds the command that lets the environment drive it.
+#
+# NOT bootflow: CONFIG_EXPO is off, so `bootflow menu` does not exist,
+# and a bare `bootflow scan -b` would just boot the default label with
+# less control. Selection is done by U-Boot's own bootmenu setting
+# pxe_label_override, because pxe_utils' menu has no arrow-key handler
+# (menu_create() passes NULL for item_choice) and would demand typed
+# digits on a board with three buttons.
+CONFIG_CMD_SYSBOOT=y
 # CONFIG_OF_LIVE is not set
 CONFIG_OF_UPSTREAM_BUILD_VENDOR=y
 # DO NOT ENABLE CONFIG_OF_LIBFDT_OVERLAY here. Tried 2026-08-22 (b360) to

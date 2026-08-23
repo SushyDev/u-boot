@@ -500,7 +500,7 @@ static void menu_display_statusline(struct menu *m)
 	 * button and nothing in the input path emits ESC, so quitting the
 	 * menu is genuinely unreachable here. Advertising it just tells the
 	 * user to press something that does not exist. */
-	puts("Press UP/DOWN to move, POWER to select");
+	puts("Press volume UP/DOWN to move, POWER to select");
 	puts(ANSI_CLEAR_LINE_TO_END);
 	printf(ANSI_CURSOR_POSITION, menu->count + 7, 1);
 	puts(ANSI_CLEAR_LINE);
