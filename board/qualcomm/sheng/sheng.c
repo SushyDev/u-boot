@@ -27,6 +27,7 @@
 #include <linux/sizes.h>
 #include <power/pmic.h>
 #include <linux/psci.h>
+#include <sheng_mdss_abi.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -36,13 +37,6 @@ DECLARE_GLOBAL_DATA_PTR;
  * CONFIG_VIDEO_SHENG_MDSS off. */
 #define SHENG_DPU_BASE			0x0ae01000
 
-extern void sheng_mdss_intf_stop(unsigned long dpu_base);
-extern int sheng_inherited;
-extern void sheng_mdss_teardown(void);
-extern int sheng_mdss_timing_fmt(char *buf, int len);
-extern int sheng_mdss_diag_fmt(char *buf, int len);
-extern unsigned long sheng_uboot_entry_us;
-extern unsigned long sheng_board_init_us;
 
 /* Time the backlight actually came on, microseconds since power-on.
  * Recorded in qcom_late_init() and relayed in ft_board_setup(), which
@@ -60,10 +54,6 @@ static unsigned long sheng_backlight_us;
 #define SHENG_PANEL_AVDD_GPIO		30
 #define SHENG_PANEL_AVEE_GPIO		31
 #define SHENG_PANEL_RESET_GPIO		133
-
-/* sheng_mdss_hw.zig */
-extern void sheng_gpio_set(unsigned int gpio, bool high);
-extern u32 sheng_gpio_read(unsigned int gpio);
 
 /* Display state as ABL left it, sampled at board_init() before anything
  * of ours touches it. bit0 is the pin level, bit1 the driven value.

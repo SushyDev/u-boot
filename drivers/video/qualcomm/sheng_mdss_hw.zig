@@ -2508,8 +2508,8 @@ export fn sheng_mdss_dsi_timeout_diag() callconv(.c) i64 {
 /// Reads nothing back: the DPU is idle but still clocked, and no status
 /// here is worth an extra MMIO access on a block mid-transition.
 export fn sheng_mdss_intf_stop(dpu_base: usize) callconv(.c) void {
-    const intf1_base = dpu_base + 0x35000; // DSI0 (master)
-    const intf2_base = dpu_base + 0x36000; // DSI1 (slave)
+    const intf1_base = dpu_base + DPU_INTF1_OFFSET; // DSI0 (master)
+    const intf2_base = dpu_base + DPU_INTF2_OFFSET; // DSI1 (slave)
 
     mmioWrite32(intf1_base, INTF_TIMING_ENGINE_EN, 0);
     mmioWrite32(intf2_base, INTF_TIMING_ENGINE_EN, 0);
@@ -2845,6 +2845,18 @@ export fn sheng_mdss_dsi_panel_init(dsi0_base: usize, dsi1_base: usize, dma_scra
 //
 // Video mode, so the INTF timing engine drives DSI continuously and
 // there is no TE/vsync wiring.
+
+/// INTF_1 (controller_id 0 = DSI0, the master) relative to the DPU base.
+const DPU_INTF1_OFFSET: usize = 0x35000;
+/// INTF_2 (controller_id 1 = DSI1, the slave).
+const DPU_INTF2_OFFSET: usize = 0x36000;
+/// Frames retired by an INTF timing engine. Sampled twice with a gap:
+/// a value that CHANGES is the only proof the engine is running rather
+/// than merely configured.
+const INTF_FRAME_COUNT: usize = 0x0ac;
+/// Gap between the two INTF_FRAME_COUNT samples. At 144Hz this is ~1
+/// frame, enough for the count to move if the engine is live.
+const FRAME_COUNT_SAMPLE_GAP_MS: u32 = 8;
 
 const SSPP_SRC_SIZE: usize = 0x00;
 const SSPP_SRC_XY: usize = 0x08;
@@ -3668,8 +3680,8 @@ export fn sheng_mdss_smmu_diag3() callconv(.c) u32 {
 /// flush cycle naturally not re-trigger since nothing keeps poking it.
 export fn sheng_mdss_dpu_stop(dpu_base: usize) callconv(.c) void {
     const ctl_base = dpu_base + 0x15000;
-    const intf1_base = dpu_base + 0x35000;
-    const intf2_base = dpu_base + 0x36000;
+    const intf1_base = dpu_base + DPU_INTF1_OFFSET;
+    const intf2_base = dpu_base + DPU_INTF2_OFFSET;
 
     mmioWrite32(intf1_base, INTF_TIMING_ENGINE_EN, 0);
     mmioWrite32(intf2_base, INTF_TIMING_ENGINE_EN, 0);
@@ -3779,8 +3791,8 @@ export fn sheng_mdss_dpu_start(
     const pp0_base = dpu_base + 0x69000;
     const pp1_base = dpu_base + 0x6a000;
     const dce_base = dpu_base + 0x80000;
-    const intf1_base = dpu_base + 0x35000; // DSI0 (master)
-    const intf2_base = dpu_base + 0x36000; // DSI1 (slave)
+    const intf1_base = dpu_base + DPU_INTF1_OFFSET; // DSI0 (master)
+    const intf2_base = dpu_base + DPU_INTF2_OFFSET; // DSI1 (slave)
 
     // Force the display's IOMMU stream to bypass before any memory
     // fetch is attempted -- see smmuBypassMdssStream()'s comment. This
@@ -4729,18 +4741,63 @@ const GPIO_PANEL_AVDD: u32 = 30;
 const GPIO_PANEL_AVEE: u32 = 31;
 const GPIO_PANEL_RESET: u32 = 133;
 
+/// A stage or sample that never ran. Same sentinel the C side relays for
+/// an unreached bring-up stage.
+pub const NEVER_RAN: c_int = 0x7fffffff;
+
 /// State the C side formats into /chosen. One struct beats a getter per
 /// field.
+///
+/// MIRRORED BY `struct sheng_diag_state` IN sheng_mdss.c. Both sides
+/// assert this struct's size and the offset of its first signature field;
+/// if you add or reorder anything here, that build breaks until the
+/// mirror and both assertions are updated. See ABI_* below.
+///
+/// The signature fields used to be a bare `reg: [9]u32` filled by index
+/// here and decoded BY POSITION into names in the C formatter -- in a
+/// different language, in a different file. Inserting one register
+/// silently relabelled every column of the diagnostic used to classify
+/// glitched boots, which is the one instrument that must not lie.
 pub const ShengDiag = extern struct {
     panel_pm: i64 = 0,
     panel_pm_pre: i64 = 0,
     fastpath: c_int = 0,
     fastpath_state_ok: c_int = 0,
     panel_init_ret: c_int = 0,
-    panel_init_ret_first: c_int = 0x7fffffff,
+    panel_init_ret_first: c_int = NEVER_RAN,
     probe_count: u32 = 0,
-    reg: [9]u32 = .{0} ** 9,
+
+    /// Display signature, sampled once the pipeline is actually
+    /// streaming. `frames_early`/`frames_late` bracket a deliberate gap:
+    /// a changing INTF frame count is the only value that proves the
+    /// timing engine is running rather than merely configured.
+    status0: u32 = 0,
+    fifo: u32 = 0,
+    fifo_late: u32 = 0,
+    lane: u32 = 0,
+    ackerr: u32 = 0,
+    timeout: u32 = 0,
+    pll_l: u32 = 0,
+    frames_early: u32 = 0,
+    frames_late: u32 = 0,
 };
+
+/// Cross-language layout lock. These numbers are duplicated as
+/// _Static_assert()s in sheng_mdss.c on purpose: it is a pinned handshake,
+/// not a shared source of truth, so whichever side is edited first fails
+/// to build and names the other.
+const ABI_DIAG_SIZE: usize = 72;
+const ABI_DIAG_STATUS0_OFFSET: usize = 36;
+const ABI_FB_SIZE: usize = 32;
+
+comptime {
+    if (@sizeOf(ShengDiag) != ABI_DIAG_SIZE)
+        @compileError("ShengDiag size changed -- update struct sheng_diag_state and its _Static_asserts in sheng_mdss.c");
+    if (@offsetOf(ShengDiag, "status0") != ABI_DIAG_STATUS0_OFFSET)
+        @compileError("ShengDiag signature block moved -- update struct sheng_diag_state and its _Static_asserts in sheng_mdss.c");
+    if (@sizeOf(ShengFb) != ABI_FB_SIZE)
+        @compileError("ShengFb size changed -- update struct sheng_fb and its _Static_assert in sheng_mdss.c");
+}
 
 var g_diag: ShengDiag = .{};
 
@@ -4937,17 +4994,17 @@ export fn sheng_mdss_bringup(splash_live: c_int, fb: *ShengFb) callconv(.c) c_in
     );
     shengTmark("dpu start");
 
-    const intf1 = DPU + 0x35000;
-    g_diag.reg[0] = mmioRead32(DSI0, 0x004);
-    g_diag.reg[1] = mmioRead32(DSI0, 0x008);
-    g_diag.reg[2] = mmioRead32(DSI0, 0x0a4);
-    g_diag.reg[3] = mmioRead32(DSI0, 0x064);
-    g_diag.reg[4] = mmioRead32(DSI0, 0x0bc);
-    g_diag.reg[5] = mmioRead32(DISPCC, 0x010);
-    g_diag.reg[6] = mmioRead32(intf1, 0x0ac);
-    mdelay(8);
-    g_diag.reg[7] = mmioRead32(intf1, 0x0ac);
-    g_diag.reg[8] = mmioRead32(DSI0, 0x008);
+    const intf1 = DPU + DPU_INTF1_OFFSET;
+    g_diag.status0 = mmioRead32(DSI0, DSI_STATUS0);
+    g_diag.fifo = mmioRead32(DSI0, DSI_FIFO_STATUS);
+    g_diag.lane = mmioRead32(DSI0, DSI_LANE_STATUS);
+    g_diag.ackerr = mmioRead32(DSI0, DSI_ACK_ERR_STATUS);
+    g_diag.timeout = mmioRead32(DSI0, DSI_TIMEOUT_STATUS);
+    g_diag.pll_l = mmioRead32(DISPCC, PLL_L_VAL_OFF);
+    g_diag.frames_early = mmioRead32(intf1, INTF_FRAME_COUNT);
+    mdelay(FRAME_COUNT_SAMPLE_GAP_MS);
+    g_diag.frames_late = mmioRead32(intf1, INTF_FRAME_COUNT);
+    g_diag.fifo_late = mmioRead32(DSI0, DSI_FIFO_STATUS);
 
     g_diag.panel_pm = sheng_mdss_dsi_read_power_mode_single(DSI0, DSI_DMA_SCRATCH);
     shengStage(STATUS_DPU, ret);

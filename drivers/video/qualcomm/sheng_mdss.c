@@ -2,7 +2,7 @@
 /*
  * Display driver for the Qualcomm MDSS on SM8550 (Xiaomi Pad 6S Pro,
  * "sheng"). Register sequencing lives in sheng_mdss_hw.zig and is
- * called through the extern declarations below.
+ * called through the declarations in <sheng_mdss_abi.h>.
  *
  * See ARCHITECTURE.md for the bring-up order, the clock tree and the
  * things that will bite you.
@@ -25,17 +25,17 @@
 #include <time.h>
 #include <vsprintf.h>
 
+#include <sheng_mdss_abi.h>
+
 #include "sheng_mdss_debug.h"
 #include "sheng_mdss_regs.h"
 
 DECLARE_GLOBAL_DATA_PTR;
 
-/* Register programming lives in sheng_mdss_hw.zig. This file keeps
- * only what needs U-Boot's driver model: the uclass plumbing, the
- * cmd-db lookups, and the sequencing between them. */
-extern void sheng_gpio_set(unsigned int gpio, bool high);
-extern int sheng_bcm_vote(u32 addr);
-extern int sheng_regulator_vote(u32 addr, u32 millivolts);
+/* Register programming lives in sheng_mdss_hw.zig, declared in
+ * <sheng_mdss_abi.h>. This file keeps only what needs U-Boot's driver
+ * model: the uclass plumbing, the cmd-db lookups, and the sequencing
+ * between them. */
 
 /*
  * Per-stage bring-up status, relayed into /chosen by ft_board_setup()
@@ -88,76 +88,21 @@ void sheng_mdss_stage_init(void)
  * Always compiled in, unlike SHENG_DBG_*: it is a handful of stores and
  * one printf, and the numbers are worth having on every boot.
  */
-/* 32, not 16: the probe can run MORE THAN ONCE (see sheng_probe_count).
- * At 16 the second run's marks silently truncated the record, which is
- * how the retry went unnoticed in the first place. */
-#define SHENG_TMARK_MAX 32
-
-/* Per-boot display signature, for chasing the intermittent glitched
- * boot.
+/* Per-boot display signature, for chasing the intermittent glitched boot.
  *
  * The glitch is NOT caused by anything in the boot-time timing work --
  * proven 2026-08-22 by flashing the pristine pre-existing tree (b362),
- * which glitches identically. It is the long-standing intermittent
- * panel init.
+ * which glitches identically. It is the long-standing intermittent panel
+ * init.
  *
  * A glitched boot reports success everywhere the existing instruments
  * look: all 11 stage codes read 0, panel_init returns 0, and the probe
  * completes. So the stage array cannot distinguish good from bad, and
- * neither can soak.sh. These registers might: they are sampled at the
- * end of probe, once the pipeline is actually streaming, and relayed to
- * Linux so a boot can be classified without a camera.
- *
- * FRAME_COUNT is read twice with a gap: it is the one value that proves
- * the timing engine is genuinely running rather than merely configured.
+ * neither can soak.sh. These registers might: they are sampled at the end
+ * of probe, once the pipeline is actually streaming, and relayed to Linux
+ * so a boot can be classified without a camera.
  */
-/* Declared here as well as further down: the diag formatter below uses
- * them and sits above that block. */
-extern long long sheng_mdss_gdsc_probe_result(void);
-extern unsigned int sheng_mdss_gdsc_collapse_us(void);
-extern long long sheng_mdss_dsi_init_fail_info(void);
-
-
-
-
-
-#define SHENG_DIAG_N 9
-
-/* The probe can run twice, which corrupts a half-configured DDIC.
- *
- * stdio_add_devices() probes the video device, then qcom_late_init()
- * force-probes it again. Normally DM returns the cached device and the
- * second call is free. But if probe #1 FAILED the device was never
- * activated, so the second call reruns everything: another GDSC
- * collapse, core reset, panel power-cycle and 94-command init, on a
- * panel left mid-bring-up.
- *
- * The retry also overwrites all 11 stage codes with 0, so a failed boot
- * reports clean. Keep the FIRST attempt's result; it says why the panel
- * is broken.
- */
-/* Did we inherit ABL's live display instead of rebuilding it? Drives the
- * handover to Linux in board_preboot_os(). */
 int sheng_inherited;
-
-/* Decided in qcom_board_init() over I2C -- see its comment. */
-
-
-/* Bring-up state, owned by sheng_mdss_hw.zig. Mirrors ShengDiag there. */
-struct sheng_diag_state {
-	long long panel_pm;
-	long long panel_pm_pre;
-	int fastpath;
-	int fastpath_state_ok;
-	int panel_init_ret;
-	int panel_init_ret_first;
-	unsigned int probe_count;
-	unsigned int reg[9];
-};
-
-extern struct sheng_diag_state *sheng_mdss_diag_state(void);
-extern const char *sheng_mdss_tmark_get(unsigned int i, unsigned long *us);
-extern unsigned int sheng_mdss_tmark_count(void);
 
 int sheng_mdss_diag_fmt(char *buf, int len)
 {
@@ -176,9 +121,9 @@ int sheng_mdss_diag_fmt(char *buf, int len)
 			d->panel_init_ret,
 			(unsigned long long)sheng_mdss_gdsc_probe_result(),
 			(int)sheng_mdss_gdsc_collapse_us(),
-			d->reg[0], d->reg[1], d->reg[8],
-			d->reg[2], d->reg[3], d->reg[4],
-			d->reg[5], d->reg[6], d->reg[7],
+			d->status0, d->fifo, d->fifo_late, d->lane,
+			d->ackerr, d->timeout, d->pll_l,
+			d->frames_early, d->frames_late,
 			(unsigned long long)d->panel_pm,
 			(unsigned int)(d->panel_pm & 0xff),
 			(unsigned long long)d->panel_pm_pre,
@@ -187,7 +132,6 @@ int sheng_mdss_diag_fmt(char *buf, int len)
 			(int)(short)((fail >> 16) & 0xffff),
 			(int)(short)(fail & 0xffff)) + 1;
 }
-
 
 /* Same marks, formatted for the /chosen relay in ft_board_setup().
  *
@@ -230,49 +174,6 @@ int sheng_mdss_timing_fmt(char *buf, int len)
 	return (n < len ? n : len - 1) + 1;
 }
 
-
-/* Panel bias: KTZ8866 over I2C plus GPIOs 30/31. The DDIC needs it
- * before any DCS command. Without it commands go nowhere and the host
- * still reports success -- a plain DCS write needs no ACK, so an
- * unpowered panel looks identical to a live one from the host side. */
-
-extern int sheng_ktz8866_set_bias(int enable);
-
-
-
-
-/* 144Hz mode, nt36532e. Matches the DPU crtc-0 modeline and the panel
- * driver's own mode table. */
-#define SHENG_PANEL_HFRONT_PORCH	142
-#define SHENG_PANEL_HSYNC_WIDTH		4
-#define SHENG_PANEL_HBACK_PORCH		92
-#define SHENG_PANEL_VFRONT_PORCH	26
-#define SHENG_PANEL_VSYNC_WIDTH		2
-#define SHENG_PANEL_VBACK_PORCH		138
-
-/* sheng_mdss_hw.zig */
-
-/* ULTRA-DEBUG BLACKBOX -- see the big comment in sheng_mdss_hw.zig.
- *
- * U-Boot appends an ASCII log to DRAM at 0xa5000000; Linux reads it back
- * through /dev/mem. This exists because CONFIG_SYS_CBSIZE caps
- * /proc/cmdline at 512 bytes, which has meant one question per boot and
- * register sweeps reported as "first mismatch + count" with the actual
- * values never visible. Budget here is ~512KB instead. */
-/* Blackbox decls/macros MOVED UP -- see above the panel power/reset
- * helper, which now logs GPIO readbacks and needs them in scope. */
-
-extern void sheng_mdss_dsi_panel_sleep(unsigned long dsi0_base, unsigned long dsi1_base,
-					unsigned long dma_scratch);
-extern long long sheng_mdss_gdsc_probe_result(void);
-extern void sheng_mdss_full_teardown(unsigned long dpu_base,
-				      unsigned long dsi0_phy_base, unsigned long dsi1_phy_base,
-				      unsigned long dispcc_base);
-
-struct sheng_mdss_priv {
-	fdt_addr_t mdss_base;
-};
-
 /*
  * Reverse of probe, panel first then hardware. Called from
  * board_preboot_os() -- NOT board_late_init(), which finishes before
@@ -308,21 +209,6 @@ void sheng_mdss_teardown(void)
 	sheng_gpio_set(TLMM_PANEL_AVEE_GPIO, false);
 	sheng_gpio_set(TLMM_PANEL_AVDD_GPIO, false);
 }
-
-/* Framebuffer description produced by the Zig bring-up. Nothing in Zig
- * touches a U-Boot struct, so a U-Boot bump cannot silently change a
- * layout underneath it. */
-struct sheng_fb {
-	unsigned long base;
-	unsigned long size;
-	unsigned int xsize;
-	unsigned int ysize;
-	unsigned int stride;
-	int inherited;
-};
-
-extern int sheng_abl_splash_live;
-extern int sheng_mdss_bringup(int splash_live, struct sheng_fb *fb);
 
 static int sheng_mdss_probe(struct udevice *dev)
 {
@@ -386,5 +272,4 @@ U_BOOT_DRIVER(sheng_mdss) = {
 	.id		= UCLASS_VIDEO,
 	.of_match	= sheng_mdss_ids,
 	.probe		= sheng_mdss_probe,
-	.priv_auto	= sizeof(struct sheng_mdss_priv),
 };
